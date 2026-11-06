@@ -8,8 +8,9 @@ import openai
 import pytest
 
 from hindsight_api.config import clear_config_cache
+from hindsight_api.engine.consolidation.consolidator import _BatchFailureClass, _classify_batch_failure
 from hindsight_api.engine.memory_engine import MemoryEngine, _is_non_retryable_task_error
-from hindsight_api.engine.providers.openai_responses_llm import OpenAIResponsesLLM
+from hindsight_api.engine.providers.openai_responses_llm import OpenAIResponsesLLM, RetryableResponsesError
 from hindsight_api.engine.remote_retry import is_invalid_remote_request, is_transient_remote_error
 from hindsight_api.worker.poller import _WALL_CEILINGS, ClaimedTask, WorkerPoller, _WallTimeoutExceeded
 from hindsight_api.worker.stage import StageHolder
@@ -28,6 +29,20 @@ def test_invalid_value_wrapped_in_502_is_not_transient() -> None:
     assert is_invalid_remote_request(error)
     assert not is_transient_remote_error(error)
     assert _is_non_retryable_task_error(error)
+    assert _classify_batch_failure(error) is _BatchFailureClass.PROPAGATE
+
+
+def test_context_overflow_can_still_reach_adaptive_bisection() -> None:
+    error = openai.BadRequestError(
+        "context overflow",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://fixture.invalid/v1/responses")),
+        body={"type": "invalid_request_error", "code": "context_length_exceeded"},
+    )
+    assert _classify_batch_failure(error) is _BatchFailureClass.RETRY
+
+
+def test_exhausted_responses_stream_wrapper_is_recognized_as_transient() -> None:
+    assert is_transient_remote_error(RetryableResponsesError("fixture stream interrupted"))
 
 
 @pytest.mark.asyncio

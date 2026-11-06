@@ -44,6 +44,7 @@ _TRANSIENT_EXCEPTION_NAMES = frozenset(
         "ConnectionError",
         "InternalServerError",
         "RateLimitError",
+        "RetryableResponsesError",
         "ServiceUnavailableError",
         "Timeout",
         "TimeoutError",
@@ -128,24 +129,23 @@ def status_code_of(exc: BaseException) -> int | None:
     return None
 
 
-def is_invalid_remote_request(exc: BaseException) -> bool:
+def is_invalid_remote_request(exc: BaseException, *, include_generic_type: bool = True) -> bool:
     """Recognize deterministic SDK request errors even when a gateway wraps them in 5xx.
 
     OpenAI SDK errors expose the structured upstream code/type on the exception.
     Do not match prose: an overloaded backend mentioning a parameter is still transient.
     Context overflow stays on reflect's existing partial-evidence synthesis path.
+    Consolidation excludes a generic error type: it may describe an oversized
+    batch that adaptive bisection can rescue, not an invalid provider parameter.
     """
-    return (
-        getattr(exc, "code", None)
-        in {
-            "invalid_value",
-            "invalid_parameter",
-            "unsupported_parameter",
-            "unknown_parameter",
-            "missing_required_parameter",
-        }
-        or getattr(exc, "type", None) == "invalid_request_error"
-    )
+    return getattr(exc, "code", None) in {
+        "invalid_value",
+        "invalid_parameter",
+        "unsupported_parameter",
+        "unsupported_value",
+        "unknown_parameter",
+        "missing_required_parameter",
+    } or (include_generic_type and getattr(exc, "type", None) == "invalid_request_error")
 
 
 def is_transient_remote_error(exc: BaseException) -> bool:

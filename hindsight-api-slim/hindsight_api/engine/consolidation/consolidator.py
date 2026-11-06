@@ -59,6 +59,7 @@ from ..llm_trace import (
 )
 from ..llm_wrapper import sanitize_llm_output
 from ..memories import StoredMemory, get_memories
+from ..remote_retry import is_invalid_remote_request
 from ..response_models import Budget
 from ..retain import embedding_utils
 from ..schema import fq_table
@@ -3838,6 +3839,10 @@ def _classify_batch_failure(exc: Exception) -> _BatchFailureClass:
     # Duck-typed rather than importing a provider SDK's error class: every SDK we
     # front (openai, anthropic) exposes the HTTP status this way.
     if getattr(exc, "status_code", None) in (401, 403):
+        return _BatchFailureClass.PROPAGATE
+    if is_invalid_remote_request(exc, include_generic_type=False):
+        # A provider parameter does not become valid when the fact list is
+        # bisected. Propagate instead of exhausting every fact's retry budget.
         return _BatchFailureClass.PROPAGATE
     if isinstance(exc, json.JSONDecodeError | ValidationError | OutputTooLongError):
         return _BatchFailureClass.FAIL_FAST
