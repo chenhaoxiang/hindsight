@@ -5127,9 +5127,9 @@ jobs:
     - name: Run Hermes compatibility test
       env:
         GITHUB_TOKEN: ${{ github.token }}
-        # Empty on fork PRs, where secrets are unavailable; the script then runs
-        # every structural check and skips only the LLM-backed round-trips.
-        HERMES_COMPAT_LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        # Keep structural checks on maintenance-fork PRs, but never activate
+        # optional live round-trips merely because a provider secret was added.
+        HERMES_COMPAT_LLM_API_KEY: ${{ github.repository == 'vectorize-io/hindsight' && secrets.OPENAI_API_KEY || '' }}
       run: ./scripts/test-hermes-compat.sh
 
     - name: Collect embedded daemon logs on failure

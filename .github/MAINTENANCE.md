@@ -39,10 +39,14 @@ Do not publish credentials, non-example environment/configuration files, private
 service endpoints, machine/user paths, internal project material, real transcripts,
 memory documents, screenshots, logs, diagnostics, database dumps or backups.
 
-The fork keeps ordinary deterministic CI. Live-provider CI is gated to upstream;
-upstream publishing, documentation deployment, signing and model-driven triage
-workflows are disabled for this maintenance fork. Fork releases use an explicit,
-separate artifact path rather than publishing under upstream package identities.
+The fork keeps ordinary deterministic CI. The common live-provider gate and the
+optional Hermes provider key are restricted to upstream. Upstream publishing,
+documentation deployment, signing, scheduled quality/performance evaluations and
+model-driven triage workflows are disabled through this repository's settings;
+these are repository settings, not guards added to every inherited workflow file.
+Keep those external-effect workflows disabled unless their execution is explicitly
+intended. Fork releases use an explicit, separate artifact path rather than
+publishing under upstream package identities.
 
 Review the complete staged diff and outgoing commit range before a push. Review PR
 text, CI output, archives and Release attachments too: they are public output, not
