@@ -579,10 +579,20 @@ export class HindsightClient {
    *  so append silently never turned on (#5286). Servers that predate the alias still answer
    *  `/version`, so that stays as the fallback. */
   private async probeIdempotentRetain(): Promise<boolean> {
-    return semverGte(
-      (await this.serverIdentity()).api_version ?? undefined,
-      MIN_IDEMPOTENT_RETAIN_VERSION
-    );
+    // Keep the established capability parser independent of diagnostic display validation:
+    // it intentionally compares Python prereleases/build suffixes and missing patch versions.
+    for (const path of ["/v1/version", "/version"]) {
+      try {
+        const r = await this.req("GET", `${this.apiUrl}${path}`);
+        if (!r.ok) continue;
+        const j = (await r.json()) as { api_version?: string };
+        return semverGte(j.api_version, MIN_IDEMPOTENT_RETAIN_VERSION);
+      } catch {
+        currentRequestSignal()?.throwIfAborted();
+        /* unreachable or not our API's JSON — try the next path */
+      }
+    }
+    return false;
   }
 
   /** Read-only API identity, not an inference-provider probe. Unreadable is unknown, never a
@@ -595,7 +605,11 @@ export class HindsightClient {
         const j = (await r.json()) as { api_version?: unknown };
         if (
           typeof j?.api_version === "string" &&
-          /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(j.api_version)
+          j.api_version.length <= 128 &&
+          // API releases use Python prereleases/post/dev versions as well as SemVer suffixes.
+          /^\d+\.\d+(?:\.\d+)?(?:(?:a|b|rc)\d+)?(?:\.(?:post|dev)\d+)*(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(
+            j.api_version
+          )
         ) {
           return { state: "available", api_version: j.api_version };
         }

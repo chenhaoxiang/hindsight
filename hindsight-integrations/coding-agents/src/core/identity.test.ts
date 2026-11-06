@@ -19,6 +19,8 @@ describe("integration identity", () => {
         disk_version: "999.0.0-fixture.1",
         disk_matches_loaded: false,
       });
+      writeFileSync(file, JSON.stringify({ version: "1.2.0-fork.1+build.2" }));
+      expect(integrationIdentity(file).disk_version).toBe("1.2.0-fork.1+build.2");
       writeFileSync(file, "{");
       expect(integrationIdentity(file)).toMatchObject({
         loaded_version: version,

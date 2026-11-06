@@ -13,7 +13,7 @@ export function integrationIdentity(packageFile?: string) {
     const pkg = JSON.parse(readFileSync(packageFile ?? join(root, "package.json"), "utf8"));
     if (
       typeof pkg?.version === "string" &&
-      /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(pkg.version)
+      /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(pkg.version)
     ) {
       diskVersion = pkg.version;
     }

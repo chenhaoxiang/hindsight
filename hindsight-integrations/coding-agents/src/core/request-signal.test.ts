@@ -19,16 +19,23 @@ function waitForAbort(init?: RequestInit): Promise<Response> {
 describe("per-tool cancellation", () => {
   it("cancels a native tool's HTTP request without cancelling another call on the same client", async () => {
     const client = new HindsightClient({ apiUrl: "https://fixture.invalid", bank: "bound-bank" });
-    let started!: () => void;
-    const pendingFetch = new Promise<void>((resolve) => {
-      started = resolve;
+    const held = new Map<string, { signal: AbortSignal; release: () => void }>();
+    let allStarted!: () => void;
+    const pendingFetches = new Promise<void>((resolve) => {
+      allStarted = resolve;
     });
     const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      if (String(_url).includes("/pages/hold")) {
-        started();
-        return waitForAbort(init);
-      }
-      return new Response(JSON.stringify({ id: "ok", body: "synthetic page" }));
+      const id = String(_url).split("/").pop()!;
+      if (id === "ok") return new Response(JSON.stringify({ id, body: "synthetic page" }));
+      return new Promise<Response>((resolve, reject) => {
+        const signal = init!.signal!;
+        held.set(id, {
+          signal,
+          release: () => resolve(new Response(JSON.stringify({ id, body: "synthetic page" }))),
+        });
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        if (held.size === 3) allStarted();
+      });
     });
     vi.stubGlobal("fetch", fetchMock);
     const spec = buildKnowledgeTools(client, "bound-bank").find(
@@ -37,16 +44,25 @@ describe("per-tool cancellation", () => {
     const tool = toPiTool(spec);
     const ctrl = new AbortController();
     const pending = tool.execute("first", { page_id: "hold" }, ctrl.signal);
-    await pendingFetch;
-    const other = await tool.execute("second", { page_id: "ok" });
-    expect(other.isError).toBeUndefined();
+    const otherCtrl = new AbortController();
+    const other = tool.execute("second", { page_id: "other" }, otherCtrl.signal);
+    // Started outside tool scope, like ingestion, but deliberately still in flight at cancellation.
+    const background = client.getPage("background");
+    await pendingFetches;
     ctrl.abort();
     const cancelled = await pending;
     expect(cancelled.isError).toBe(true);
     expect(JSON.parse(cancelled.content[0].text).code).toBe("cancelled");
+    expect(held.get("other")!.signal.aborted).toBe(false);
+    expect(held.get("background")!.signal.aborted).toBe(false);
+    expect(otherCtrl.signal.aborted).toBe(false);
+    held.get("other")!.release();
+    held.get("background")!.release();
+    expect((await other).isError).toBeUndefined();
+    expect(await background).toMatchObject({ id: "background", body: "synthetic page" });
     expect(currentRequestSignal()).toBeUndefined();
     expect((await tool.execute("third", { page_id: "ok" })).isError).toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("stops a rate-limit sleep rather than sending another attempt", async () => {

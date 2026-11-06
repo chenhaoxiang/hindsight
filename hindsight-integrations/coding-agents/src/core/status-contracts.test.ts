@@ -92,6 +92,23 @@ describe("authoritative operation totals", () => {
 });
 
 describe("API identity", () => {
+  it.each(["0.9.0rc1", "1.2.0-fork.1+build.2", "0.9", "1.2.0.post1.dev2+fixture"])(
+    "preserves append capability and diagnostic identity for %s",
+    async (version) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url) =>
+          String(url).endsWith("/config")
+            ? json({ config: { store_document_text: true } })
+            : json({ api_version: version })
+        )
+      );
+      const c = client();
+      expect(await c.supportsIdempotentRetain()).toBe(true);
+      expect(await c.supportsAppendRetain()).toBe(true);
+      expect(await c.serverIdentity()).toEqual({ state: "available", api_version: version });
+    }
+  );
   it("falls back to the legacy version alias and never guesses from the integration version", async () => {
     const fetchMock = vi.fn(async (url) =>
       String(url).endsWith("/v1/version")
