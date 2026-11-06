@@ -39,6 +39,8 @@ describe("buildKnowledgePreamble", () => {
     expect(out).toContain("hindsight_list_knowledge_pages");
     expect(out).toContain("hindsight_read_knowledge_page");
     expect(out).toContain("hindsight_reflect");
+    expect(out).toContain("hindsight_recall");
+    expect(out).toContain("hindsight_recent_memories");
     expect(out).toContain("hindsight_capture_initiative");
     expect(out).toContain("hindsight_ingest_document");
   });
@@ -69,7 +71,11 @@ describe("buildKnowledgePreamble", () => {
       }),
     ]) {
       expect(out).toMatch(/new task or goal.*knowledge pages FIRST/is);
-      expect(out).toMatch(/hindsight_reflect only when.*pages are too shallow/is);
+      expect(out).toMatch(
+        /use raw\/recent facts when pages lag.*hindsight_reflect only when deeper reasoning/is
+      );
+      expect(out).toMatch(/missing metadata is unknown/);
+      expect(out).toMatch(/deletions are not observed/);
       // No `s` flag ON PURPOSE: this must stay a per-LINE guard against the old wording
       // ("call hindsight_reflect with that goal FIRST"). With `s` it would span newlines and
       // match the legitimate "hindsight_reflect ..." / "FIRST STOP" lines further down the guide.
@@ -89,6 +95,8 @@ describe("buildRosterRefresh", () => {
     for (const tool of [
       "hindsight_list_knowledge_pages",
       "hindsight_read_knowledge_page",
+      "hindsight_recall",
+      "hindsight_recent_memories",
       "hindsight_capture_initiative",
       "hindsight_ingest_document",
     ]) {

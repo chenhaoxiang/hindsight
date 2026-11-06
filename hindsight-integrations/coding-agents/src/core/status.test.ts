@@ -149,6 +149,28 @@ describe("syncStatus", () => {
     expect(s.pageFreshness).toBe("unknown");
   });
 
+  it.each([
+    [["stale", "unknown"], "stale"],
+    [["refresh_failed", "stale"], "refresh_failed"],
+    [["no_scoped_writes_reported", "unknown"], "unknown"],
+    [["no_scoped_writes_reported"], "no_scoped_writes_reported"],
+  ])(
+    "aggregates reported page freshness without assuming missing metadata is current",
+    async (states, expected) => {
+      const client = stubClient({
+        gitIds: ["gitlog:repo"],
+        listPages: async () => ({
+          items: (states as string[]).map((state, i) => ({
+            id: `p${i}`,
+            name: `Page ${i}`,
+            freshness: { state },
+          })),
+        }),
+      });
+      expect((await syncStatus(client, "bank-1")).pageFreshness).toBe(expected);
+    }
+  );
+
   it("fail-open: a source:chat listDocumentIds rejection yields chatDocs 0, no throw", async () => {
     const client = stubClient({
       listDocumentIds: async (tag: string) => {

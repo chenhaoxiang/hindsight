@@ -209,6 +209,28 @@ describe("readUsage", () => {
     );
   });
 
+  it("counts raw and recent fact reads as retrieval, not as writes or status probes", () => {
+    writeFileSync(
+      usageFile,
+      ["hindsight_recall", "hindsight_recent_memories"]
+        .map((name, i) =>
+          JSON.stringify({
+            harness: "pi",
+            session: "synthetic",
+            turn: i + 1,
+            calls: [name],
+            credited: i === 0,
+          })
+        )
+        .join("\n")
+    );
+    expect(readUsage(usageFile)[0]).toMatchObject({
+      turnsWithRetrieval: 2,
+      creditedTurnsWithRetrieval: 1,
+      byTool: { hindsight_recall: 1, hindsight_recent_memories: 1 },
+    });
+  });
+
   it("says so when nothing is recorded", () => {
     expect(formatUsageReport(readUsage(usageFile), usageFile)).toBe(
       `no Hindsight usage recorded yet (${usageFile})`

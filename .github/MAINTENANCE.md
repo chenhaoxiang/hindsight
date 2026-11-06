@@ -105,7 +105,15 @@ A bounded throughput observation is not a permanent capacity guarantee.
 - [x] Distinguish service availability, ingestion activity, consolidation backlog and
       page freshness. Keep existing fields compatible where possible.
 - [x] Report compiled integration/API identity without leaking configuration values.
-- [ ] Add synthetic adapter/client tests and deliver a focused PR.
+- [x] Add synthetic adapter/client tests and deliver a focused PR.
+
+Delivered in [PR #2](https://github.com/chenhaoxiang/hindsight/pull/2), merged as
+`2b4f0d527f4af8ad4ca4fa9f79a23f3baab75919`. The runtime candidate passed
+1,444 isolated unit tests, full typecheck/lint/build and compiled native smoke on
+Node 22 and 26 (not the full Node 26 unit suite). Final exact-head remote CI passed,
+including generated documentation and the full blackbox suite. Earlier failures
+and the generated-copy/buffered-trace readiness corrections remain in the PR.
+No runtime installation is claimed here.
 
 Acceptance: errors remain errors in the host, older pending work cannot disappear
 behind a page of completed operations, and cancellation is not described as rollback
@@ -113,18 +121,24 @@ of an already-started upstream effect.
 
 ### 3. Expose bounded, layered retrieval
 
-- [ ] Surface available page freshness, refresh failure and source-watermark metadata;
+- [x] Surface available page freshness, refresh failure and source-watermark metadata;
       missing metadata stays unknown rather than being inferred from page age.
-- [ ] Expose structured raw-fact recall using the existing client/API, including
+- [x] Expose structured raw-fact recall using the existing client/API, including
       provenance, fact type and supported temporal fields.
-- [ ] Expose bounded recent-update reads through the existing list APIs. A recall
+- [x] Expose bounded recent-update reads through the existing list APIs. A recall
       temporal-ranking window must not be represented as an exclusive ingestion-time filter.
-- [ ] Keep bank/authentication binding under the host's control and enforce argument
+- [x] Keep bank/authentication binding under the host's control and enforce argument
       and result budgets. Do not let model arguments replace API URLs or credentials.
-- [ ] Add layered usage guidance through the existing configuration extension point.
-- [ ] Test stale-page/new-fact, unconsolidated-fact, missing metadata, API failure,
+- [x] Add layered usage guidance while preserving the existing configuration extension point.
+- [x] Test stale-page/new-fact, unconsolidated-fact, missing metadata, API failure,
       cancellation and bank/tag-boundary scenarios.
-- [ ] Keep automatic multi-step fallback opt-in and out of the initial default path.
+- [x] Keep automatic multi-step fallback out of the initial default path; none is added.
+- [ ] Complete independent source review and focused PR delivery.
+
+The explicit tools are `hindsight_recall` and `hindsight_recent_memories`. Recent
+reads use the API's memory-row `updated_at` axis; no event-time substitute or
+unverifiable creation-time ordering is invented. Agent-facing rosters/body reads
+are paged/bounded too; internal seed and automatic-retrieval defaults are retained.
 
 Acceptance: recent facts can be found without waiting for consolidation; raw
 statements are attributed evidence, not automatic proof of current business state.

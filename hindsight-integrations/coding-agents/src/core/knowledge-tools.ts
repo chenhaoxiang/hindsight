@@ -29,6 +29,14 @@ import { describeError } from "./log";
 import type { RetainStamp } from "./retain-stamp";
 import type { PageTrigger } from "./missions";
 import { diagnosticEndpoint, integrationIdentity } from "./identity";
+import {
+  MemoryReadUnavailableError,
+  recallFacts,
+  recentFacts,
+  recallInput,
+  recentInput,
+} from "./memory-retrieval";
+import { boundedPageList, boundedPageRead, boundedPageSearch } from "./page-results";
 
 export interface ToolResult {
   // Index signature so this structurally satisfies the MCP SDK's CallToolResult (which carries
@@ -96,7 +104,18 @@ function ok(value: unknown): ToolResult {
 
 function err(e: unknown): ToolResult {
   const message = describeError(e);
-  return { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true };
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          error: message,
+          ...(e instanceof MemoryReadUnavailableError ? { code: e.code } : {}),
+        }),
+      },
+    ],
+    isError: true,
+  };
 }
 
 /** Wrap a handler body so a thrown client error always becomes an isError:true result, never a throw. */
@@ -132,6 +151,15 @@ export function buildKnowledgeTools(
 ): ToolSpec[] {
   const extra = opts.toolGuideExtra?.trim();
   const crediting = extra ? `${CREDIT_REMINDER} ${extra}` : CREDIT_REMINDER;
+  const listInput = {
+    limit: z.number().int().min(1).max(100).default(25),
+    offset: z.number().int().min(0).max(1_000_000).default(0),
+  };
+  const readInput = {
+    page_id: z.string().min(1).max(1024),
+    offset: z.number().int().min(0).max(1_000_000).default(0),
+    max_chars: z.number().int().min(1000).max(48_000).default(24_000),
+  };
   return [
     {
       name: "hindsight_sync_status",
@@ -227,13 +255,14 @@ export function buildKnowledgeTools(
         // fiddly drift apart, and the description is what a host shows when the tool is listed.
         "read a full page with hindsight_read_knowledge_page. " +
         crediting,
-      inputSchema: { query: z.string().describe("what to look for") },
+      inputSchema: { query: z.string().trim().min(1).max(2000).describe("what to look for") },
       annotations: READ_ONLY_ANNOTATIONS,
       handler: async (args: { query: string }) => {
         try {
           // Limit comes from the client (`pageSearchLimit`), so the tool and the hook's injection
           // can never drift apart — this used to pass its own literal 3.
-          const hits = await client.searchKnowledgePages(args.query);
+          const query = z.string().trim().min(1).max(2000).parse(args.query);
+          const hits = await client.searchKnowledgePages(query, { includeFreshness: true });
           // No `score`. The server fuses BM25 and vector search with reciprocal rank fusion, so the
           // number is ~1/(60+rank) summed over two retrievers: a perfect top hit scores about 0.03
           // and nothing ever approaches 1. Handed that, a model reads a strong match as 3% relevant
@@ -245,15 +274,10 @@ export function buildKnowledgeTools(
           // see that?". The guide had scrolled far up the context by then; the instruction that
           // lands at the same moment as the results is the one that can still be acted on.
           return ok({
-            pages: hits.map((h) => ({
-              page: h.name,
-              page_id: h.id,
-              // The question the page answers — the same `description` the list and read tools
-              // carry, so a hit says what the page is FOR, not just how it opens.
-              ...(h.source_query ? { description: h.source_query } : {}),
-              snippet: h.snippet,
-            })),
+            ...boundedPageSearch(hits),
             crediting,
+            freshness_note:
+              "Freshness is scoped-write metadata, not a current-truth guarantee; deletions are not observed. Missing metadata is unknown.",
           });
         } catch (e) {
           return err(e);
@@ -266,12 +290,20 @@ export function buildKnowledgeTools(
         "List this repository's Hindsight knowledge pages — curated, continuously-updated " +
         "summaries of the project's durable knowledge (architecture, components, conventions, key " +
         "decisions, and in-flight initiatives). Returns each page's id, title, and a one-line " +
-        "description of what it covers. Call this at the start of any non-trivial task, and again " +
+        "description of what it covers, plus reported freshness. Results are bounded/paged; use " +
+        "next_offset or search instead of dumping a large roster. Call at the start of substantial work, and again " +
         "periodically in long sessions, to see what the project already knows before you read code " +
         "or ask the user. The list changes as work is captured, so re-check it occasionally.",
-      inputSchema: {},
+      inputSchema: listInput,
       annotations: READ_ONLY_ANNOTATIONS,
-      handler: guarded(async () => client.listPages()),
+      handler: guarded(async (input) => {
+        const args = z.object(listInput).strict().parse(input);
+        return boundedPageList(
+          await client.listPages({ includeFreshness: true }),
+          args.limit,
+          args.offset
+        );
+      }),
     },
     {
       name: "hindsight_read_knowledge_page",
@@ -281,10 +313,46 @@ export function buildKnowledgeTools(
         "you're about to do — e.g. read Conventions before writing new code, Component map before " +
         "changing a subsystem, or an initiative's page before continuing that feature. A page may " +
         "contain [[page:<id>]] links to related pages; follow one by calling this tool again with " +
-        "that id. Prefer reading a page over re-deriving the same understanding from source.",
-      inputSchema: { page_id: z.string() },
+        "that id. Body reads are character-bounded; follow next_offset for the rest. Freshness " +
+        "metadata may be unknown; a page is a historical synthesis, not proof of current state.",
+      inputSchema: readInput,
       annotations: READ_ONLY_ANNOTATIONS,
-      handler: guarded(async ({ page_id }) => client.getPage(page_id)),
+      handler: guarded(async (input) => {
+        const args = z.object(readInput).strict().parse(input);
+        return boundedPageRead(
+          await client.getPage(args.page_id, { includeFreshness: true }),
+          args.offset,
+          args.max_chars
+        );
+      }),
+    },
+    {
+      name: "hindsight_recall",
+      description:
+        "Retrieve structured memory facts using the existing bank's recall API. Use when pages are stale, failed, generic, or miss recent evidence. Defaults to world/experience facts, including extracted facts not yet consolidated; observations are explicit opt-in. Returns fact/document IDs, provenance, tags and event timestamps with bounded results. This is not an ingestion-time filter or proof that a historical statement is still true. API ranking may use configured services; no reflect synthesis is requested. " +
+        crediting,
+      inputSchema: recallInput,
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async (input) => ({
+        ...(await recallFacts(client, input)),
+        bank_id: bankId,
+        crediting: crediting.replace("<page>", "<document or fact id>"),
+        availability_note:
+          "Raw facts are searchable after extraction, which may still be pending; consolidation/page refresh is not required.",
+      })),
+    },
+    {
+      name: "hindsight_recent_memories",
+      description:
+        "Read a bounded set of memory facts written/updated since an explicit ISO timestamp. Uses updated_at filtering and ordering via the existing list API, NOT recall's event-time ranking window. since is inclusive; until is exclusive and defaults to call start. Defaults to world/experience, at most one page per requested type; truncated means not exhaustive. No semantic search, no replay or refresh. " +
+        crediting,
+      inputSchema: recentInput,
+      annotations: READ_ONLY_ANNOTATIONS,
+      handler: guarded(async (input) => ({
+        ...(await recentFacts(client, input)),
+        bank_id: bankId,
+        crediting: crediting.replace("<page>", "<document or fact id>"),
+      })),
     },
     {
       name: "hindsight_reflect",

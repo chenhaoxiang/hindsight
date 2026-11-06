@@ -19,7 +19,7 @@ explains what happens automatically, which tools you have, and how to configure 
 - **Session synthesis**: by default, the first prompt of a session triggers one deep memory
   synthesis (`reflect`) injected into context. `autoInject` switches the source: `pages` (knowledge
   page search hits), `recall` (recalled observations), or `none` (nothing injected; the agent
-  searches the knowledge pages first and reflects only when they are too shallow).
+  searches pages first, checks raw/recent facts when they lag, and reflects only for deeper reasoning).
 - **Write-back**: the session transcript is retained into the bank automatically at session end
   (per-turn on opencode). The user never needs to "save" a conversation.
 
@@ -40,7 +40,14 @@ When the user says "store this in hindsight" / "remember this":
 
 - `hindsight_search_knowledge_pages(query)` — FIRST STOP for project questions (components,
   conventions, past decisions, initiatives). Server-side hybrid search, fast.
-- `hindsight_read_knowledge_page(page_id)` / `hindsight_list_knowledge_pages` — read pages fully.
+- `hindsight_read_knowledge_page(page_id)` / `hindsight_list_knowledge_pages` — bounded reads;
+  follow `next_offset` for the rest. Check reported freshness/failure/source-watermark metadata.
+  Missing metadata is unknown; scoped write freshness does not observe deletions or prove correctness.
+- `hindsight_recall(query)` — structured source facts when pages are stale, failed or too generic;
+  raw facts can be searchable before consolidation, but extraction itself may still be pending.
+- `hindsight_recent_memories(since)` — bounded recent memory-row updates, filtered by `updated_at`,
+  not event dates. ISO bounds require a timezone; `since` inclusive, `until` exclusive. Truncated
+  results are not exhaustive. Recall's temporal window ranks; it is not a strict write-time filter.
 - `hindsight_reflect(query)` — deep reasoning over the whole memory for WHY questions and exact
   decided values; slower (seconds), use deliberately.
 - Credit visibly whenever memory informs an answer: start that part with
@@ -56,6 +63,8 @@ source contradicts it), FIX THE RECORD — don't just ignore it. Call
 - **content**: (1) what memory claimed, (2) what is verifiably true now, (3) the evidence you
   checked (file/commit/output). Quote exact values verbatim.
 
-Newer facts supersede older ones in retrieval, so one clear correction permanently outranks the
-stale memory. Do this whenever you catch a wrong injected memory, a stale knowledge-page claim, or
-an outdated decision — silent disregard leaves the trap armed for the next session.
+Corrections are retained asynchronously. Their facts become searchable after extraction, while
+knowledge pages may still show the older synthesis until they refresh. Do not promise permanent
+ranking precedence or immediate page replacement. Verify important claims against current code and
+source evidence, attribute records to their actual project/document, and correct a verified stale
+claim rather than leaving it unqualified for the next session.

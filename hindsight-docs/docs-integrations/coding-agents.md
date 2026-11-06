@@ -1155,7 +1155,7 @@ event is written on those turns — nothing reflected.
 `~/.hindsight/coding-agents-logs/usage.jsonl` (override `HINDSIGHT_USAGE_FILE`) — the `hindsight_*`
 tools the agent called during that turn, and whether its reply credited Hindsight memory ("From
 Hindsight memory"). The credit rate counts only turns that called a retrieval tool (search, list,
-read, reflect); saving a document is not expected to be credited. Recorded at the end of each turn,
+read, raw/recent facts, reflect); saving a document is not expected to be credited. Recorded at the end of each turn,
 whether or not `retainSessions` writes the session back. It never leaves your machine. Summarize it per agent with:
 
 ```bash
@@ -1175,8 +1175,7 @@ readiness from activity and derived-memory freshness:
 - `syncScope: "seed_ingestion"` makes the limit explicit: this is not a claim that later writes
   have all been consolidated or every page is current. `consolidation` reports pending/failed
   source-fact counts separately, where supported. Those server statistics may be cached; their
-  cache age is unknown. Missing fields remain null. Page existence alone leaves `pageFreshness`
-  unknown.
+  cache age is unknown. Missing fields remain null. `pageFreshness` aggregates reported scope signals; page existence/age alone cannot make it current.
 - Git deepening and survey progress remain informational: `surveyBaseline` is the HEAD the last
   survey started from; `surveyDocs` counts findings documents that landed, 0–4. A baseline without
   findings retries automatically, at most three times per commit. Each survey agent that could
@@ -1184,6 +1183,46 @@ readiness from activity and derived-memory freshness:
 
 Ingestion stays automatic. A status result is not an instruction to replay operations or clear
 failure records.
+
+### Layered retrieval without waiting for page refresh
+
+The agent-facing tools keep the normal pages-first path and add two explicit, bounded reads:
+
+1. Search/read knowledge pages for durable architecture, conventions and decisions. Search, list
+   and read results expose available scoped staleness, refresh-failure and source-watermark
+   metadata. `no_scoped_writes_reported` is not a correctness guarantee: deletions are not observed.
+   Missing/unsupported metadata stays unknown. Optional metadata reads have short deadlines and
+   use one metadata-only batch for a roster/search, not one body/trace request per hit; metadata
+   beyond that bounded page may remain unknown.
+2. `hindsight_recall(query)` asks the existing recall API for structured facts, defaulting to
+   `world` and `experience`, including facts not yet consolidated. It retains fact/document IDs,
+   metadata, tags and supported event timestamps. Optional `types`, strict `tags_match`, `tags`,
+   `limit` (1–20, default 8) and `max_tokens` (128–4000, default 2000) are validated. Its low budget
+   is fixed; it requests no reflect synthesis, although configured API ranking services may run.
+   It does not inherit injection-only `recallOptions`, and has no ingestion-time filter.
+3. `hindsight_recent_memories(since)` reads facts whose **memory row `updated_at`** is inside a
+   window: inclusive `since`, exclusive `until` (defaults to call start). Both use ISO timestamps
+   with a timezone. This is a list read, not semantic search. It requests at most one top-N page
+   per type and merges by write time; default types are `world`/`experience`, default limit 10,
+   maximum 20. It never substitutes an old event date for a missing write timestamp. Recall's
+   `temporal_window` changes ranking and must not be described as this strict filter.
+4. Use `hindsight_reflect` deliberately when deeper reasoning about past decisions is needed.
+   No new automatic multi-step fallback or mandatory per-turn synthesis is enabled.
+
+Agent rosters default to 25 entries (`limit` up to 100); use `next_offset` or search rather than
+loading the whole bank. Page bodies default to 24,000 characters per read (`max_chars` up to
+48,000); follow `next_offset` with `offset` to read the rest. Search excerpts, rosters and raw-fact
+records have fixed result budgets; `truncated`/`body_truncated` means the result is not complete.
+Raw provenance IDs are never silently shortened. Unsupported capability, unavailable/invalid
+response and a valid empty result remain distinct.
+
+All tools keep the host-resolved bank, endpoint and authentication. Model arguments cannot replace
+those. Shared-bank facts must be attributed to their actual source/project, not assumed to apply
+to every repository. These are historical records, not proof of current business state. Raw facts
+become searchable after extraction, which can itself be delayed; they do not require consolidation
+or page refresh. Existing `autoInject` choices, including `none`, and the team's `toolGuideExtra`
+remain intact. Corrections are asynchronous too: do not assume a newly retained correction has
+already rewritten a derived page.
 
 ### Resetting a repo's memory
 

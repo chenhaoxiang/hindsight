@@ -23,7 +23,7 @@ import type { ConsolidationStatus } from "./hindsight";
 /** Minimal client shape (HindsightClient satisfies it structurally). */
 export interface StatusClient {
   listDocumentIds(tag: string, tagsMatch?: "all" | "all_strict"): Promise<Set<string>>;
-  listPages(): Promise<unknown>;
+  listPages(opts?: { includeFreshness?: boolean }): Promise<unknown>;
   knowledgePagesSupported?: boolean;
   activeOperations(): Promise<number>;
   consolidationStatus?(): Promise<ConsolidationStatus>;
@@ -46,7 +46,7 @@ export interface SyncStatus {
   seedReady: boolean;
   activity: "active" | "idle" | "unknown";
   consolidation: ConsolidationStatus | null;
-  pageFreshness: "unknown";
+  pageFreshness: "unknown" | "stale" | "refresh_failed" | "no_scoped_writes_reported";
   syncScope: "seed_ingestion";
   synced: boolean;
 }
@@ -73,7 +73,17 @@ export async function syncStatus(
   const chatIds = await client
     .listDocumentIds("source:chat", "all_strict")
     .catch(() => new Set<string>());
-  const pages = parsePageList(await client.listPages().catch(() => null));
+  const pagePayload = await client.listPages({ includeFreshness: true }).catch(() => null);
+  const pages = parsePageList(pagePayload);
+  const pageItems = (pagePayload as { items?: { freshness?: { state?: string } }[] } | null)?.items;
+  const states = Array.isArray(pageItems) ? pageItems.map((p) => p?.freshness?.state) : undefined;
+  const pageFreshness = states?.includes("refresh_failed")
+    ? "refresh_failed"
+    : states?.includes("stale")
+      ? "stale"
+      : states?.length && states.every((s) => s === "no_scoped_writes_reported")
+        ? "no_scoped_writes_reported"
+        : "unknown";
   const reportedOps = await client.activeOperations().catch(() => null);
   const activeOps =
     Number.isSafeInteger(reportedOps) && (reportedOps as number) >= 0 ? reportedOps : null;
@@ -129,8 +139,8 @@ export async function syncStatus(
     seedReady,
     activity: activeOps === null ? "unknown" : activeOps > 0 ? "active" : "idle",
     consolidation,
-    // Page existence/age says nothing about the facts its synthesis actually saw.
-    pageFreshness: "unknown",
+    // Aggregate reported scope signals, never infer freshness from page age/existence.
+    pageFreshness,
     syncScope: "seed_ingestion",
     // Older servers may explicitly lack pages; an unreportable operation count is NOT zero.
     synced: seedReady && activeOps === 0,

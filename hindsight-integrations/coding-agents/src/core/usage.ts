@@ -46,6 +46,8 @@ const RETRIEVAL_TOOLS = new Set([
   "hindsight_list_knowledge_pages",
   "hindsight_read_knowledge_page",
   "hindsight_reflect",
+  "hindsight_recall",
+  "hindsight_recent_memories",
 ]);
 
 /** Roles a reader uses for the agent's own prose (Gemini-shaped transcripts say "model"). */
