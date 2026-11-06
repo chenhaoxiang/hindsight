@@ -230,7 +230,7 @@ describe("recent writes, not event-time ranking", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it.each([undefined, "2001-01-01T00:00:00Z", "2025-02-01T00:00:00Z"])(
+  it.each([undefined, "2001-01-01T00:00:00Z", "2025-02-01T00:00:00Z", "2025-01-20T00:00:00"])(
     "does not substitute event dates for missing/invalid write time",
     async (updated) => {
       vi.stubGlobal(
@@ -248,6 +248,51 @@ describe("recent writes, not event-time ranking", () => {
       });
     }
   );
+
+  it.each([
+    ["2025-01-20T00:00:00.123100Z", "2025-01-20T00:00:00.123900Z", "2025-01-20T00:00:00.123500Z"],
+    ["2025-01-20T00:00:00.123000Z", "2025-01-20T00:00:00.123900Z", "2025-01-20T00:00:00.123800Z"],
+  ])(
+    "honors microsecond windows and their exclusive upper bound",
+    async (since, until, updated) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          json({
+            items: [fact({ type: undefined, fact_type: "world", updated_at: updated })],
+            total: 1,
+          })
+        )
+      );
+      const result = await recentFacts(client(), { since, until, types: ["world"] });
+      expect(result.memories[0].updated_at).toBe(updated);
+    }
+  );
+
+  it("selects the newer cross-type fact within one millisecond, including timezone offsets", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url) => {
+        const type = new URL(String(url)).searchParams.get("type");
+        return json({
+          items: [
+            fact({
+              type: undefined,
+              fact_type: type,
+              id: type === "world" ? "a-older" : "z-newer",
+              updated_at:
+                type === "world"
+                  ? "2025-01-20T01:00:00.123100+01:00"
+                  : "2025-01-20T00:00:00.123900Z",
+            }),
+          ],
+          total: 1,
+        });
+      })
+    );
+    const result = await recentFacts(client(), { ...window, limit: 1 });
+    expect(result.memories.map((f) => f.id)).toEqual(["z-newer"]);
+  });
 
   it("does not scan history for empty windows or duplicate type inputs", async () => {
     const fetchMock = vi.fn(async () => json({ items: [], total: 0 }));

@@ -207,12 +207,24 @@ export async function recallFacts(client: ReadClient, input: unknown) {
   };
 }
 
+/** Match the API's Python/Postgres microsecond precision, including offsets. Date.parse gives
+ *  the whole millisecond; restore its three discarded fractional digits without rounding or
+ *  relabelling the returned ISO string. Finer input fractions truncate as Python's parser does. */
+function writeTimeMicros(value: string): bigint | null {
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis) || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const fraction = value.match(/\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/)?.[1] ?? "";
+  const remainder = fraction.slice(3, 6).padEnd(3, "0");
+  return BigInt(millis) * 1000n + BigInt(remainder);
+}
+
 export async function recentFacts(client: ReadClient, input: unknown) {
   const args = recentArgs.parse(input);
   const until = args.until ?? new Date().toISOString();
-  const start = Date.parse(args.since),
-    end = Date.parse(until);
-  if (end <= start) throw new Error("until must be later than since");
+  const start = writeTimeMicros(args.since),
+    end = writeTimeMicros(until);
+  if (start === null || end === null || end <= start)
+    throw new Error("until must be later than since");
   const types = [...new Set(args.types)];
   // One top-N page per type is sufficient for the merged top N. Never scan history or let a
   // burst of synthesized observations displace every unconsolidated source fact by default.
@@ -239,8 +251,8 @@ export async function recentFacts(client: ReadClient, input: unknown) {
         throw new Error("Invalid Hindsight recent-memory totals");
       const facts = items.map((row) => shapeFact(row, [type], args.tags, args.tags_match));
       for (const fact of facts) {
-        const updated = fact.updated_at === null ? NaN : Date.parse(fact.updated_at);
-        if (!Number.isFinite(updated) || updated < start || updated >= end)
+        const updated = fact.updated_at === null ? null : writeTimeMicros(fact.updated_at);
+        if (updated === null || updated < start || updated >= end)
           throw new MemoryReadUnavailableError(
             "The server's updated-at window cannot be verified; no event-time substitute was used"
           );
@@ -250,9 +262,11 @@ export async function recentFacts(client: ReadClient, input: unknown) {
   );
   const facts = pages
     .flatMap((p) => p.facts)
-    .sort(
-      (a, b) => Date.parse(b.updated_at!) - Date.parse(a.updated_at!) || a.id.localeCompare(b.id)
-    );
+    .sort((a, b) => {
+      const left = writeTimeMicros(a.updated_at!)!,
+        right = writeTimeMicros(b.updated_at!)!;
+      return left > right ? -1 : left < right ? 1 : a.id.localeCompare(b.id);
+    });
   const bounded = boundFacts(facts, args.limit);
   return {
     source: "recent_list",
