@@ -29,6 +29,7 @@ from ..config import (
     DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
     DEFAULT_RERANKER_COHERE_MODEL,
     DEFAULT_RERANKER_COHERE_TIMEOUT,
+    DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
     DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE,
     DEFAULT_RERANKER_FLASHRANK_CACHE_DIR,
     DEFAULT_RERANKER_FLASHRANK_MODEL,
@@ -77,6 +78,7 @@ from .local_device import (
     select_local_device,
 )
 from .remote_retry import RetryPolicy, acall_with_retry
+from .rerank_input_budget import RerankInputBudgetError, ServerTokenizerBudget
 from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
 from .token_encoding import count_tokens, truncate_to_tokens
 
@@ -222,6 +224,9 @@ class CrossEncoderModel(ABC):
         if self.max_tokens_per_candidate is not None and pairs:
             docs = _truncate_docs_to_tokens([doc for _, doc in pairs], self.max_tokens_per_candidate)
             pairs = [(query, doc) for (query, _), doc in zip(pairs, docs)]
+        # Provider-specific fitting runs once, before tracing or retrying the model
+        # request. The trace then describes the copies actually sent, not full sources.
+        pairs = await self._prepare_pairs(pairs)
         if not self.traces_calls:
             return await self._predict_with_retry(pairs)
         return await trace_model_call(
@@ -232,6 +237,10 @@ class CrossEncoderModel(ABC):
             request={"queries": list(dict.fromkeys(q for q, _ in pairs)), "documents": [d for _, d in pairs]},
             output_of=lambda scores: {"scores": [float(score) for score in scores]},
         )
+
+    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Fit provider-specific inputs, leaving all other backends unchanged."""
+        return pairs
 
     async def _predict_with_retry(self, pairs: list[tuple[str, str]]) -> list[float]:
         if self.retry_policy is None:
@@ -860,6 +869,9 @@ class CohereCrossEncoder(CrossEncoderModel):
         base_url: str | None = None,
         timeout: float = 60.0,
         max_concurrent: int = DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
+        tokenizer_url: str | None = None,
+        max_input_tokens: int | None = None,
+        token_overhead: int = DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
     ):
         """
         Initialize Cohere cross-encoder client.
@@ -877,8 +889,22 @@ class CohereCrossEncoder(CrossEncoderModel):
         self.base_url = base_url
         self.timeout = timeout
         self.max_concurrent = max_concurrent
-        # Held around the request only, so the timeout covers server time, not the wait
-        # behind other recalls: without it a burst queues at the server, waits there past
+        if (tokenizer_url is None) != (max_input_tokens is None):
+            raise RerankInputBudgetError("Cohere tokenizer URL and maximum input tokens must be configured together")
+        self._input_budget = (
+            ServerTokenizerBudget(
+                rerank_url=base_url,
+                tokenizer_url=tokenizer_url,
+                api_key=api_key,
+                max_input_tokens=max_input_tokens,
+                token_overhead=token_overhead,
+                timeout=timeout,
+            )
+            if tokenizer_url is not None and max_input_tokens is not None
+            else None
+        )
+        # Held around each tokenizer group or model request, so timeouts cover server
+        # time, not the wait behind other recalls: otherwise a burst queues there past
         # the timeout and retries, adding load exactly when it is saturated.
         # CrossLoopSemaphore for the same reason as TypeSafeCrossEncoder's cap.
         self._semaphore = CrossLoopSemaphore(max_concurrent or DEFAULT_RERANKER_COHERE_MAX_CONCURRENT)
@@ -959,6 +985,22 @@ class CohereCrossEncoder(CrossEncoderModel):
             for (idx, _), score in zip(items, scores):
                 all_scores[idx] = score
         return all_scores
+
+    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        if self._input_budget is None or not pairs:
+            return pairs
+        if self._http_client is None or not self._http_client.initialized:
+            raise RuntimeError("Reranker not initialized. Call initialize() first.")
+        groups: dict[str, list[int]] = {}
+        for index, (query, _) in enumerate(pairs):
+            groups.setdefault(query, []).append(index)
+        fitted_pairs = list(pairs)
+        for query, indices in groups.items():
+            async with self._semaphore:
+                documents = await self._input_budget.fit(query, [pairs[index][1] for index in indices])
+            for index, document in zip(indices, documents):
+                fitted_pairs[index] = (query, document)
+        return fitted_pairs
 
     async def _rerank_group(self, query: str, texts: list[str]) -> list[float]:
         """Score ``texts`` against one query in a single request, within the concurrency cap."""
@@ -2891,6 +2933,9 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             base_url=member.cohere_base_url,
             timeout=member.cohere_timeout,
             max_concurrent=member.cohere_max_concurrent,
+            tokenizer_url=member.cohere_tokenizer_url,
+            max_input_tokens=member.cohere_max_input_tokens,
+            token_overhead=member.cohere_token_overhead,
         )
     elif provider == "openrouter":
         api_key = member.openrouter_api_key

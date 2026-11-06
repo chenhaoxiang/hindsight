@@ -688,6 +688,9 @@ ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
 ENV_RERANKER_TEI_HTTP_TIMEOUT = "HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT"
 ENV_RERANKER_COHERE_TIMEOUT = "HINDSIGHT_API_RERANKER_COHERE_TIMEOUT"
 ENV_RERANKER_COHERE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_COHERE_MAX_CONCURRENT"
+ENV_RERANKER_COHERE_TOKENIZER_URL = "HINDSIGHT_API_RERANKER_COHERE_TOKENIZER_URL"
+ENV_RERANKER_COHERE_MAX_INPUT_TOKENS = "HINDSIGHT_API_RERANKER_COHERE_MAX_INPUT_TOKENS"
+ENV_RERANKER_COHERE_TOKEN_OVERHEAD = "HINDSIGHT_API_RERANKER_COHERE_TOKEN_OVERHEAD"
 ENV_RERANKER_OPENROUTER_TIMEOUT = "HINDSIGHT_API_RERANKER_OPENROUTER_TIMEOUT"
 ENV_RERANKER_ZEROENTROPY_TIMEOUT = "HINDSIGHT_API_RERANKER_ZEROENTROPY_TIMEOUT"
 ENV_RERANKER_SILICONFLOW_TIMEOUT = "HINDSIGHT_API_RERANKER_SILICONFLOW_TIMEOUT"
@@ -1420,6 +1423,7 @@ DEFAULT_RERANKER_TEI_HTTP_TIMEOUT = 30.0  # HTTP timeout for TEI reranker reques
 # HTTP timeout (seconds) for remote rerank providers. Defaults match the previous
 # hardcoded constructor defaults so unset envs keep current behavior.
 DEFAULT_RERANKER_COHERE_TIMEOUT = 60.0
+DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD = 128
 # In-flight rerank requests per process. Excess requests queue locally, so the request
 # timeout measures server time rather than time spent behind other recalls.
 DEFAULT_RERANKER_COHERE_MAX_CONCURRENT = 16
@@ -2985,6 +2989,9 @@ class RerankerMemberConfig:
     cohere_base_url: str | None
     cohere_timeout: float
     cohere_max_concurrent: int
+    cohere_tokenizer_url: str | None
+    cohere_max_input_tokens: int | None
+    cohere_token_overhead: int
     # openrouter
     openrouter_api_key: str | None
     openrouter_model: str
@@ -3154,6 +3161,11 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 cohere_model=_member_str(base, "COHERE_MODEL", DEFAULT_RERANKER_COHERE_MODEL),
                 cohere_base_url=_member_opt_str(base, "COHERE_BASE_URL"),
                 cohere_timeout=_member_float(base, "COHERE_TIMEOUT", DEFAULT_RERANKER_COHERE_TIMEOUT),
+                cohere_tokenizer_url=_member_opt_str(base, "COHERE_TOKENIZER_URL"),
+                cohere_max_input_tokens=_member_opt_int(base, "COHERE_MAX_INPUT_TOKENS", None),
+                cohere_token_overhead=_member_int(
+                    base, "COHERE_TOKEN_OVERHEAD", DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD
+                ),
                 cohere_max_concurrent=_member_int(
                     base, "COHERE_MAX_CONCURRENT", DEFAULT_RERANKER_COHERE_MAX_CONCURRENT
                 ),
@@ -3612,6 +3624,9 @@ class HindsightConfig:
     reranker_cohere_base_url: str | None
     reranker_cohere_timeout: float
     reranker_cohere_max_concurrent: int
+    reranker_cohere_tokenizer_url: str | None
+    reranker_cohere_max_input_tokens: int | None
+    reranker_cohere_token_overhead: int
     reranker_openrouter_api_key: str | None
     reranker_openrouter_model: str
     reranker_openrouter_base_url: str
@@ -4298,6 +4313,9 @@ class HindsightConfig:
             cohere_base_url=self.reranker_cohere_base_url,
             cohere_timeout=self.reranker_cohere_timeout,
             cohere_max_concurrent=self.reranker_cohere_max_concurrent,
+            cohere_tokenizer_url=self.reranker_cohere_tokenizer_url,
+            cohere_max_input_tokens=self.reranker_cohere_max_input_tokens,
+            cohere_token_overhead=self.reranker_cohere_token_overhead,
             openrouter_api_key=self.reranker_openrouter_api_key,
             openrouter_model=self.reranker_openrouter_model,
             openrouter_base_url=self.reranker_openrouter_base_url,
@@ -5156,6 +5174,11 @@ class HindsightConfig:
             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
             reranker_cohere_base_url=os.getenv(ENV_RERANKER_COHERE_BASE_URL) or None,
+            reranker_cohere_tokenizer_url=os.getenv(ENV_RERANKER_COHERE_TOKENIZER_URL) or None,
+            reranker_cohere_max_input_tokens=_env_int(ENV_RERANKER_COHERE_MAX_INPUT_TOKENS),
+            reranker_cohere_token_overhead=int(
+                os.getenv(ENV_RERANKER_COHERE_TOKEN_OVERHEAD, str(DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD))
+            ),
             reranker_cohere_timeout=float(os.getenv(ENV_RERANKER_COHERE_TIMEOUT, str(DEFAULT_RERANKER_COHERE_TIMEOUT))),
             reranker_cohere_max_concurrent=int(
                 os.getenv(ENV_RERANKER_COHERE_MAX_CONCURRENT, str(DEFAULT_RERANKER_COHERE_MAX_CONCURRENT))
