@@ -128,6 +128,26 @@ def status_code_of(exc: BaseException) -> int | None:
     return None
 
 
+def is_invalid_remote_request(exc: BaseException) -> bool:
+    """Recognize deterministic SDK request errors even when a gateway wraps them in 5xx.
+
+    OpenAI SDK errors expose the structured upstream code/type on the exception.
+    Do not match prose: an overloaded backend mentioning a parameter is still transient.
+    Context overflow stays on reflect's existing partial-evidence synthesis path.
+    """
+    return (
+        getattr(exc, "code", None)
+        in {
+            "invalid_value",
+            "invalid_parameter",
+            "unsupported_parameter",
+            "unknown_parameter",
+            "missing_required_parameter",
+        }
+        or getattr(exc, "type", None) == "invalid_request_error"
+    )
+
+
 def is_transient_remote_error(exc: BaseException) -> bool:
     """
     Return True when ``exc`` is worth retrying.
@@ -137,6 +157,8 @@ def is_transient_remote_error(exc: BaseException) -> bool:
     permanent and must fail fast. Without a status code we fall back to
     transport-level exception types and known SDK exception names.
     """
+    if is_invalid_remote_request(exc):
+        return False
     status = status_code_of(exc)
     if status is not None:
         return status >= 500 or status in _TRANSIENT_STATUS_CODES

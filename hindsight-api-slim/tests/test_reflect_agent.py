@@ -1415,6 +1415,21 @@ class TestReflectAgentMocked:
         mock_llm.call.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_exhausted_transport_error_is_not_retried_by_the_agent(self, mock_llm, mock_functions):
+        """The provider already owns transport retries; the agent must not multiply them."""
+        mock_llm.call_with_tools.side_effect = ConnectionError("provider retries exhausted")
+        with pytest.raises(ConnectionError, match="provider retries exhausted"):
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+        assert mock_llm.call_with_tools.await_count == 1
+        mock_llm.call.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_transient_llm_error_is_still_retried(self, mock_llm, mock_functions):
         """One failed turn followed by a good one is a normal run, not a failure."""
         mock_llm.call_with_tools.side_effect = closing_echo(

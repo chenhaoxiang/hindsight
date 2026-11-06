@@ -1641,23 +1641,26 @@ _FAIR_FETCH_OVERFETCH = 5
 
 
 def _fair_group_slice(memories: list[StoredMemory], limit: int, quota: int) -> list[StoredMemory]:
-    """Oldest-first, but at most ``quota`` facts per consolidation group.
+    """Give each group its fair quota first, then fill spare capacity oldest-first.
 
-    ``memories`` must already be sorted oldest-first: groups are then visited in the order
-    of their oldest fact, and the round fills from the front. Keying is
-    ``_consolidation_batch_key``, the same key the dispatcher groups by, so a round that
-    holds N keys gives the dispatcher N groups to run in parallel.
+    A quota is a fairness reservation, not a hard ceiling: a bank whose facts all
+    target ``shared`` has only one group. Previously that bank read a fraction of
+    the requested batch, repeatedly paying for small tail calls. Filling unused
+    capacity does not introduce parallel writes or change scope isolation.
     """
     taken: list[StoredMemory] = []
+    skipped: list[StoredMemory] = []
     seen: defaultdict[tuple[str, ...], int] = defaultdict(int)
     for m in memories:
         key = _consolidation_batch_key({"tags": list(m.tags or []), "observation_scopes": m.observation_scopes})
         if seen[key] >= quota:
+            skipped.append(m)
             continue
         seen[key] += 1
         taken.append(m)
         if len(taken) >= limit:
-            break
+            return taken
+    taken.extend(skipped[: max(0, limit - len(taken))])
     return taken
 
 
@@ -1682,10 +1685,10 @@ async def _fetch_unconsolidated_rows(
     owns the oldest facts, and the dispatcher parallelises across groups — one group in the
     round means one LLM call at a time, whatever the parallelism, and a big group's backlog
     starves every other group until it drains (#4823). So read a window of
-    ``_FAIR_FETCH_OVERFETCH`` rounds and take at most ``ceil(limit / llm_parallelism)`` facts
-    per group, leaving enough distinct groups in the round to fill the parallel slots. Facts
-    are still consumed oldest-first *within* a group, which is the ordering consolidation
-    actually depends on.
+    ``_FAIR_FETCH_OVERFETCH`` rounds and first reserve ``ceil(limit / llm_parallelism)`` facts
+    per group, leaving enough distinct groups to fill the parallel slots. Unused reservations
+    are then filled oldest-first, so a bank with fewer groups still gets a full batch. Facts
+    remain oldest-first *within* each group, which is the ordering consolidation depends on.
     """
     store = get_memories()
     scopes: list[list[str] | None] = list(observation_scopes) if observation_scopes else [None]
@@ -2121,6 +2124,11 @@ async def _run_consolidation_job(
                             mark_consolidated_ids=sub_ids if is_final_pass else None,
                         )
                         sub_deleted += pass_deleted
+                        if pass_results and all(r.get("reason") == "source_changed_since_read" for r in pass_results):
+                            # The next fetch must re-read the new scope/version. A
+                            # later pass over this same stale snapshot cannot fix it.
+                            sub_results = pass_results
+                            break
                         if pass_failed:
                             # Stop the remaining scopes: the sub-batch is going to be bisected
                             # and re-run in full, and every write this pass made is already
@@ -2198,7 +2206,7 @@ async def _run_consolidation_job(
                     )
                     ignored_ids = {str(m["id"]) for m in ignored}
                     for m, r in zip(sub_batch, sub_results):
-                        if str(m["id"]) not in ignored_ids:
+                        if str(m["id"]) not in ignored_ids and r.get("reason") != "source_changed_since_read":
                             succeeded_ids.append(m["id"])
                             all_results.append(r)
                     if ignored:
@@ -3084,6 +3092,7 @@ async def _process_memory_batch(
     # bisects and retries them, and a stamp would exclude them from pending consolidation
     # for good. With neither writes nor stamps there is nothing to open a transaction for.
     stamp_ids = list(mark_consolidated_ids or []) if not llm_result.failed else []
+    sources_changed = False
     if prepared_deletes or prepared_updates or prepared_creates or stamp_ids:
         # One store batch for everything this response decided. The SQL transaction already makes
         # these writes all-or-nothing for a store that keeps its rows in SQL; a store whose every
@@ -3115,6 +3124,7 @@ async def _process_memory_batch(
                     await assert_job_bank_alive(conn, bank_id)
                     changed_ids = await _sources_changed_since_read(conn, bank_id, memories)
                     if changed_ids:
+                        sources_changed = True
                         # Drop the whole response, stamps included: the facts stay pending and the
                         # job's next fetch re-reads them as they are now (#4831).
                         logger.info(
@@ -3233,6 +3243,11 @@ async def _process_memory_batch(
     # Build per-memory result dicts for the stats tracker in the outer loop
     results: list[dict[str, Any]] = []
     for m in memories:
+        if sources_changed:
+            # This is not an LLM omission. Re-asking the unchanged in-memory copy
+            # would repeat a response that the version check must reject again.
+            results.append({"action": "deferred", "reason": "source_changed_since_read"})
+            continue
         mid = str(m["id"])
         created = mid in per_memory_created
         updated = mid in per_memory_updated
@@ -3996,8 +4011,10 @@ async def _consolidate_batch_with_llm(
                 },
                 lambda fid, oid: bool((ft := fact_time.get(fid)) and (ot := obs_time.get(oid)) and ot > ft),
                 # What the prompt marked: a fact's closest observations, and those newer than every fact.
-                lambda fid, oid: oid in (closest or {}).get(fid, ())
-                or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact),
+                lambda fid, oid: (
+                    oid in (closest or {}).get(fid, ())
+                    or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact)
+                ),
             )
             creates = response.creates
             # The answer's schema carries no cap on new observations: enforce the scope's here.

@@ -734,7 +734,7 @@ from .reflect.tools import (
     tool_search_mental_models,
     tool_search_observations,
 )
-from .remote_retry import RetryPolicy, is_transient_remote_error, status_code_of
+from .remote_retry import RetryPolicy, is_invalid_remote_request, is_transient_remote_error, status_code_of
 from .response_models import (
     DIRECTIVE_PRIORITY_MAX,
     DIRECTIVE_PRIORITY_MIN,
@@ -1736,6 +1736,7 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
         # tasks that let the provider's own error through (consolidation, refresh).
         or isinstance(e, ProviderAuthError)
         or status_code_of(e) in (401, 403)
+        or is_invalid_remote_request(e)
     )
 
 
@@ -5292,10 +5293,10 @@ class MemoryEngine(MemoryEngineInterface):
         for the same reason: its ``except`` blocks never ran, and without the record
         the automatic triggers would queue it again on the next tick (#4532).
 
-        Except when the ceiling fired during a retry backoff (``stage`` ends in
-        ``.backoff``): the time ran out waiting for a provider that had just failed,
-        not on a prompt that can never finish. That is the temporary failure #5394
-        already declines to pause on, so it is recorded without pausing (#5561).
+        Except when the ceiling fired during retry backoff or a local permit wait
+        (``stage`` ends in ``.backoff`` or ``.queued``): congestion is not proof that
+        the prompt cannot finish. The provider-failure path already declines to
+        pause on temporary failures (#5394, #5561); a local queue needs the same rule.
         """
         if task_dict.get("type") == "refresh_mental_model":
             token = _current_schema.set(schema)
@@ -5306,7 +5307,10 @@ class MemoryEngine(MemoryEngineInterface):
                     outcome="refresh_failed_error",
                     failure_reason="unexpected_error",
                     error_message=error_message,
-                    pause_automatic=not stage.endswith(".backoff"),
+                    # Waiting for a local permit says nothing about whether this
+                    # page can be refreshed. Like provider backoff, it must never
+                    # turn congestion into a permanent automatic-refresh pause.
+                    pause_automatic=not stage.endswith((".backoff", ".queued")),
                 )
             finally:
                 _current_schema.reset(token)

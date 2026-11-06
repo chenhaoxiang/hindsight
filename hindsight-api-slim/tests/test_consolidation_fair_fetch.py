@@ -51,15 +51,16 @@ class TestFairGroupSlice:
         taken = C._fair_group_slice(oldest_first, limit=8, quota=2)
 
         assert len(set(_keys(taken))) == 4, "every waiting group should get a slot in the round"
-        assert sum(1 for m in taken if not m.tags) == 2, "the big group is capped at its quota"
+        assert len(taken) == 8, "unused reservations must not shrink the round"
+        assert sum(1 for m in taken if not m.tags) == 5, "the big group uses only the spare slots"
 
     def test_fills_the_round_from_the_groups_that_have_facts(self):
-        # Only two groups exist, so the quota cannot fill an 8-fact round: take what there is.
+        # Two groups get their fair reservation, then use the spare capacity.
         oldest_first = [_mem([]) for _ in range(20)] + [_mem(["user:alice"]) for _ in range(20)]
 
         taken = C._fair_group_slice(oldest_first, limit=8, quota=2)
 
-        assert len(taken) == 4
+        assert len(taken) == 8
         assert len(set(_keys(taken))) == 2
 
     def test_stops_at_the_limit(self):
@@ -68,12 +69,19 @@ class TestFairGroupSlice:
 
     def test_keys_on_the_resolved_scope_not_raw_tags(self):
         # Two memories with different tags both target the untagged ``shared`` scope, so they
-        # are ONE group and share the quota — the grouping key the dispatcher uses, not tags.
+        # are ONE group. Spare capacity is refilled without inventing another write scope.
         oldest_first = [_mem(["user:alice"], "shared"), _mem(["user:bob"], "shared")]
 
         taken = C._fair_group_slice(oldest_first, limit=8, quota=1)
 
-        assert len(taken) == 1
+        assert len(taken) == 2
+        assert len(set(_keys(taken))) == 1
+
+    def test_shared_backlog_fills_the_requested_batch(self):
+        oldest_first = [_mem([f"project:{i}"], "shared") for i in range(200)]
+        taken = C._fair_group_slice(oldest_first, limit=100, quota=25)
+        assert taken == oldest_first[:100]
+        assert len(set(_keys(taken))) == 1
 
 
 async def _insert(conn, bank_id: str, text: str, tags: list[str], created_at: datetime) -> None:

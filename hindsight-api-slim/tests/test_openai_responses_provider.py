@@ -79,6 +79,35 @@ async def test_request_holds_attempt_context():
     assert llm.supports_attempt_scoped_concurrency()
 
 
+@pytest.mark.asyncio
+async def test_operator_can_disable_native_tools_without_disabling_schema_tools():
+    """A proxy may inject native image tools; explicit none must survive schema calls."""
+    llm = OpenAIResponsesLLM(
+        provider="openai-responses",
+        api_key="fixture-key",
+        base_url="https://fixture.invalid/v1",
+        model="gpt-6-luna",
+        reasoning_effort="high",
+        extra_body={"store": False, "tools": [], "tool_choice": "none"},
+    )
+    create = _mock_create(llm, _fake_response(output_text='{"answer":"fixture"}'))
+
+    class Answer(BaseModel):
+        answer: str
+
+    try:
+        result = await llm.call(
+            messages=[{"role": "user", "content": "fixture"}], response_format=Answer, strict_schema=True
+        )
+        params = create.call_args.kwargs
+        assert params["extra_body"] == {"store": False, "tools": [], "tool_choice": "none"}
+        assert params["reasoning"] == {"effort": "high"}
+        assert params["text"]["format"]["type"] == "json_schema"
+        assert result.content.answer == "fixture"
+    finally:
+        await llm.cleanup()
+
+
 # --------------------------------------------------------------------------- #
 # Registration / wiring
 # --------------------------------------------------------------------------- #

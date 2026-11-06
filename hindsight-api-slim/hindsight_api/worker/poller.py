@@ -1171,32 +1171,42 @@ class WorkerPoller:
         operation_type = task.task_dict.get("operation_type", "unknown")
         bank_id = task.task_dict.get("bank_id", "unknown")
 
-        # Stage holder is updated by engine code via stage.set_stage(); the
-        # poller reads it during periodic logging to surface what each
-        # in-flight task is doing.
-        holder = StageHolder(stage=f"queued.{task_type}")
-
-        # Create background task. The holder is passed in and bound to the
-        # task's own contextvar scope inside _execute_task_inner so engine
-        # code running under that task sees it via stage.set_stage().
-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
-
-        # Track this task as active
+        # Reserved slots are a floor, not a cap. Starting every claimed refresh
+        # while only two LLM permits exist burns the other jobs' wall budgets in
+        # the semaphore queue. Keep excess refreshes pending instead; admission
+        # and in-flight registration share the lock so concurrent callers agree.
+        refresh_limit = get_config().mental_model_refresh_llm_max_concurrent
+        deferred = False
         async with self._in_flight_lock:
-            self._active_tasks[task.operation_id] = ActiveTaskInfo(
-                op_type=operation_type,
-                bank_id=bank_id,
-                schema=task.schema,
-                bg_task=bg_task,
-                started_at=time.monotonic(),
-                stage_holder=holder,
-                task_type=task_type,
+            if (
+                task_type == "refresh_mental_model"
+                and refresh_limit is not None
+                and refresh_limit > 0
+                and self._in_flight_by_type.get(operation_type, 0) >= refresh_limit
+            ):
+                deferred = True
+            else:
+                holder = StageHolder(stage=f"queued.{task_type}")
+                bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+                self._active_tasks[task.operation_id] = ActiveTaskInfo(
+                    op_type=operation_type,
+                    bank_id=bank_id,
+                    schema=task.schema,
+                    bg_task=bg_task,
+                    started_at=time.monotonic(),
+                    stage_holder=holder,
+                    task_type=task_type,
+                )
+                self._in_flight_count += 1
+                self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
+                bg_task.add_done_callback(
+                    lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type))
+                )
+        if deferred:
+            retry_at = datetime.now(timezone.utc) + timedelta(seconds=get_config().worker_task_retry_backoff_seconds)
+            await self._write_terminal(
+                task, "deferred", lambda: self._defer_all(task, retry_at, "waiting for refresh execution capacity")
             )
-            self._in_flight_count += 1
-            self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
-
-        # Add cleanup callback
-        bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
 
     async def _cleanup_task(self, operation_id: str, operation_type: str):
         """Remove task from tracking after completion."""
@@ -1328,9 +1338,18 @@ class WorkerPoller:
             stage = holder.stage if holder is not None else "unknown"
             message = e.describe(task_type, stage)
             logger.error(f"Task {task.operation_id} timed out: {message}")
-            await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
-            await self._notify_wall_timeout(task, message, stage)
-            terminal_success = False
+            config = get_config()
+            if (
+                task_type == "refresh_mental_model"
+                and stage.endswith(".queued")
+                and task.task_dict.get("_retry_count", 0) < config.worker_max_retries
+            ):
+                retry_at = datetime.now(timezone.utc) + timedelta(seconds=config.worker_task_retry_backoff_seconds)
+                await self._write_terminal(task, "retry", lambda: self._schedule_retry_all(task, retry_at, message))
+            else:
+                await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
+                await self._notify_wall_timeout(task, message, stage)
+                terminal_success = False
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
             defer = e

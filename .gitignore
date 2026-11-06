@@ -24,8 +24,15 @@ node_modules/
 # pointing a scratch worktree at an installed one) is a file, slips past it, and can be committed.
 node_modules
 
+# Local-only runtime evidence and credentials never belong in public artifacts.
+/tmp/
+/keys-local/
+
 # Environment variables and local config
 .env
+.env.*
+!.env.example
+!.env.*.example
 .env.bak*
 .env.*.bak
 docker-compose.yml

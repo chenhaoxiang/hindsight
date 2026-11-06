@@ -84,9 +84,10 @@ jobs:
       integrations-roo-code: ${{ steps.filter.outputs.integrations-roo-code }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs and workflow_dispatch.
-      # Fork PRs via pull_request event do NOT have access to secrets.
-      has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Upstream live-provider jobs are not part of this fork's deterministic CI.
+      # Keep upstream behavior unchanged, but never treat a same-fork PR as consent
+      # to send synthetic or private input to a billable provider.
+      has_secrets: ${{ github.repository == 'vectorize-io/hindsight' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
     - uses: actions/checkout@v6
 
