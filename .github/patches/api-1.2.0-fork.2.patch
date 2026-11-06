@@ -1,0 +1,871 @@
+diff --git a/hindsight-api-slim/hindsight_api/__init__.py b/hindsight-api-slim/hindsight_api/__init__.py
+--- a/hindsight-api-slim/hindsight_api/__init__.py
++++ b/hindsight-api-slim/hindsight_api/__init__.py
+@@ -43 +43 @@
+-__version__ = "1.2.0"
++__version__ = "1.2.0-fork.2"
+diff --git a/hindsight-api-slim/hindsight_api/config.py b/hindsight-api-slim/hindsight_api/config.py
+--- a/hindsight-api-slim/hindsight_api/config.py
++++ b/hindsight-api-slim/hindsight_api/config.py
+@@ -527,0 +528 @@
++ENV_MENTAL_MODEL_DELTA_TIMEOUT = "HINDSIGHT_API_MENTAL_MODEL_DELTA_TIMEOUT"
+@@ -689,0 +691,3 @@
++ENV_RERANKER_COHERE_TOKENIZER_URL = "HINDSIGHT_API_RERANKER_COHERE_TOKENIZER_URL"
++ENV_RERANKER_COHERE_MAX_INPUT_TOKENS = "HINDSIGHT_API_RERANKER_COHERE_MAX_INPUT_TOKENS"
++ENV_RERANKER_COHERE_TOKEN_OVERHEAD = "HINDSIGHT_API_RERANKER_COHERE_TOKEN_OVERHEAD"
+@@ -1421,0 +1426 @@
++DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD = 128
+@@ -2986,0 +2992,3 @@
++    cohere_tokenizer_url: str | None
++    cohere_max_input_tokens: int | None
++    cohere_token_overhead: int
+@@ -3155,0 +3164,5 @@
++                cohere_tokenizer_url=_member_opt_str(base, "COHERE_TOKENIZER_URL"),
++                cohere_max_input_tokens=_member_opt_int(base, "COHERE_MAX_INPUT_TOKENS", None),
++                cohere_token_overhead=_member_int(
++                    base, "COHERE_TOKEN_OVERHEAD", DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD
++                ),
+@@ -3512,0 +3526,2 @@
++    # Optional wall budget for the whole edit/retraction phase, not full synthesis.
++    mental_model_delta_timeout: float | None
+@@ -3611,0 +3627,3 @@
++    reranker_cohere_tokenizer_url: str | None
++    reranker_cohere_max_input_tokens: int | None
++    reranker_cohere_token_overhead: int
+@@ -4297,0 +4316,3 @@
++            cohere_tokenizer_url=self.reranker_cohere_tokenizer_url,
++            cohere_max_input_tokens=self.reranker_cohere_max_input_tokens,
++            cohere_token_overhead=self.reranker_cohere_token_overhead,
+@@ -4411,0 +4433,2 @@
++        if self.mental_model_delta_timeout is not None and not (0 < self.mental_model_delta_timeout < float("inf")):
++            raise ValueError(f"{ENV_MENTAL_MODEL_DELTA_TIMEOUT} must be a finite positive number")
+@@ -4797,0 +4821 @@
++            mental_model_delta_timeout=_env_float(ENV_MENTAL_MODEL_DELTA_TIMEOUT),
+@@ -5152,0 +5177,5 @@
++            reranker_cohere_tokenizer_url=os.getenv(ENV_RERANKER_COHERE_TOKENIZER_URL) or None,
++            reranker_cohere_max_input_tokens=_env_int(ENV_RERANKER_COHERE_MAX_INPUT_TOKENS),
++            reranker_cohere_token_overhead=int(
++                os.getenv(ENV_RERANKER_COHERE_TOKEN_OVERHEAD, str(DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD))
++            ),
+diff --git a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+--- a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
++++ b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+@@ -60,0 +61 @@
++from ..remote_retry import is_invalid_remote_request
+@@ -1643,6 +1644,6 @@
+-    """Oldest-first, but at most ``quota`` facts per consolidation group.
+-
+-    ``memories`` must already be sorted oldest-first: groups are then visited in the order
+-    of their oldest fact, and the round fills from the front. Keying is
+-    ``_consolidation_batch_key``, the same key the dispatcher groups by, so a round that
+-    holds N keys gives the dispatcher N groups to run in parallel.
++    """Give each group its fair quota first, then fill spare capacity oldest-first.
++
++    A quota is a fairness reservation, not a hard ceiling: a bank whose facts all
++    target ``shared`` has only one group. Previously that bank read a fraction of
++    the requested batch, repeatedly paying for small tail calls. Filling unused
++    capacity does not introduce parallel writes or change scope isolation.
+@@ -1650,0 +1652 @@
++    skipped: list[StoredMemory] = []
+@@ -1654,0 +1657 @@
++            skipped.append(m)
+@@ -1659 +1662,2 @@
+-            break
++            return taken
++    taken.extend(skipped[: max(0, limit - len(taken))])
+@@ -1684,4 +1688,4 @@
+-    ``_FAIR_FETCH_OVERFETCH`` rounds and take at most ``ceil(limit / llm_parallelism)`` facts
+-    per group, leaving enough distinct groups in the round to fill the parallel slots. Facts
+-    are still consumed oldest-first *within* a group, which is the ordering consolidation
+-    actually depends on.
++    ``_FAIR_FETCH_OVERFETCH`` rounds and first reserve ``ceil(limit / llm_parallelism)`` facts
++    per group, leaving enough distinct groups to fill the parallel slots. Unused reservations
++    are then filled oldest-first, so a bank with fewer groups still gets a full batch. Facts
++    remain oldest-first *within* each group, which is the ordering consolidation depends on.
+@@ -2122,0 +2127,5 @@
++                        if pass_results and all(r.get("reason") == "source_changed_since_read" for r in pass_results):
++                            # The next fetch must re-read the new scope/version. A
++                            # later pass over this same stale snapshot cannot fix it.
++                            sub_results = pass_results
++                            break
+@@ -2200 +2209 @@
+-                        if str(m["id"]) not in ignored_ids:
++                        if str(m["id"]) not in ignored_ids and r.get("reason") != "source_changed_since_read":
+@@ -3085,0 +3095 @@
++    sources_changed = False
+@@ -3111,0 +3122 @@
++                        sources_changed = True
+@@ -3229,0 +3241,5 @@
++        if sources_changed:
++            # This is not an LLM omission. Re-asking the unchanged in-memory copy
++            # would repeat a response that the version check must reject again.
++            results.append({"action": "deferred", "reason": "source_changed_since_read"})
++            continue
+@@ -3819,0 +3836,4 @@
++        return _BatchFailureClass.PROPAGATE
++    if is_invalid_remote_request(exc, include_generic_type=False):
++        # A provider parameter does not become valid when the fact list is
++        # bisected. Propagate instead of exhausting every fact's retry budget.
+@@ -3993,2 +4013,4 @@
+-                lambda fid, oid: oid in (closest or {}).get(fid, ())
+-                or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact),
++                lambda fid, oid: (
++                    oid in (closest or {}).get(fid, ())
++                    or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact)
++                ),
+diff --git a/hindsight-api-slim/hindsight_api/engine/cross_encoder.py b/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
+--- a/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
++++ b/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
+@@ -31,0 +32 @@
++    DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
+@@ -79,0 +81 @@
++from .rerank_input_budget import RerankInputBudgetError, ServerTokenizerBudget
+@@ -224,0 +227,3 @@
++        # Provider-specific fitting runs once, before tracing or retrying the model
++        # request. The trace then describes the copies actually sent, not full sources.
++        pairs = await self._prepare_pairs(pairs)
+@@ -234,0 +240,4 @@
++
++    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
++        """Fit provider-specific inputs, leaving all other backends unchanged."""
++        return pairs
+@@ -862,0 +872,3 @@
++        tokenizer_url: str | None = None,
++        max_input_tokens: int | None = None,
++        token_overhead: int = DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
+@@ -880,2 +892,16 @@
+-        # Held around the request only, so the timeout covers server time, not the wait
+-        # behind other recalls: without it a burst queues at the server, waits there past
++        if (tokenizer_url is None) != (max_input_tokens is None):
++            raise RerankInputBudgetError("Cohere tokenizer URL and maximum input tokens must be configured together")
++        self._input_budget = (
++            ServerTokenizerBudget(
++                rerank_url=base_url,
++                tokenizer_url=tokenizer_url,
++                api_key=api_key,
++                max_input_tokens=max_input_tokens,
++                token_overhead=token_overhead,
++                timeout=timeout,
++            )
++            if tokenizer_url is not None and max_input_tokens is not None
++            else None
++        )
++        # Held around each tokenizer group or model request, so timeouts cover server
++        # time, not the wait behind other recalls: otherwise a burst queues there past
+@@ -961,0 +988,16 @@
++
++    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
++        if self._input_budget is None or not pairs:
++            return pairs
++        if self._http_client is None or not self._http_client.initialized:
++            raise RuntimeError("Reranker not initialized. Call initialize() first.")
++        groups: dict[str, list[int]] = {}
++        for index, (query, _) in enumerate(pairs):
++            groups.setdefault(query, []).append(index)
++        fitted_pairs = list(pairs)
++        for query, indices in groups.items():
++            async with self._semaphore:
++                documents = await self._input_budget.fit(query, [pairs[index][1] for index in indices])
++            for index, document in zip(indices, documents):
++                fitted_pairs[index] = (query, document)
++        return fitted_pairs
+@@ -2893,0 +2936,3 @@
++            tokenizer_url=member.cohere_tokenizer_url,
++            max_input_tokens=member.cohere_max_input_tokens,
++            token_overhead=member.cohere_token_overhead,
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_attempts.py b/hindsight-api-slim/hindsight_api/engine/llm_attempts.py
+new file mode 100644
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/llm_attempts.py
+@@ -0,0 +1,69 @@
++"""Bounded, payload-free provider attempts attached to one logical LLM trace.
++
++The wrapper owns a fresh sink per call. Providers opt in without adding trace
++rows, changing token accounting, or sharing mutable state between concurrent
++calls. Unknown upstream work/usage is not inferred from a successful retry.
++"""
++
++from contextvars import ContextVar, Token
++from dataclasses import dataclass, field, replace
++from typing import Literal
++
++
++@dataclass
++class ProviderAttempt:
++    attempt: int
++    outcome: Literal["queued", "response", "http_error", "transport_error", "parse_error", "error", "cancelled"] = (
++        "queued"
++    )
++    queue_wait_ms: int = 0
++    request_ms: int | None = None
++    elapsed_ms: int = 0
++    backoff_ms: int = 0
++    planned_backoff_ms: int = 0
++    http_status: int | None = None
++    error_type: str | None = None
++    request_id: str | None = None
++
++
++@dataclass(frozen=True)
++class ProviderAttemptSummary:
++    total: int
++    omitted: int
++    records: list[ProviderAttempt]
++
++
++@dataclass
++class ProviderAttemptLog:
++    records: list[ProviderAttempt] = field(default_factory=list)
++    total: int = 0
++
++    def start(self, attempt: int) -> ProviderAttempt:
++        self.total += 1
++        record = ProviderAttempt(attempt=attempt)
++        # Even a caller-configured huge retry count must not make tracing unbounded.
++        if len(self.records) < 32:
++            self.records.append(record)
++        return record
++
++    def summary(self) -> ProviderAttemptSummary:
++        return ProviderAttemptSummary(
++            total=self.total,
++            omitted=self.total - len(self.records),
++            records=[replace(record) for record in self.records],
++        )
++
++
++_attempt_log: ContextVar[ProviderAttemptLog | None] = ContextVar("hindsight_provider_attempts", default=None)
++
++
++def bind_provider_attempts() -> Token:
++    return _attempt_log.set(ProviderAttemptLog())
++
++
++def reset_provider_attempts(token: Token) -> None:
++    _attempt_log.reset(token)
++
++
++def current_provider_attempts() -> ProviderAttemptLog | None:
++    return _attempt_log.get()
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_trace.py b/hindsight-api-slim/hindsight_api/engine/llm_trace.py
+--- a/hindsight-api-slim/hindsight_api/engine/llm_trace.py
++++ b/hindsight-api-slim/hindsight_api/engine/llm_trace.py
+@@ -41 +41 @@
+-from dataclasses import dataclass, field
++from dataclasses import asdict, dataclass, field
+@@ -817,0 +818,6 @@
++        from .llm_attempts import current_provider_attempts
++
++        attempts = current_provider_attempts()
++        if attempts is not None and attempts.total:
++            # Snapshot now: retries and concurrent calls must not mutate a buffered row.
++            llm_info["provider_attempts"] = asdict(attempts.summary())
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py b/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
+--- a/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
++++ b/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
+@@ -4,0 +5 @@
++import asyncio
+@@ -1408,0 +1410,3 @@
++        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
++
++        attempt_token = bind_provider_attempts()
+@@ -1445 +1449 @@
+-                except Exception as e:
++                except (Exception, asyncio.CancelledError) as e:
+@@ -1475,0 +1480 @@
++            reset_provider_attempts(attempt_token)
+@@ -1651,0 +1657,3 @@
++        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
++
++        attempt_token = bind_provider_attempts()
+@@ -1677 +1685 @@
+-                except Exception as e:
++                except (Exception, asyncio.CancelledError) as e:
+@@ -1707,0 +1716 @@
++            reset_provider_attempts(attempt_token)
+diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+--- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
++++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+@@ -29 +29 @@
+-from dataclasses import dataclass, field, replace
++from dataclasses import asdict, dataclass, field, replace
+@@ -730 +730 @@
+-from .remote_retry import RetryPolicy, is_transient_remote_error, status_code_of
++from .remote_retry import RetryPolicy, is_invalid_remote_request, is_transient_remote_error, status_code_of
+@@ -1715,0 +1716 @@
++        or is_invalid_remote_request(e)
+@@ -1887,0 +1889,13 @@
++
++
++@dataclass(frozen=True)
++class _ExactKnowledgeHit:
++    """A scoped identity result, serialized into the existing search envelope."""
++
++    id: str
++    name: str
++    mental_model_id: str | None
++    source_query: str | None
++    snippet: str
++    updated_at: str | None
++    score: float = 1.0
+@@ -5250,4 +5264,4 @@
+-        Except when the ceiling fired during a retry backoff (``stage`` ends in
+-        ``.backoff``): the time ran out waiting for a provider that had just failed,
+-        not on a prompt that can never finish. That is the temporary failure #5394
+-        already declines to pause on, so it is recorded without pausing (#5561).
++        Except when the ceiling fired during retry backoff or a local permit wait
++        (``stage`` ends in ``.backoff`` or ``.queued``): congestion is not proof that
++        the prompt cannot finish. The provider-failure path already declines to
++        pause on temporary failures (#5394, #5561); a local queue needs the same rule.
+@@ -5264 +5278,4 @@
+-                    pause_automatic=not stage.endswith(".backoff"),
++                    # Waiting for a local permit says nothing about whether this
++                    # page can be refreshed. Like provider backoff, it must never
++                    # turn congestion into a permanent automatic-refresh pause.
++                    pause_automatic=not stage.endswith((".backoff", ".queued", ".budget_exhausted")),
+@@ -18629,0 +18647,11 @@
++        # Full synthesis has already run. The retraction/edit calls and any corrected
++        # response now share ONE phase budget, clamped to this task's remaining wall time.
++        from ..worker.stage import get_task_deadline
++
++        edit_deadline = get_task_deadline()
++        edit_timeout = get_config().mental_model_delta_timeout
++        if edit_timeout is not None:
++            configured_deadline = asyncio.get_running_loop().time() + edit_timeout
++            edit_deadline = (
++                min(edit_deadline, configured_deadline) if edit_deadline is not None else configured_deadline
++            )
+@@ -18696,0 +18725 @@
++                            deadline=edit_deadline,
+@@ -18719,0 +18749,7 @@
++                        # A transport outage or control signal is not an invalid edit. Preserve
++                        # its type for the task's retry/defer/cancel policy; swallowing it here
++                        # could advance the watermark while leaving a retired claim in place.
++                        if isinstance(
++                            exc, (OperationCancelledError, ProviderRateLimitResetError)
++                        ) or is_transient_remote_error(exc):
++                            raise
+@@ -18827,0 +18864 @@
++                        deadline=edit_deadline,
+@@ -18878,0 +18916,7 @@
++                    # Do not turn a temporary provider failure into delta_ops_failed: that
++                    # refusal pauses automatic refresh and hides the original retryability.
++                    # Structural/schema failures still follow the data-preserving refusal.
++                    if isinstance(
++                        exc, (OperationCancelledError, ProviderRateLimitResetError)
++                    ) or is_transient_remote_error(exc):
++                        raise
+@@ -20531,2 +20575,3 @@
+-        similarity (``mm.embedding``) using Reciprocal Rank Fusion, in a single
+-        round trip. No reranker — this path is tuned for latency. Returns pages
++        similarity (``mm.embedding``) using Reciprocal Rank Fusion. A bounded exact
++        title lookup precedes hybrid ranking, so identity matches cannot disappear
++        below an ANN/BM25 candidate cut. No reranker. Returns pages
+@@ -20536 +20581,4 @@
+-        ``score`` is normalized to ``0..1``, where 1.0 is the best a page can do
++        Case-insensitive full-title matches come first with score 1.0; the title is
++        not tokenized, so Chinese titles and punctuation work without a text index.
++        Other pages retain the existing rank-fusion score, normalized to ``0..1``,
++        where 1.0 is the best a non-exact page can do
+@@ -20577,4 +20624,0 @@
+-        # Embed with the query input type (asymmetric models prefix queries).
+-        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
+-        emb_str = str(emb[0]) if emb and emb[0] else None
+-
+@@ -20583,0 +20628,38 @@
++        exact_tags = tag_filter.clause(3)
++        backend = await self._get_backend()
++        async with acquire_with_retry(backend) as conn:
++            exact_rows = await conn.fetch(
++                f"""
++                SELECT kp.id, kp.name, kp.mental_model_id,
++                       LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at
++                FROM {join}
++                WHERE kp.bank_id = $1 AND kp.kind = 'page' AND LOWER(kp.name) = LOWER($2)
++                      {exact_tags.sql}
++                ORDER BY kp.name, kp.id
++                LIMIT {limit}
++                """,
++                bank_id,
++                query,
++                *exact_tags.params,
++            )
++        exact_ids = {r["id"] for r in exact_rows}
++        exact_results = [
++            asdict(
++                _ExactKnowledgeHit(
++                    id=r["id"],
++                    name=r["name"],
++                    mental_model_id=r["mental_model_id"],
++                    source_query=r["source_query"],
++                    snippet=_knowledge_snippet(r["snippet"]),
++                    updated_at=r["updated_at"].isoformat() if r["updated_at"] else None,
++                )
++            )
++            for r in exact_rows
++        ]
++        if len(exact_results) == limit:
++            return exact_results
++
++        # Embed only after the scoped identity lookup. An exact-only result does
++        # not depend on a working embedding service or the text-search index.
++        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
++        emb_str = str(emb[0]) if emb and emb[0] else None
+@@ -20600 +20682 @@
+-                return []
++                return exact_results
+@@ -20638 +20720 @@
+-            return out[:limit]
++            return (exact_results + [hit for hit in out if hit["id"] not in exact_ids])[:limit]
+@@ -20662 +20744 @@
+-            return []
++            return exact_results
+@@ -20777 +20859 @@
+-        return [
++        hybrid_results = [
+@@ -20787,0 +20870 @@
++            if r["id"] not in exact_ids
+@@ -20788,0 +20872 @@
++        return (exact_results + hybrid_results)[:limit]
+diff --git a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+--- a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
++++ b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+@@ -43,0 +44 @@
++from hindsight_api.engine.llm_attempts import ProviderAttempt, current_provider_attempts
+@@ -61 +62 @@
+-from hindsight_api.engine.remote_retry import jittered_backoff
++from hindsight_api.engine.remote_retry import is_invalid_remote_request, jittered_backoff
+@@ -352,0 +354,12 @@
++
++        async def backoff(record: ProviderAttempt, seconds: float) -> None:
++            record.planned_backoff_ms = int(seconds * 1000)
++            # The wall-timeout handler distinguishes temporary backoff from execution.
++            # Previously the last attempt label survived the sleep and could freeze a page.
++            set_stage(f"llm.{self.provider}.{scope}.backoff")
++            started = time.perf_counter()
++            try:
++                await asyncio.sleep(seconds)
++            finally:
++                record.backoff_ms = int((time.perf_counter() - started) * 1000)
++
+@@ -353,0 +367,4 @@
++            log = current_provider_attempts()
++            record = log.start(attempt + 1) if log is not None else ProviderAttempt(attempt=attempt + 1)
++            attempt_started = time.perf_counter()
++            request_started: float | None = None
+@@ -355,0 +373,2 @@
++                    request_started = time.perf_counter()
++                    record.queue_wait_ms = int((request_started - attempt_started) * 1000)
+@@ -360,0 +380,8 @@
++                record.outcome = "response"
++                record.http_status = 200
++                record.request_ms = int((time.perf_counter() - request_started) * 1000)
++                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
++                # Only the SDK's bounded correlation id; never headers, error prose or payloads.
++                request_id = getattr(response, "_request_id", None)
++                if isinstance(request_id, str) and len(request_id) <= 128:
++                    record.request_id = request_id
+@@ -371,0 +399,4 @@
++            except asyncio.CancelledError:
++                record.outcome = "cancelled"
++                record.error_type = "CancelledError"
++                raise
+@@ -372,0 +404,2 @@
++                record.outcome = "parse_error"
++                record.error_type = type(e).__name__
+@@ -380 +413 @@
+-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
++                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
+@@ -384,0 +418,2 @@
++                record.outcome = "transport_error"
++                record.error_type = type(e).__name__
+@@ -394 +429 @@
+-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
++                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
+@@ -398,0 +434,13 @@
++                record.outcome = "http_error"
++                record.error_type = type(e).__name__
++                record.http_status = e.status_code
++                request_id = getattr(e, "request_id", None)
++                if isinstance(request_id, str) and len(request_id) <= 128:
++                    record.request_id = request_id
++                if is_invalid_remote_request(e):
++                    # A proxy can wrap invalid_value in HTTP 502. Replaying the same
++                    # payload cannot fix it and multiplies the outer worker retries.
++                    logger.error(
++                        "Invalid Responses request (%s/%s, scope=%s), not retrying", self.provider, self.model, scope
++                    )
++                    raise
+@@ -414 +462 @@
+-                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
++                    await backoff(record, jittered_backoff(attempt, initial_backoff, max_backoff))
+@@ -420,0 +469,10 @@
++            except Exception as e:
++                record.outcome = "error"
++                record.error_type = type(e).__name__
++                raise
++            finally:
++                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
++                if request_started is None:
++                    record.queue_wait_ms = record.elapsed_ms
++                elif record.request_ms is None:
++                    record.request_ms = max(0, record.elapsed_ms - record.queue_wait_ms - record.backoff_ms)
+diff --git a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+--- a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
++++ b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+@@ -23,0 +24 @@
++from ..remote_retry import is_invalid_remote_request, is_transient_remote_error
+@@ -1415,0 +1417,4 @@
++                # Transport retries already ran inside the provider. A second agent
++                # iteration repeats that whole budget without gathering any evidence.
++                if is_invalid_remote_request(e) or is_transient_remote_error(e):
++                    raise
+diff --git a/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py b/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
+--- a/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
++++ b/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
+@@ -43,0 +44 @@
++import asyncio
+@@ -51,0 +53,2 @@
++from hindsight_api.cancellation import OperationCancelledError
++from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+@@ -523,0 +527,58 @@
++    deadline: float | None = None,
++    **call_kwargs: Any,
++) -> DeltaOperationList:
++    """One shared edit deadline, including provider retries and the semantic correction.
++
++    An exhausted budget is temporary, never permission to overwrite the old page
++    with a partial candidate. External cancellation is still external cancellation.
++    """
++    from hindsight_api.worker.stage import set_stage
++
++    if deadline is not None and deadline <= asyncio.get_running_loop().time():
++        set_stage("mental_model_delta.budget_exhausted")
++        raise TimeoutError("Delta edit has no remaining stage budget")
++    try:
++        async with asyncio.timeout_at(deadline):
++            result = await _request_delta_operations(
++                llm,
++                system_prompt=system_prompt,
++                user_prompt=user_prompt,
++                scope=scope,
++                document=document,
++                deadline=deadline,
++                **call_kwargs,
++            )
++            # A provider may suppress cancellation or finish between timer ticks.
++            # A late answer must not turn an expired budget into permission to write.
++            if deadline is not None and deadline <= asyncio.get_running_loop().time():
++                raise TimeoutError("Delta edit completed after its stage deadline")
++            return result
++    except (OperationCancelledError, ProviderRateLimitResetError):
++        # A caller cancellation or a provider's known reset remains a control signal.
++        raise
++    except Exception as exc:
++        if deadline is not None and deadline <= asyncio.get_running_loop().time() and not isinstance(exc, TimeoutError):
++            # Validation exceptions from a late/cancellation-suppressing provider are
++            # not allowed to turn a spent budget into a structural permanent pause.
++            raise TimeoutError("Delta edit failed after its stage deadline") from exc
++        raise
++    finally:
++        if deadline is not None and deadline <= asyncio.get_running_loop().time():
++            # Runs even if the outer worker ceiling cancels at the same deadline.
++            # That cancellation must not be mistaken for a deterministic page failure.
++            set_stage("mental_model_delta.budget_exhausted")
++
++
++def _check_edit_deadline(deadline: float | None) -> None:
++    if deadline is not None and deadline <= asyncio.get_running_loop().time():
++        raise TimeoutError("Delta edit completed after its stage deadline")
++
++
++async def _request_delta_operations(
++    llm: ConfiguredLLMProvider,
++    *,
++    system_prompt: str,
++    user_prompt: str,
++    scope: str,
++    document: StructuredDocument | None = None,
++    deadline: float | None = None,
+@@ -557,0 +619 @@
++    _check_edit_deadline(deadline)
+@@ -558,0 +621 @@
++    _check_edit_deadline(deadline)
+@@ -587,0 +651 @@
++    _check_edit_deadline(deadline)
+@@ -588,0 +653 @@
++    _check_edit_deadline(deadline)
+diff --git a/hindsight-api-slim/hindsight_api/engine/remote_retry.py b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+--- a/hindsight-api-slim/hindsight_api/engine/remote_retry.py
++++ b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+@@ -46,0 +47 @@
++        "RetryableResponsesError",
+@@ -130,0 +132,26 @@
++def is_invalid_remote_request(exc: BaseException, *, include_generic_type: bool = True) -> bool:
++    """Recognize deterministic SDK request errors even when a gateway wraps them in 5xx.
++
++    OpenAI SDK errors expose the structured upstream code/type on the exception.
++    Do not match prose: an overloaded backend mentioning a parameter is still transient.
++    Context overflow stays on reflect's existing partial-evidence synthesis path.
++    Consolidation excludes a generic error type: it may describe an oversized
++    batch that adaptive bisection can rescue, not an invalid provider parameter.
++    """
++    return getattr(exc, "code", None) in {
++        "invalid_value",
++        "invalid_parameter",
++        "unsupported_parameter",
++        "unsupported_value",
++        "unknown_parameter",
++        "missing_required_parameter",
++    } or (
++        include_generic_type
++        and getattr(exc, "type", None) == "invalid_request_error"
++        # Compatible providers also use this generic envelope for 429/5xx. Only an
++        # explicit parameter code may override a transient HTTP status; otherwise a
++        # temporary outage would permanently pause automatic page refreshes.
++        and ((status := status_code_of(exc)) is None or (400 <= status < 500 and status not in _TRANSIENT_STATUS_CODES))
++    )
++
++
+@@ -139,0 +167,2 @@
++    if is_invalid_remote_request(exc):
++        return False
+diff --git a/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py b/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py
+new file mode 100644
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py
+@@ -0,0 +1,129 @@
++"""Opt-in input fitting for a self-hosted Cohere-compatible reranker.
++
++Use that server's llama.cpp-compatible tokenizer, not Hindsight's fact tokenizer.
++Only ranking copies are shortened; queries and stored source text stay intact.
++"""
++
++import asyncio
++import math
++from urllib.parse import urlsplit, urlunsplit
++
++from pydantic import BaseModel, StrictInt, StrictStr
++
++from .aiohttp_session import LoopLocalSession, per_phase_timeout, raise_for_status
++
++
++class RerankInputBudgetError(ValueError):
++    """An input cannot be safely fitted to the configured server budget."""
++
++
++class _TokenizedText(BaseModel):
++    tokens: list[StrictInt]
++
++
++class _DetokenizedText(BaseModel):
++    content: StrictStr
++
++
++class ServerTokenizerBudget:
++    """Fit query/document pairs with the same tokenizer used by the serving model."""
++
++    def __init__(
++        self,
++        *,
++        rerank_url: str | None,
++        tokenizer_url: str,
++        api_key: str,
++        max_input_tokens: int,
++        token_overhead: int = 128,
++        timeout: float = 30.0,
++    ) -> None:
++        if max_input_tokens <= 0 or token_overhead < 0 or token_overhead >= max_input_tokens:
++            raise RerankInputBudgetError("Reranker input budget must exceed its nonnegative template reserve")
++        if not math.isfinite(timeout) or timeout <= 0:
++            raise RerankInputBudgetError("Tokenizer timeout must be finite and positive")
++        rerank = urlsplit(rerank_url or "")
++        tokenizer = urlsplit(tokenizer_url)
++        # Reuse the existing credential only at the operator's same-origin endpoint.
++        # Disallow userinfo, query strings and redirects instead of forwarding secrets.
++        if (
++            rerank.scheme not in {"http", "https"}
++            or tokenizer.scheme not in {"http", "https"}
++            or not rerank.hostname
++            or not tokenizer.hostname
++            or rerank.username is not None
++            or tokenizer.username is not None
++            or tokenizer.query
++            or tokenizer.fragment
++            or (rerank.scheme, rerank.hostname, rerank.port) != (tokenizer.scheme, tokenizer.hostname, tokenizer.port)
++            or not tokenizer.path.endswith("/tokenize")
++        ):
++            raise RerankInputBudgetError("Tokenizer must be a same-origin /tokenize endpoint of a custom reranker")
++        self.tokenizer_url = tokenizer_url
++        self.detokenizer_url = urlunsplit(
++            tokenizer._replace(path=tokenizer.path.removesuffix("tokenize") + "detokenize")
++        )
++        self.max_input_tokens = max_input_tokens
++        self.token_overhead = token_overhead
++        self.timeout = min(timeout, 30.0)
++        self._session = LoopLocalSession(
++            timeout=per_phase_timeout(self.timeout),
++            headers={"Authorization": f"Bearer {api_key}"},
++        )
++
++    async def _tokenize(self, text: str) -> list[int]:
++        async with self._session.get().post(
++            self.tokenizer_url, json={"content": text, "add_special": False}, allow_redirects=False
++        ) as response:
++            if 300 <= response.status < 400:
++                raise RerankInputBudgetError("Tokenizer redirects are not supported")
++            await raise_for_status(response)
++            tokens = _TokenizedText.model_validate(await response.json(content_type=None)).tokens
++            if any(token < 0 for token in tokens) or (text and not tokens):
++                raise RerankInputBudgetError("Tokenizer returned invalid or empty token IDs")
++            return tokens
++
++    async def _detokenize(self, tokens: list[int]) -> str:
++        async with self._session.get().post(
++            self.detokenizer_url, json={"tokens": tokens}, allow_redirects=False
++        ) as response:
++            if 300 <= response.status < 400:
++                raise RerankInputBudgetError("Tokenizer redirects are not supported")
++            await raise_for_status(response)
++            return _DetokenizedText.model_validate(await response.json(content_type=None)).content
++
++    async def fit(self, query: str, documents: list[str]) -> list[str]:
++        """Keep one ranking pool, fitting each copy under query + template + document."""
++        # One wall budget for all tokenization/detokenization, not N request timeouts.
++        async with asyncio.timeout(self.timeout):
++            query_tokens = await self._tokenize(query)
++            available = self.max_input_tokens - self.token_overhead - len(query_tokens)
++            if available <= 0:
++                raise RerankInputBudgetError("Reranker query leaves no document budget; query was not truncated")
++            semaphore = asyncio.Semaphore(8)  # Per-call, on this loop; no process-global asyncio primitive.
++
++            async def fit_document(document: str) -> str:
++                async with semaphore:
++                    tokens = await self._tokenize(document)
++                    if document and not tokens:
++                        raise RerankInputBudgetError("Tokenizer returned no tokens for a nonempty document")
++                    if len(tokens) <= available:
++                        return document
++                    # A token prefix can end halfway through a UTF-8 character. Back
++                    # off a bounded suffix rather than introducing replacement text.
++                    for tail in range(min(8, available)):
++                        fitted = await self._detokenize(tokens[: available - tail])
++                        if fitted and document.startswith(fitted) and len(await self._tokenize(fitted)) <= available:
++                            return fitted
++                    raise RerankInputBudgetError("Tokenizer could not produce a verified nonempty document prefix")
++
++            tasks = [asyncio.create_task(fit_document(document)) for document in documents]
++            try:
++                return await asyncio.gather(*tasks)
++            finally:
++                # gather does not cancel siblings when one fails. No orphan tokenizer
++                # calls may continue after this fit failed or its caller was cancelled.
++                for task in tasks:
++                    if not task.done():
++                        task.cancel()
++                await asyncio.gather(*tasks, return_exceptions=True)
+diff --git a/hindsight-api-slim/hindsight_api/worker/poller.py b/hindsight-api-slim/hindsight_api/worker/poller.py
+--- a/hindsight-api-slim/hindsight_api/worker/poller.py
++++ b/hindsight-api-slim/hindsight_api/worker/poller.py
+@@ -1174,11 +1174,6 @@
+-        # Stage holder is updated by engine code via stage.set_stage(); the
+-        # poller reads it during periodic logging to surface what each
+-        # in-flight task is doing.
+-        holder = StageHolder(stage=f"queued.{task_type}")
+-
+-        # Create background task. The holder is passed in and bound to the
+-        # task's own contextvar scope inside _execute_task_inner so engine
+-        # code running under that task sees it via stage.set_stage().
+-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+-
+-        # Track this task as active
++        # Reserved slots are a floor, not a cap. Starting every claimed refresh
++        # while only two LLM permits exist burns the other jobs' wall budgets in
++        # the semaphore queue. Keep excess refreshes pending instead; admission
++        # and in-flight registration share the lock so concurrent callers agree.
++        refresh_limit = get_config().mental_model_refresh_llm_max_concurrent
++        deferred = False
+@@ -1186,8 +1181,28 @@
+-            self._active_tasks[task.operation_id] = ActiveTaskInfo(
+-                op_type=operation_type,
+-                bank_id=bank_id,
+-                schema=task.schema,
+-                bg_task=bg_task,
+-                started_at=time.monotonic(),
+-                stage_holder=holder,
+-                task_type=task_type,
++            if (
++                task_type == "refresh_mental_model"
++                and refresh_limit is not None
++                and refresh_limit > 0
++                and self._in_flight_by_type.get(operation_type, 0) >= refresh_limit
++            ):
++                deferred = True
++            else:
++                holder = StageHolder(stage=f"queued.{task_type}")
++                bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
++                self._active_tasks[task.operation_id] = ActiveTaskInfo(
++                    op_type=operation_type,
++                    bank_id=bank_id,
++                    schema=task.schema,
++                    bg_task=bg_task,
++                    started_at=time.monotonic(),
++                    stage_holder=holder,
++                    task_type=task_type,
++                )
++                self._in_flight_count += 1
++                self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
++                bg_task.add_done_callback(
++                    lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type))
++                )
++        if deferred:
++            retry_at = datetime.now(timezone.utc) + timedelta(seconds=get_config().worker_task_retry_backoff_seconds)
++            await self._write_terminal(
++                task, "deferred", lambda: self._defer_all(task, retry_at, "waiting for refresh execution capacity")
+@@ -1195,5 +1209,0 @@
+-            self._in_flight_count += 1
+-            self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
+-
+-        # Add cleanup callback
+-        bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
+@@ -1233,0 +1244,2 @@
++                if holder is not None and not ceiling.extends_on_progress:
++                    holder.deadline = cm.when()
+@@ -1252,0 +1265 @@
++                        holder.deadline = None
+@@ -1331,3 +1344,12 @@
+-            await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
+-            await self._notify_wall_timeout(task, message, stage)
+-            terminal_success = False
++            config = get_config()
++            if (
++                task_type == "refresh_mental_model"
++                and stage.endswith(".queued")
++                and task.task_dict.get("_retry_count", 0) < config.worker_max_retries
++            ):
++                retry_at = datetime.now(timezone.utc) + timedelta(seconds=config.worker_task_retry_backoff_seconds)
++                await self._write_terminal(task, "retry", lambda: self._schedule_retry_all(task, retry_at, message))
++            else:
++                await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
++                await self._notify_wall_timeout(task, message, stage)
++                terminal_success = False
+diff --git a/hindsight-api-slim/hindsight_api/worker/stage.py b/hindsight-api-slim/hindsight_api/worker/stage.py
+--- a/hindsight-api-slim/hindsight_api/worker/stage.py
++++ b/hindsight-api-slim/hindsight_api/worker/stage.py
+@@ -33,0 +34,3 @@
++    # Absolute asyncio loop time for a whole-task ceiling (not an idle ceiling).
++    # Nested edit stages honor the remaining budget instead of starting work past it.
++    deadline: float | None = None
+@@ -65,0 +69,6 @@
++def get_task_deadline() -> float | None:
++    """The active task's absolute deadline, or unknown outside an absolute-ceiling task."""
++    holder = _current_holder.get()
++    return holder.deadline if holder is not None else None
++
++
+diff --git a/hindsight-api-slim/pyproject.toml b/hindsight-api-slim/pyproject.toml
+--- a/hindsight-api-slim/pyproject.toml
++++ b/hindsight-api-slim/pyproject.toml
+@@ -7 +7 @@
+-version = "1.2.0"
++version = "1.2.0+fork.2"
