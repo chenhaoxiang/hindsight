@@ -32,6 +32,7 @@ import {
 } from "./page-freshness";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
+import { uuidV5 } from "./uuid";
 
 /** Sent on every request so the server can tell which integration is calling. */
 export const USER_AGENT = `hindsight-coding-agents/${PKG_VERSION}`;
@@ -51,6 +52,7 @@ export interface KnowledgeNode {
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
   trigger?: CurrentPageTrigger;
   children?: KnowledgeNode[];
+  tags?: string[];
 }
 
 /**
@@ -1288,6 +1290,12 @@ export class HindsightClient {
       // No trigger reported = policy unknown, not divergent (a server older than #3572).
       if (page.trigger != null) {
         const desired = pageTriggerFor(pageTrigger, this.bank, page.name);
+        // Scope is an initiative's source contract, not a schedule preference. A normal
+        // seed/schedule re-sync must never widen a scoped page back to untagged observations.
+        if (page.tags?.some((tag) => /^initiative:[0-9a-f-]{36}$/.test(tag))) {
+          desired.tags_match = "all_strict";
+          desired.fact_types = ["world", "experience"];
+        }
         if (pageTriggerDrifted(page.trigger, desired)) patch.trigger = pageTriggerPatch(desired);
       }
       if (!patch.trigger && !patch.source_query) continue;
@@ -1326,12 +1334,11 @@ export class HindsightClient {
    * Update (relatesToPageId) → no new page; only a marker accruing to the existing page, so an
    * enhancement or a mid-work plan change lands on the initiative it belongs to.
    *
-   * The marker carries its page id in two places, neither of them a tag (#3641):
-   * `metadata.relatedPageId` for provenance (visible on the document, and to a reflect loop that
-   * expands one), and a `[[page:<id>]]` link in the retain CONTEXT, which is the only one of the
-   * three channels a page synthesis actually reads — reflect's search results keep `context` and
-   * `tags` but strip `metadata` (`_UNREAD_RESULT_FIELDS`), and the id has no business in a tag
-   * vocabulary that exists to be matched with exact set-ops.
+   * New pages read only explicitly captured initiative facts, not the shared bank's other
+   * plans or untagged consolidated observations. A stable source tag is written on the facts
+   * AND used by the page's strict filter; it is not a tag invented only on a page (#3641).
+   * The real server-assigned page id still rides on metadata and a [[page:…]] context link.
+   * Existing pages are not silently migrated or relabeled; updates inherit a scoped page's tag.
    */
   async captureInitiative(args: {
     title: string;
@@ -1342,36 +1349,89 @@ export class HindsightClient {
      *  carry its own hardcoded copy of this trigger. */
     pageTrigger?: PageTrigger;
   }): Promise<{ page_id: string }> {
-    // `/knowledge-base/pages` mints its OWN page id (kp-…); we can't set it. So for a new initiative
-    // we create the page first and adopt the server-assigned id — that id is what the return value
-    // and the marker must use, or `read_knowledge_page(id)` 404s and the `[[page:<id>]]` link
-    // points at nothing.
     let pageId = args.relatesToPageId;
-    if (!pageId) {
-      const folderId = await this.ensureFolder("Initiatives");
-      // Same subject scoping and budget as the seeded pages: an initiative page synthesizes from
-      // the same bank, which also holds facts about the dependencies this repo merely uses, and
-      // "the project's memory" alone never said WHICH project (#3476). `max_tokens` is stated for
-      // the same reason `seedPages` states it — leaving it implicit pins these pages to whatever
-      // the server's page default happens to be, which is only coincidentally PAGE_MAX_TOKENS.
-      const r = await this.req("POST", this.bankUrl("/knowledge-base/pages"), {
-        name: args.title,
-        source_query:
-          `Summarize the "${args.title}" initiative: what is being built or changed and why, ` +
-          `and its current state — drawn from the project's memory.` +
-          pageScopeRule(this.project),
-        parent_id: folderId,
-        tags: ["knowledge:feature-work"],
-        max_tokens: PAGE_MAX_TOKENS,
-        trigger: pageTriggerFor(args.pageTrigger ?? buildPageTrigger(), this.bank, args.title),
+    let sourceTag: string | undefined;
+    if (pageId) {
+      // Read only the requested page. A shared client/cwd is not evidence of its owner.
+      const response = await this.req(
+        "GET",
+        this.bankUrl(`/knowledge-base/pages/${encodeURIComponent(pageId)}`)
+      );
+      if (!response.ok) throw new Error("Initiative page is unavailable; no marker was written");
+      const page = (await response.json()) as { tags?: unknown };
+      const sourceTags = Array.isArray(page.tags)
+        ? page.tags.filter(
+            (tag): tag is string =>
+              typeof tag === "string" && /^initiative:[0-9a-f-]{36}$/.test(tag)
+          )
+        : [];
+      if (sourceTags.length > 1)
+        throw new Error("Initiative page has ambiguous source scope; no marker was written");
+      sourceTag = sourceTags[0];
+    } else {
+      // Creating a page starts synthesis immediately, before we know its page id. Retain an
+      // idempotent source FIRST and wait for its extracted facts, not merely HTTP acceptance.
+      const sourceId = `initiative-source-${uuidV5(JSON.stringify([this.bank, this.project ?? null, args.title, args.summary, args.stamp ?? null]))}`;
+      sourceTag = `initiative:${sourceId.slice("initiative-source-".length)}`;
+      const tags = [...new Set([...(args.stamp?.tags ?? []), "knowledge:feature-work", sourceTag])];
+      const source = `New initiative: ${args.title}. ${args.summary}`;
+      const operationId = uuidV5(
+        JSON.stringify([this.bank, sourceId, source, tags, args.stamp?.metadata ?? {}])
+      );
+      await this.retain(source, `initiative source ${sourceId}`, sourceId, tags, "document", {
+        metadata: args.stamp?.metadata,
+        operationId,
       });
-      try {
-        const j = (await r.json()) as { page_id?: string; id?: string };
-        pageId = j.page_id ?? j.id;
-      } catch {
-        /* fall through to the slug fallback below */
+      await this.waitForInitiativeSource(operationId, sourceId);
+      const folderId = await this.ensureFolder("Initiatives");
+      const r = await this.req(
+        "POST",
+        this.bankUrl("/knowledge-base/pages"),
+        {
+          name: args.title,
+          source_query:
+            `Summarize only the "${args.title}" initiative, anchored by source document ${sourceId}. ` +
+            `Its planned scope is: ${args.summary}\n` +
+            `Use its captured source and updates as evidence; distinguish plans from verified delivery. ` +
+            `Do not include adjacent initiatives or other projects merely because their terminology overlaps.` +
+            (this.project === undefined ? "" : pageScopeRule(this.project)),
+          parent_id: folderId,
+          tags: ["knowledge:feature-work", sourceTag],
+          max_tokens: PAGE_MAX_TOKENS,
+          trigger: {
+            ...pageTriggerFor(args.pageTrigger ?? buildPageTrigger(), this.bank, args.title),
+            // Shared consolidation deliberately drops provenance tags. Read the scoped raw facts
+            // instead of broadening to those observations; later plan changes need explicit capture.
+            tags_match: "all_strict",
+            fact_types: ["world", "experience"],
+            exclude_mental_models: true,
+          },
+        },
+        [409]
+      );
+      let id: unknown;
+      if (r.status === 409) {
+        // Retrying a capture after a lost create acknowledgement must not invent an id or
+        // attach this plan to an unrelated same-name page. Match its actual source tag too.
+        const tree = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
+        const nodes = ((await tree.json()) as { roots?: KnowledgeNode[] }).roots ?? [];
+        const siblings = folderId
+          ? (nodes.find((node) => node.id === folderId)?.children ?? [])
+          : nodes;
+        const matches = siblings.filter(
+          (node) =>
+            node.kind === "page" && node.name === args.title && node.tags?.includes(sourceTag!)
+        );
+        if (matches.length === 1) id = matches[0].id;
+      } else if (r.ok) {
+        const page = (await r.json()) as { page_id?: unknown; id?: unknown };
+        id = page.page_id ?? page.id;
       }
-      pageId ||= `initiative-${this.slugify(args.title)}`; // last resort if the response lacked an id
+      if (typeof id !== "string" || !id.trim())
+        throw new Error(
+          "Initiative page creation was not acknowledged; source retained, no page id invented"
+        );
+      pageId = id;
     }
     // "Update", not "Enhancement": a recapture is just as often a plan change (scope/goal/why
     // rewritten) as an addition, and this string is what the page synthesis reads.
@@ -1382,7 +1442,13 @@ export class HindsightClient {
     // the creation marker keeps what the initiative set out to do, the update marker holds the
     // latest plan change (a newer update supersedes the older one).
     const markerId = `initiative-marker-${this.slugify(pageId)}${args.relatesToPageId ? "-update" : ""}`;
-    const tags = [...new Set([...(args.stamp?.tags ?? []), "knowledge:feature-work"])];
+    const tags = [
+      ...new Set([
+        ...(args.stamp?.tags ?? []),
+        "knowledge:feature-work",
+        ...(sourceTag ? [sourceTag] : []),
+      ]),
+    ];
     // The context rides on every fact extracted from this marker, verbatim (ExtractedFact.context),
     // so the Initiatives overview can link an initiative to its own page from what it retrieved.
     const context = `initiative marker for [[page:${pageId}]]`;
@@ -1390,6 +1456,51 @@ export class HindsightClient {
       metadata: { ...(args.stamp?.metadata ?? {}), relatedPageId: pageId },
     });
     return { page_id: pageId };
+  }
+
+  /** A bounded, cancellable capture wait. Background hooks still enqueue without waiting. */
+  private async waitForInitiativeSource(operationId: string, documentId: string): Promise<void> {
+    const deadline = Date.now() + 120_000;
+    while (Date.now() < deadline) {
+      currentRequestSignal()?.throwIfAborted();
+      const response = await this.req(
+        "GET",
+        this.bankUrl(`/operations/${encodeURIComponent(operationId)}`),
+        undefined,
+        [],
+        Math.min(10_000, deadline - Date.now())
+      );
+      const operation = (await response.json()) as { status?: unknown };
+      if (
+        !response.ok ||
+        !["pending", "processing", "completed"].includes(String(operation.status))
+      )
+        throw new Error("Initiative source did not complete; source retained, no page created");
+      if (operation.status === "completed") {
+        const params = new URLSearchParams({ document_id: documentId, limit: "1" });
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const facts = await this.req(
+          "GET",
+          this.bankUrl(`/memories/list?${params}`),
+          undefined,
+          [],
+          Math.min(10_000, remaining)
+        );
+        const result = (await facts.json()) as { items?: { document_id?: unknown }[] };
+        if (
+          !facts.ok ||
+          !Array.isArray(result.items) ||
+          !result.items.some((item) => item.document_id === documentId)
+        )
+          throw new Error("Initiative source has no visible extracted facts; no page created");
+        return;
+      }
+      await abortableDelay(Math.min(1_000, Math.max(1, deadline - Date.now())), undefined, {
+        signal: currentRequestSignal(),
+      });
+    }
+    throw new Error("Initiative source is still pending; source retained, no page created");
   }
 
   /** Find a root folder by name (case-insensitive) or create it; returns its id. Fail-open to undefined. */

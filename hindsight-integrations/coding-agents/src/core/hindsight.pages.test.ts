@@ -771,6 +771,50 @@ describe("HindsightClient.seedPages", () => {
     });
   });
 
+  it("keeps strict raw-fact initiative scope when re-syncing its schedule", async () => {
+    const calls: any[] = [];
+    stubFetchRouted(calls, [
+      {
+        match: (m, u) => m === "GET" && u.endsWith("/knowledge-base/tree"),
+        json: {
+          roots: [
+            ...PAGES.map((p, i) => ({
+              id: `kp-${i}`,
+              kind: "page",
+              name: p.name,
+              description: p.source_query,
+              trigger: settledTrigger(p.name),
+            })),
+            {
+              id: "folder",
+              kind: "folder",
+              name: "Initiatives",
+              children: [
+                {
+                  id: "kp-scoped",
+                  kind: "page",
+                  name: "Scoped initiative",
+                  description: "Only its captured source",
+                  tags: [
+                    "knowledge:feature-work",
+                    "initiative:11111111-2222-5333-8444-555555555555",
+                  ],
+                  trigger: { tags_match: "all_strict", refresh_after_consolidation: true },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    ]);
+    await new HindsightClient({ apiUrl: "http://x", bank: "repo-a" }).seedPages();
+    const patches = calls.filter((call) => call.method === "PATCH");
+    expect(patches).toHaveLength(1);
+    expect(patches[0].body.trigger.tags_match).toBe("all_strict");
+    expect(patches[0].body.trigger.fact_types).toEqual(["world", "experience"]);
+    expect(patches[0].body.source_query).toBeUndefined();
+  });
+
   it("an initiative page deleted under us is skipped, not the rest of the folder", async () => {
     // This used to `break`, so one vanished page abandoned every initiative after it.
     const drifted = (id: string, name: string) => ({
@@ -1133,12 +1177,31 @@ describe("HindsightClient.ensureFolder", () => {
   });
 });
 
+function stubInitiativeFetch(
+  calls: any[],
+  routes: { match: (method: string, url: string) => boolean; json: unknown }[]
+) {
+  stubFetchRouted(calls, [
+    ...routes,
+    { match: (m, u) => m === "GET" && u.includes("/operations/"), json: { status: "completed" } },
+    {
+      match: (m, u) => m === "GET" && u.includes("/memories/list?"),
+      get json() {
+        const retained = calls.find(
+          (call) => call.method === "POST" && call.url.endsWith("/memories")
+        );
+        return { items: [{ document_id: retained?.body.items[0].document_id }] };
+      },
+    },
+  ]);
+}
+
 describe("HindsightClient.captureInitiative", () => {
   // The subject is a property of the BANK (`project` when it is one repo's, the bank id otherwise
   // — #4146), exactly as it is for the seeded pages.
   it("names the repository, not the bank, when the client knows one", async () => {
     const calls: any[] = [];
-    stubFetchRouted(calls, [
+    stubInitiativeFetch(calls, [
       { match: (m, u) => m === "GET" && u.endsWith("/knowledge-base/tree"), json: { roots: [] } },
       {
         match: (m, u) => m === "POST" && u.endsWith("/knowledge-base/folders"),
@@ -1165,7 +1228,7 @@ describe("HindsightClient.captureInitiative", () => {
 
   it("new initiative: POSTs a per-initiative page + a marker retain naming the same page id", async () => {
     const calls: any[] = [];
-    stubFetchRouted(calls, [
+    stubInitiativeFetch(calls, [
       { match: (m, u) => m === "GET" && u.endsWith("/knowledge-base/tree"), json: { roots: [] } },
       {
         match: (m, u) => m === "POST" && u.endsWith("/knowledge-base/folders"),
@@ -1190,29 +1253,35 @@ describe("HindsightClient.captureInitiative", () => {
     // the /knowledge-base/pages endpoint mints its own id.
     expect(result).toEqual({ page_id: "pg" });
 
-    // Page POST: name = title, nested under the Initiatives folder. The page itself carries NO
-    // tags field at all (no tag taxonomy to maintain).
+    // The initiative tag is actually written on its source facts, so strict filtering isolates
+    // this initiative without reading shared observations about other projects.
     const pagePost = calls.find(
       (k) => k.method === "POST" && k.url.endsWith("/knowledge-base/pages")
     );
     expect(pagePost).toBeDefined();
     expect(pagePost.body.name).toBe("Retry backoff for the uploader");
     expect(pagePost.body.parent_id).toBe("folder-abc");
-    expect(pagePost.body.tags).toEqual(["knowledge:feature-work"]);
-    // Same subject scoping and budget as a seeded page: the bank also holds facts about the
-    // dependencies this repo merely uses, and "the project's memory" never said which project
-    // (#3476). No `project` was given, so it gets the shared-bank clause — as in `seedPages` (#4490).
-    expect(pagePost.body.source_query).toContain('Summarize the "Retry backoff for the uploader"');
-    expect(pagePost.body.source_query).toContain(pageScopeRule());
+    expect(pagePost.body.tags).toEqual([
+      "knowledge:feature-work",
+      expect.stringMatching(/^initiative:/),
+    ]);
+    expect(pagePost.body.trigger.tags_match).toBe("all_strict");
+    expect(pagePost.body.trigger.fact_types).toEqual(["world", "experience"]);
+    expect(pagePost.body.source_query).toContain(
+      'Summarize only the "Retry backoff for the uploader"'
+    );
+    expect(pagePost.body.source_query).toContain(
+      "Add exponential backoff so transient upload failures retry."
+    );
     expect(pagePost.body.max_tokens).toBe(PAGE_MAX_TOKENS);
 
-    // Marker retain POST to /memories. The page id rides on the metadata and on the context —
-    // NEVER on a tag: tags are matched with exact set-ops against a fixed vocabulary, and one
-    // more tag value per initiative both isolates nothing and pollutes every fact (#3641).
-    const memPost = calls.find((k) => k.method === "POST" && k.url.endsWith("/memories"));
+    // The backlink marker uses the same source tag; the overview can still follow its page link.
+    const memPost = calls.find(
+      (k) => k.method === "POST" && k.body?.items?.[0].metadata?.relatedPageId === "pg"
+    );
     expect(memPost).toBeDefined();
     const item = memPost.body.items[0];
-    expect(item.tags).toEqual(["knowledge:feature-work"]);
+    expect(item.tags).toEqual(pagePost.body.tags);
     expect(item.metadata).toEqual({ relatedPageId: "pg" });
     // The context is the one channel a page synthesis reads back (reflect strips `metadata` from
     // its search results), so this is what lets the overview link to the REAL page id.
@@ -1234,7 +1303,7 @@ describe("HindsightClient.captureInitiative", () => {
   it("hashes an initiative page's own schedule", async () => {
     const capture = async (title: string) => {
       const calls: any[] = [];
-      stubFetchRouted(calls, [
+      stubInitiativeFetch(calls, [
         { match: (m, u) => m === "GET" && u.endsWith("/knowledge-base/tree"), json: { roots: [] } },
         {
           match: (m, u) => m === "POST" && u.endsWith("/knowledge-base/folders"),

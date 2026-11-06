@@ -851,6 +851,26 @@ loudly instead of looking like it disabled something. Adding pages of your own i
 setting is for: the agent's `hindsight_capture_initiative` tool already creates pages, one per
 initiative, each with its own query.
 
+#### Captured initiative pages in this maintenance fork
+
+New initiative pages use a dedicated `initiative:<id>` source tag with strict matching,
+reading raw world/experience facts from their explicitly captured source and updates.
+They do not infer progress from unrelated plans or untagged shared observations. The
+five taxonomy pages keep their existing broader behavior; existing initiative pages
+are not bulk-migrated or historical facts relabeled.
+
+Creation first retains an idempotent identifying source and waits up to two minutes
+for its operation to complete and extracted facts to be visible, then creates the
+auto-synthesizing page and records its real page backlink. A failed, missing, cancelled
+or unconfirmed source does not create a page. Cancelling the wait is not rollback of
+the already-accepted retain. Identical retries reuse the source identity; a duplicate
+page can be adopted only when both its name and source tag match, never a guessed id.
+
+Update the original page with `relates_to_page_id` for plan changes, verified milestones
+and completion. Include the actual repository and evidence in the summary. A scoped
+page intentionally does not treat ordinary session ingestion as a scoped progress
+update; its facts may be current before the scheduled page synthesis catches up.
+
 #### Pages of your own — `customPages`
 
 `pages` only reworks the five above. To add a page, name it under `customPages`:
