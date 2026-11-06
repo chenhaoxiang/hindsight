@@ -563,16 +563,20 @@ describe("startCodebaseSurvey", () => {
       expect(await runHook()).toBe(false); // not stale yet
       await sleep(staleMs * 2);
       expect(await race()).toBe(1);
+      // Admission returns before the detached agent registers itself. Waiting for the
+      // third record prevents finally from missing it while it recreates the fixture
+      // directory during afterEach's removal (ENOTEMPTY on a loaded CI runner).
+      await vi.waitFor(() => expect(agents()).toHaveLength(3));
     } finally {
-      for (const { pid, ppid } of agents()) {
-        for (const p of [pid, ppid]) {
-          try {
-            process.kill(p, "SIGKILL");
-          } catch {
-            /* already exited */
-          }
+      const owned = new Set(agents().flatMap(({ pid, ppid }) => [pid, ppid]));
+      for (const p of owned) {
+        try {
+          process.kill(p, "SIGKILL");
+        } catch {
+          /* already exited */
         }
       }
+      await vi.waitFor(() => expect([...owned].some(alive)).toBe(false), { timeout: 5_000 });
     }
   }, 30_000);
 });
