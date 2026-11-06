@@ -192,6 +192,73 @@ describe("pi extension adapter", () => {
   });
 });
 
+describe("pi native tool contracts", () => {
+  const makeSpec = (handler: ToolSpec["handler"]): ToolSpec => ({
+    name: "hindsight_fixture",
+    description: "synthetic fixture",
+    inputSchema: { query: z.string() },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+    handler,
+  });
+
+  it("preserves the BOUND handler's error flag and catches thrown failures", async () => {
+    const spec = makeSpec(async () => ({ content: [{ type: "text", text: "unused" }] }));
+    const bound = makeSpec(async () => ({
+      content: [{ type: "text", text: "failed" }],
+      isError: true,
+    }));
+    expect(await toPiTool(spec, () => bound).execute("call", { query: "fixture" })).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "failed" }],
+    });
+    const thrown = makeSpec(async () => {
+      throw new Error("synthetic service unavailable");
+    });
+    expect((await toPiTool(thrown).execute("call", { query: "fixture" })).isError).toBe(true);
+  });
+
+  it.each([{ query: 42 }, { query: "ok", apiToken: "synthetic-secret-do-not-echo" }, {}])(
+    "rejects invalid arguments before invoking the handler",
+    async (params) => {
+      const handler = vi.fn(async () => ({ content: [] }));
+      const result = await toPiTool(makeSpec(handler)).execute("call", params);
+      expect(result.isError).toBe(true);
+      expect(handler).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain("synthetic-secret-do-not-echo");
+    }
+  );
+
+  it("applies the bound schema's defaults and leaves successful results compatible", async () => {
+    const handler = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ok" }] }));
+    const spec = makeSpec(handler);
+    spec.inputSchema = { query: z.string().default("fixture default") };
+    const result = await toPiTool(spec).execute("call", {});
+    expect(handler).toHaveBeenCalledExactlyOnceWith({ query: "fixture default" });
+    expect(result).not.toHaveProperty("isError");
+  });
+
+  it("does not resolve a workspace or start work after a pre-cancellation", async () => {
+    const handler = vi.fn(async () => ({ content: [] }));
+    const bind = vi.fn(() => makeSpec(handler));
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const result = await toPiTool(makeSpec(handler), bind).execute(
+      "call",
+      { query: "q" },
+      ctrl.signal
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content[0].text).code).toBe("cancelled");
+    expect(handler).not.toHaveBeenCalled();
+    expect(bind).not.toHaveBeenCalled();
+  });
+});
+
 describe("pi extension factory", () => {
   /** A fake RuntimeCore per repository; its one tool answers with the repository it is bound to. */
   function fakeCore(repo: string) {

@@ -22,6 +22,8 @@ import {
   type RetainExtractionMode,
 } from "./missions";
 import { version as PKG_VERSION } from "../../package.json";
+import { setTimeout as abortableDelay } from "node:timers/promises";
+import { currentRequestSignal, requestDeadline } from "./request-signal";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
 
@@ -133,6 +135,20 @@ export interface ClientOpts {
    *  wait out is an item missing from the bank — deepen used to log "failed to enqueue" and carry
    *  on, dropping about a third of a repo's chats against a rate-limited Hindsight Cloud. */
   rateLimitPatienceMs?: number;
+}
+
+export interface ConsolidationStatus {
+  pending: number | null;
+  failed: number | null;
+  last_consolidated_at: string | null;
+  last_memory_write_at: string | null;
+  // The server may cache bank stats. Receipt time is not the underlying snapshot's age.
+  freshness: "server_reported_cache_age_unknown";
+}
+
+export interface ServerIdentity {
+  state: "available" | "unknown";
+  api_version: string | null;
 }
 
 export interface RetainOpts {
@@ -443,9 +459,16 @@ export class HindsightClient {
   private async fetchWithAuth(url: string, init: RequestInit): Promise<Response> {
     // Only a request with its own deadline drops undici's timeouts; the drain poll has none.
     const dispatcher = init.signal ? signalOnlyDispatcher() : undefined;
-    const send = () =>
-      fetch(url, { ...init, headers: this.headers(), ...(dispatcher ? { dispatcher } : {}) });
+    const send = () => {
+      init.signal?.throwIfAborted();
+      return fetch(url, {
+        ...init,
+        headers: this.headers(),
+        ...(dispatcher ? { dispatcher } : {}),
+      });
+    };
     const r = await send();
+    init.signal?.throwIfAborted();
     if (r.status !== 401 || !this.refreshToken()) return r;
     return send();
   }
@@ -479,7 +502,7 @@ export class HindsightClient {
       r = await this.fetchWithAuth(url, {
         method,
         body: payload,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: requestDeadline(timeoutMs),
       });
       if (r.status !== 429 || tolerate.includes(429)) break;
       const asked = retryAfterMs(r.headers.get("retry-after"));
@@ -487,7 +510,9 @@ export class HindsightClient {
       const wait =
         Math.min(RETRY_AFTER_CEILING_MS, Math.max(asked, backoff)) * (1 + Math.random() / 2);
       if (waited + wait > this.rateLimitPatienceMs) throw new RateLimitedError(asked);
-      await sleep(wait);
+      const signal = currentRequestSignal();
+      if (signal) await abortableDelay(wait, undefined, { signal });
+      else await sleep(wait);
       waited += wait;
     }
     if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
@@ -554,17 +579,32 @@ export class HindsightClient {
    *  so append silently never turned on (#5286). Servers that predate the alias still answer
    *  `/version`, so that stays as the fallback. */
   private async probeIdempotentRetain(): Promise<boolean> {
+    return semverGte(
+      (await this.serverIdentity()).api_version ?? undefined,
+      MIN_IDEMPOTENT_RETAIN_VERSION
+    );
+  }
+
+  /** Read-only API identity, not an inference-provider probe. Unreadable is unknown, never a
+   *  guessed local package version. The optional shorter deadline is for interactive diagnostics. */
+  async serverIdentity(timeoutMs = 15_000): Promise<ServerIdentity> {
     for (const path of ["/v1/version", "/version"]) {
       try {
-        const r = await this.req("GET", `${this.apiUrl}${path}`);
+        const r = await this.req("GET", `${this.apiUrl}${path}`, undefined, [], timeoutMs);
         if (!r.ok) continue;
-        const j = (await r.json()) as { api_version?: string };
-        return semverGte(j.api_version, MIN_IDEMPOTENT_RETAIN_VERSION);
+        const j = (await r.json()) as { api_version?: unknown };
+        if (
+          typeof j?.api_version === "string" &&
+          /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(j.api_version)
+        ) {
+          return { state: "available", api_version: j.api_version };
+        }
       } catch {
-        /* unreachable or not our API's JSON — try the next path */
+        currentRequestSignal()?.throwIfAborted();
+        /* unreachable or not our API's JSON — try the legacy alias */
       }
     }
-    return false;
+    return { state: "unknown", api_version: null };
   }
 
   /**
@@ -719,20 +759,57 @@ export class HindsightClient {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
 
-  /** Count of operations still ACTIVE on this bank — the list includes terminal ops (completed/
-   *  failed/cancelled), so filter by status. Powers syncStatus's "extractions drained" check. */
+  /** Count ALL active operations, not the first (newest, usually completed) history page.
+   *  Two filtered totals bound the payload without walking the bank's operation history. They are
+   *  adjacent observations, not an atomic snapshot. Missing/malformed status must not mean zero. */
   async activeOperations(): Promise<number> {
-    const r = await this.req("GET", this.bankUrl("/operations"));
-    try {
-      const j = (await r.json()) as {
-        operations?: { status?: string }[];
-        items?: { status?: string }[];
-      };
-      const ops = j.operations ?? j.items ?? [];
-      return ops.filter((o) => !TERMINAL.has((o?.status || "").toLowerCase())).length;
-    } catch {
-      return 0;
-    }
+    const counts = await Promise.all(
+      ["pending", "processing"].map(async (status) => {
+        const r = await this.req(
+          "GET",
+          this.bankUrl(`/operations?status=${status}&limit=1&offset=0`)
+        );
+        if (!r.ok) throw new Error("Hindsight operation status unavailable");
+        const j = (await r.json()) as {
+          total?: unknown;
+          operations?: { status?: string }[];
+          items?: { status?: string }[];
+        };
+        const items = j?.operations ?? j?.items;
+        if (
+          !Number.isSafeInteger(j?.total) ||
+          (j.total as number) < 0 ||
+          !Array.isArray(items) ||
+          items.length > 1 ||
+          items.length > (j.total as number) ||
+          items.some((o) => o?.status !== status)
+        ) {
+          throw new Error("Invalid Hindsight operation totals");
+        }
+        return j.total as number;
+      })
+    );
+    return counts.reduce((sum, count) => sum + count, 0);
+  }
+
+  /** Consolidation backlog is facts waiting for a derived layer, not the active-operation count. */
+  async consolidationStatus(): Promise<ConsolidationStatus> {
+    const r = await this.req("GET", this.bankUrl("/stats"));
+    if (!r.ok) throw new Error("Hindsight bank statistics unavailable");
+    const j = (await r.json()) as Record<string, unknown>;
+    const count = (key: string): number | null =>
+      Number.isSafeInteger(j?.[key]) && (j[key] as number) >= 0 ? (j[key] as number) : null;
+    const date = (key: string): string | null =>
+      typeof j?.[key] === "string" && Number.isFinite(Date.parse(j[key] as string))
+        ? (j[key] as string)
+        : null;
+    return {
+      pending: count("pending_consolidation"),
+      failed: count("failed_consolidation"),
+      last_consolidated_at: date("last_consolidated_at"),
+      last_memory_write_at: date("last_memory_write_at"),
+      freshness: "server_reported_cache_age_unknown",
+    };
   }
 
   /**
@@ -808,13 +885,16 @@ export class HindsightClient {
    * tool's configured window and aborted every high-budget synthesis mid-flight (#3590).
    */
   async reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string> {
+    const external = currentRequestSignal();
+    external?.throwIfAborted();
     const ctrl = new AbortController();
+    const signal = external ? AbortSignal.any([external, ctrl.signal]) : ctrl.signal;
     const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
     try {
       const resp = await this.fetchWithAuth(this.bankUrl("/reflect"), {
         method: "POST",
         body: JSON.stringify({ query, budget: opts.budget ?? "high" }),
-        signal: ctrl.signal,
+        signal,
       });
       // Keep the server's body: a bare "reflect 500" in the diag trail is undebuggable after the fact.
       if (!resp.ok)
@@ -826,6 +906,8 @@ export class HindsightClient {
       const data = (await resp.json()) as { text?: string };
       return (data.text || "").trim();
     } catch (e) {
+      // A caller cancellation is not a synthesis timeout and must not start fallback retrieval.
+      external?.throwIfAborted();
       // Our own deadline surfaces as a generic "This operation was aborted"; name it.
       if (ctrl.signal.aborted)
         throw new ReflectError(`reflect timed out after ${opts.timeoutMs}ms`, undefined, true, {

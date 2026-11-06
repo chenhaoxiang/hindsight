@@ -28,6 +28,7 @@ import { diagFilePath } from "./diag";
 import { describeError } from "./log";
 import type { RetainStamp } from "./retain-stamp";
 import type { PageTrigger } from "./missions";
+import { diagnosticEndpoint, integrationIdentity } from "./identity";
 
 export interface ToolResult {
   // Index signature so this structurally satisfies the MCP SDK's CallToolResult (which carries
@@ -137,9 +138,10 @@ export function buildKnowledgeTools(
       description:
         "Report whether this repo's memory bank is in sync: gitlog seed present, how much recent " +
         "history has been deepened with full diffs, conversations ingested, knowledge pages " +
-        "created, and extractions still running. `synced: true` means the seeded memory is fully " +
-        "queryable. Ingestion is automatic and background — if not synced, it is in progress; " +
-        "nothing to run.",
+        "created, and ALL async operations still active. `synced: true` covers seed ingestion, " +
+        "not completion of later consolidation or page refresh. Unknown activity is not idle. " +
+        "Consolidation backlog and page freshness are reported separately. Ingestion is automatic; " +
+        "do not start a manual replay based on this status.",
       inputSchema: {},
       annotations: READ_ONLY_ANNOTATIONS,
       handler: async () => {
@@ -154,12 +156,18 @@ export function buildKnowledgeTools(
       name: "hindsight_diagnose",
       description:
         "Report safe Hindsight runtime diagnostics for this coding-agent session: resolved bank, " +
-        "workspace, harness, config location, API endpoint, and non-secret environment overrides. " +
-        "Use this when memory, hooks, MCP tools, or configuration appear not to work. Tokens and " +
-        "other secret values are never returned.",
-      inputSchema: {},
+        "workspace, harness, loaded integration version versus disk version, config location, API " +
+        "endpoint, and non-secret environment overrides. Optionally verify API identity with a " +
+        "read-only version request (no LLM calls). Use when memory, tools or updates appear not to " +
+        "work. Tokens and URL credentials are never returned.",
+      inputSchema: {
+        verify_connection: z
+          .boolean()
+          .optional()
+          .describe("Read the API version, without running a model probe (default false)"),
+      },
       annotations: READ_ONLY_ANNOTATIONS,
-      handler: async (_args: Record<string, never>) => {
+      handler: async (args: { verify_connection?: boolean }) => {
         const configPath =
           process.env.HINDSIGHT_CONFIG || join(homedir(), ".hindsight", "coding-agent.json");
         const harness = opts.harness ?? "unknown";
@@ -175,10 +183,17 @@ export function buildKnowledgeTools(
           bank_id: bankId,
           harness,
           workspace: opts.repoDir ?? process.cwd(),
+          integration: integrationIdentity(),
+          api: {
+            endpoint_in_use: diagnosticEndpoint(client.apiUrl),
+            ...(args.verify_connection
+              ? await client.serverIdentity(2_000)
+              : { state: "not_checked", api_version: null }),
+          },
           config: {
             path: configPath,
             exists: existsSync(configPath),
-            api_url: cfg.apiUrl,
+            api_url: diagnosticEndpoint(cfg.apiUrl),
             api_token_configured: Boolean(cfg.apiToken),
             disabled: cfg.disabled,
           },

@@ -9,8 +9,8 @@
  * the same via `dist/status.js`.
  *
  * `synced` is the completion marker for the REQUIRED memory: gitlog seeded, pages created, and no
- * extraction operation still active. The deepen engine creates pages LAST (after draining its
- * enqueued extractions), so `synced` implies the seed's facts are queryable. The per-commit diff
+ * async operation still active. This is a seed-ingestion check, NOT a claim that every later write
+ * has been consolidated or every page refreshed. The per-commit diff
  * trickle deliberately does NOT gate `synced` — it deepens across sessions and is a bonus, not a
  * prerequisite.
  */
@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { commitsSince, repoNameOf } from "./git";
 import { parsePageList } from "./knowledge-injection";
 import { SURVEY_DOC_IDS } from "./survey";
+import type { ConsolidationStatus } from "./hindsight";
 
 /** Minimal client shape (HindsightClient satisfies it structurally). */
 export interface StatusClient {
@@ -25,6 +26,7 @@ export interface StatusClient {
   listPages(): Promise<unknown>;
   knowledgePagesSupported?: boolean;
   activeOperations(): Promise<number>;
+  consolidationStatus?(): Promise<ConsolidationStatus>;
 }
 
 /** How much recent history the deepen engine targets with per-commit diffs. */
@@ -40,7 +42,12 @@ export interface SyncStatus {
   surveyBaseline: string | null; // HEAD sha at the last codebase survey START (null = never started)
   surveyDocs: number; // findings documents present (of 4) — completion signal, not just started
   surveyCommitsBehind: number | null; // commits since that baseline (null = no baseline / no repo)
-  activeOps: number | null; // extraction ops still running; null if the server can't report
+  activeOps: number | null; // ALL pending/processing ops; null if the server can't report
+  seedReady: boolean;
+  activity: "active" | "idle" | "unknown";
+  consolidation: ConsolidationStatus | null;
+  pageFreshness: "unknown";
+  syncScope: "seed_ingestion";
   synced: boolean;
 }
 
@@ -67,7 +74,10 @@ export async function syncStatus(
     .listDocumentIds("source:chat", "all_strict")
     .catch(() => new Set<string>());
   const pages = parsePageList(await client.listPages().catch(() => null));
-  const activeOps = await client.activeOperations().catch(() => null);
+  const reportedOps = await client.activeOperations().catch(() => null);
+  const activeOps =
+    Number.isSafeInteger(reportedOps) && (reportedOps as number) >= 0 ? reportedOps : null;
+  const consolidation = (await client.consolidationStatus?.().catch(() => null)) ?? null;
   const uploads = await client
     .listDocumentIds("source:upload", "all_strict")
     .catch(() => new Set<string>());
@@ -104,6 +114,7 @@ export async function syncStatus(
   const commits = repoDir ? commitCount(repoDir) : null;
   const gitDiffTarget = commits === null ? null : Math.min(DEEPEN_DIFF_TARGET, commits);
 
+  const seedReady = gitlogPresent && (client.knowledgePagesSupported === false || pages.length > 0);
   return {
     bank,
     gitlogPresent,
@@ -115,11 +126,13 @@ export async function syncStatus(
     surveyDocs,
     surveyCommitsBehind,
     activeOps,
-    // Older Hindsight servers have no page surface. They are still fully usable for the
-    // legacy bank/retain pipeline, so page absence must not make syncStatus permanently false.
-    synced:
-      gitlogPresent &&
-      (client.knowledgePagesSupported === false || pages.length > 0) &&
-      (activeOps ?? 0) === 0,
+    seedReady,
+    activity: activeOps === null ? "unknown" : activeOps > 0 ? "active" : "idle",
+    consolidation,
+    // Page existence/age says nothing about the facts its synthesis actually saw.
+    pageFreshness: "unknown",
+    syncScope: "seed_ingestion",
+    // Older servers may explicitly lack pages; an unreportable operation count is NOT zero.
+    synced: seedReady && activeOps === 0,
   };
 }

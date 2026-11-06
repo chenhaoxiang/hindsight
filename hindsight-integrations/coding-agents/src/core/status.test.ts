@@ -47,6 +47,11 @@ describe("syncStatus", () => {
       chatDocs: 0,
       pagesCount: 1,
       activeOps: 0,
+      seedReady: true,
+      activity: "idle",
+      consolidation: null,
+      pageFreshness: "unknown",
+      syncScope: "seed_ingestion",
       synced: true,
     });
   });
@@ -100,7 +105,7 @@ describe("syncStatus", () => {
     expect(s.synced).toBe(false);
   });
 
-  it("fail-open: an activeOperations rejection yields activeOps null and does NOT block synced", async () => {
+  it("an unavailable operation count is unknown and cannot declare the bank synced", async () => {
     const client = stubClient({
       gitIds: ["gitlog:repo"],
       activeOperations: async () => {
@@ -109,8 +114,39 @@ describe("syncStatus", () => {
     });
     const s = await syncStatus(client, "bank-1");
     expect(s.activeOps).toBeNull();
-    // (activeOps ?? 0) === 0 — an unreportable count doesn't gate completion.
+    expect(s.activity).toBe("unknown");
+    expect(s.seedReady).toBe(true);
+    expect(s.synced).toBe(false);
+  });
+
+  it.each([-1, NaN, 1.5, Infinity])(
+    "does not accept invalid active-operation count %s",
+    async (count) => {
+      const s = await syncStatus(
+        stubClient({ gitIds: ["gitlog:repo"], activeOperations: async () => count }),
+        "bank-1"
+      );
+      expect(s.activeOps).toBeNull();
+      expect(s.activity).toBe("unknown");
+      expect(s.synced).toBe(false);
+    }
+  );
+
+  it("reports consolidation separately without pretending page existence proves freshness", async () => {
+    const client = stubClient({ gitIds: ["gitlog:repo"] });
+    client.consolidationStatus = async () => ({
+      pending: 300,
+      failed: 7,
+      last_consolidated_at: null,
+      last_memory_write_at: null,
+      freshness: "server_reported_cache_age_unknown",
+    });
+    const s = await syncStatus(client, "bank-1");
     expect(s.synced).toBe(true);
+    expect(s.syncScope).toBe("seed_ingestion");
+    expect(s.consolidation?.pending).toBe(300);
+    expect(s.consolidation?.failed).toBe(7);
+    expect(s.pageFreshness).toBe("unknown");
   });
 
   it("fail-open: a source:chat listDocumentIds rejection yields chatDocs 0, no throw", async () => {

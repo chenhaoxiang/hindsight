@@ -598,7 +598,16 @@ restarted. Everything else follows the table: `apiUrl`, `disabled`, bank routing
 the survey and knowledge-page settings.
 
 `hindsight_diagnose` reports both sides of that gap — what the file says now, and what the running
-client is actually using.
+client is actually using. It also distinguishes the integration version compiled into the loaded
+module from the package version currently on disk. `verify_connection: true` adds a bounded,
+read-only API-version request; it does not probe an inference provider. An unavailable version is
+unknown, not guessed from the local package. URL userinfo, query parameters and fragments are
+removed from diagnostic endpoints.
+
+The pi-family native adapter preserves tool errors as `isError`, validates arguments before
+calling a handler, and passes cancellation through that call's HTTP requests and rate-limit waits.
+Concurrent calls and background ingestion do not share a mutable cancellation signal. Cancelling
+a request is not rollback: a write already accepted by the server may still finish.
 
 ### Opt-in only
 
@@ -1155,13 +1164,26 @@ npx @vectorize-io/hindsight-coding-agents stats
 
 ### Is the memory ready yet?
 
-`hindsight_sync_status` — the agent-facing tool, `dist/status.js` for scripts — answers exactly
-that: `"synced": true` means the seeded memory is queryable. It also reports gitlog freshness, how
-far per-commit deepening has got, the codebase survey's state (`surveyBaseline` is the HEAD the last
-survey started from, `surveyDocs` counts the findings documents that have landed, 0–4 — a baseline
-with no findings retries automatically, at most three times per commit), and the extraction
-operations still in flight. Each survey agent that could not be found, failed to launch or exited
-with an error leaves one `[survey]` line in the plugin log.
+`hindsight_sync_status` — the agent-facing tool, `dist/status.js` for scripts — separates seed
+readiness from activity and derived-memory freshness:
+
+- `seedReady` reports the gitlog/page prerequisites. `synced: true` additionally requires a known
+  zero count of **all** pending/processing async operations, obtained from bounded, status-filtered
+  totals rather than the first page of history. These are adjacent observations, not one atomic
+  snapshot. An unavailable/invalid count is `activeOps: null`, `activity: "unknown"`, and cannot
+  declare sync complete.
+- `syncScope: "seed_ingestion"` makes the limit explicit: this is not a claim that later writes
+  have all been consolidated or every page is current. `consolidation` reports pending/failed
+  source-fact counts separately, where supported. Those server statistics may be cached; their
+  cache age is unknown. Missing fields remain null. Page existence alone leaves `pageFreshness`
+  unknown.
+- Git deepening and survey progress remain informational: `surveyBaseline` is the HEAD the last
+  survey started from; `surveyDocs` counts findings documents that landed, 0–4. A baseline without
+  findings retries automatically, at most three times per commit. Each survey agent that could
+  not be found, failed to launch or exited with an error leaves one `[survey]` log line.
+
+Ingestion stays automatic. A status result is not an instruction to replay operations or clear
+failure records.
 
 ### Resetting a repo's memory
 

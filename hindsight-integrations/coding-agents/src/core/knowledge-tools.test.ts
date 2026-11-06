@@ -88,6 +88,11 @@ describe("buildKnowledgeTools", () => {
         chatDocs: 1,
         pagesCount: 1,
         activeOps: 0,
+        seedReady: true,
+        activity: "idle",
+        consolidation: null,
+        pageFreshness: "unknown",
+        syncScope: "seed_ingestion",
         synced: true,
       });
     } finally {
@@ -128,6 +133,28 @@ describe("buildKnowledgeTools", () => {
     });
     expect(client.listPages).not.toHaveBeenCalled();
     expect(client.getPage).not.toHaveBeenCalled();
+  });
+
+  it("reports loaded/disk identity and only probes the API when explicitly requested", async () => {
+    const client = stubClient({
+      serverIdentity: vi.fn(async () => ({ state: "available", api_version: "1.2.0+fixture.1" })),
+    });
+    (client as unknown as { apiUrl: string }).apiUrl =
+      "https://user:synthetic-url-secret@fixture.invalid/api?token=synthetic-query-secret#private";
+    const tool = findTool(buildKnowledgeTools(client, "repo-a"), "hindsight_diagnose");
+    const first = JSON.parse((await tool.handler({})).content[0].text);
+    expect(first.integration.loaded_version).toMatch(/^\d+\.\d+\.\d+/);
+    expect(first.api).toEqual({
+      endpoint_in_use: "https://fixture.invalid/api",
+      state: "not_checked",
+      api_version: null,
+    });
+    expect(client.serverIdentity).not.toHaveBeenCalled();
+    const checked = JSON.parse((await tool.handler({ verify_connection: true })).content[0].text);
+    expect(checked.api.api_version).toBe("1.2.0+fixture.1");
+    expect(client.serverIdentity).toHaveBeenCalledWith(2_000);
+    expect(JSON.stringify(checked)).not.toContain("synthetic-url-secret");
+    expect(JSON.stringify(checked)).not.toContain("synthetic-query-secret");
   });
 
   // #3600: diagnose read the config FILE and called a host healthy while its live client was

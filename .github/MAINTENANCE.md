@@ -82,8 +82,15 @@ Move only the generic fixes and their regression tests:
 - [x] After source facts change, discard stale results and re-read the facts rather
       than repeatedly asking the model about the same obsolete snapshot.
 - [x] Run deterministic and isolated-store regressions and lint.
-- [ ] Complete source review.
-- [ ] Deliver a focused PR with a verified public diff.
+- [x] Complete source review.
+- [x] Deliver a focused PR with a verified public diff.
+
+Delivered in [PR #1](https://github.com/chenhaoxiang/hindsight/pull/1), merged as
+`ab82994b58fa9b26990ba7a4b69266275db24395`. The reviewed candidate passed
+69 targeted API regressions, both refresh-failure blackbox scenarios, lint and
+remote CI (including the full blackbox suite). An earlier CI failure exposed a
+429-classification regression; it was corrected without weakening the scenario.
+This records source delivery only, not a new API installation.
 
 Acceptance: preserve scope isolation, atomic writes, cancellation and source-version
 checks. Do not manufacture success by dropping data or disabling consistency checks.
@@ -91,13 +98,13 @@ A bounded throughput observation is not a permanent capacity guarantee.
 
 ### 2. Correct the Pi adapter and status contracts
 
-- [ ] Preserve tool `isError` in the Pi-native result.
-- [ ] Validate native tool arguments and propagate cancellation to supported HTTP calls.
-- [ ] Count active work from authoritative aggregation instead of the first page of
+- [x] Preserve tool `isError` in the Pi-native result.
+- [x] Validate native tool arguments and propagate cancellation to supported HTTP calls.
+- [x] Count active work from authoritative aggregation instead of the first page of
       operation history; unavailable/invalid status is unknown, not zero.
-- [ ] Distinguish service availability, ingestion activity, consolidation backlog and
+- [x] Distinguish service availability, ingestion activity, consolidation backlog and
       page freshness. Keep existing fields compatible where possible.
-- [ ] Report compiled integration/API identity without leaking configuration values.
+- [x] Report compiled integration/API identity without leaking configuration values.
 - [ ] Add synthetic adapter/client tests and deliver a focused PR.
 
 Acceptance: errors remain errors in the host, older pending work cannot disappear
