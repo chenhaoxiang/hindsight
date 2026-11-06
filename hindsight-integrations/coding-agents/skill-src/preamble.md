@@ -35,6 +35,11 @@ When the user says "store this in hindsight" / "remember this":
   call `hindsight_capture_initiative` again with `relates_to_page_id` set to that initiative's page
   id, summarising the _current_ intent. Same page, updated plan — never a second page. Trivial
   course-corrections don't count.
+- **Verified milestones or completion** of an already tracked initiative → update that same page
+  with `relates_to_page_id` and evidence. New scoped initiative pages read explicit captures, not
+  unrelated shared-bank observations; ordinary session write-back does not advance their scope.
+  Creation can wait up to two minutes for source extraction. A pending/error result is not a page
+  success, and cancellation does not roll back an already accepted source retain.
 
 ## Retrieving
 

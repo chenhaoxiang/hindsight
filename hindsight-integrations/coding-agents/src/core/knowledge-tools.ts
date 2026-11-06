@@ -385,7 +385,9 @@ export function buildKnowledgeTools(
         "scope, or rationale of an initiative you already captured materially changes (an approach is " +
         "dropped, scope grows or shrinks, the why is rewritten). Pass relates_to_page_id = that " +
         "initiative's page id so the change lands on the existing page. Never mint a second page for the " +
-        "same initiative.\n\n" +
+        "same initiative.\n" +
+        "- Verified milestone or completion: update the same page with evidence. New scoped pages read " +
+        "explicit captures, not unrelated shared-bank observations or ordinary session ingestion.\n\n" +
         "WHEN TO SKIP: bug fixes, small tweaks, refactors, chores, and trivial course-corrections that " +
         "leave the goal intact are not initiatives — skip them.\n\n" +
         "- title: short, specific name (e.g. 'Newsletter refinement chat'). On a recapture, reuse the " +
@@ -395,7 +397,8 @@ export function buildKnowledgeTools(
         "- relates_to_page_id: leave empty for a new initiative. Set it to an existing initiative's page " +
         "id — from hindsight_list_knowledge_pages, or the id this tool returned earlier — to record a " +
         "plan change or an enhancement to it.\n\n" +
-        "Returns the page id. The page is generated for you — you never format one yourself.",
+        "Creation waits up to two minutes for the source facts. Pending/errors are not success; cancellation " +
+        "does not roll back an accepted retain. Returns the real page id, not a fabricated fallback.",
       inputSchema: {
         title: z.string(),
         summary: z.string(),

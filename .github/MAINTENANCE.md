@@ -217,8 +217,10 @@ verify the actual loaded integration/API identities separately from disk labels.
 
 ## Approved follow-up order
 
-- [ ] Deliver the naming correction as a new immutable `api-1.2.0-fork.1` release;
+- [x] Deliver the naming correction as a new immutable `api-1.2.0-fork.1` release;
       verify the Python metadata/display mapping and preserve previous artifacts.
+      [PR #5](https://github.com/chenhaoxiang/hindsight/pull/5) merged as
+      `c47faf1df7ad202e526ee55467202d0807e3b381`; previous assets remain immutable.
 - [ ] Verify potentially missing source documents and recover only confirmed gaps,
       through normal retention with original identity and provenance. No bulk replay.
 - [ ] Trial recovery of three to five historical queue/backoff-paused pages, keeping
@@ -230,6 +232,11 @@ verify the actual loaded integration/API identities separately from disk labels.
 - [ ] Bind initiative synthesis to the actual initiative/source scope and make its
       marker visible before initial synthesis. Test competing projects and asynchronous
       retention without relabeling historical facts or splitting banks.
+      The `0.8.5-fork.2` candidate uses a dedicated source tag and strict raw-fact
+      matching for new pages; it deliberately requires explicit captures for later
+      milestones instead of inferring progress from unrelated shared observations.
+      Existing pages are not silently migrated. Source waits are bounded/cancellable;
+      accepted writes survive cancellation, and no fallback page id is fabricated.
 - [ ] Verify source delivery, artifacts, installation and observed recovery separately.
 
 Local operational evidence stays private. No database schema, embedding, inference

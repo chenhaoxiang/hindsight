@@ -93,8 +93,10 @@ const TOOL_GUIDE =
   "- hindsight_capture_initiative(title, summary) — right after the user approves a plan or finishes brainstorming a " +
   "new feature/capability and you are about to start implementing (BEFORE you write any code), call this to " +
   "record it as a tracked page; then call it AGAIN with relates_to_page_id set to that page whenever the goal, " +
-  "scope, or rationale materially changes mid-work, so the page tracks the current plan and not the opening one. " +
-  "Skip bug fixes, small tweaks, chores, and trivial course-corrections.\n" +
+  "scope, or rationale materially changes mid-work, and for verified milestones or completion. New scoped " +
+  "initiative pages read explicit captures, not unrelated shared observations; include the actual repository " +
+  "and evidence. Creation waits for source extraction; cancellation is not rollback of an accepted retain. " +
+  "Skip new pages for bug fixes, small tweaks, chores, and trivial course-corrections.\n" +
   "- hindsight_ingest_document(title, content) — save an external document or durable notes/findings you want " +
   "remembered (not the current conversation — that is captured automatically at session end).";
 
