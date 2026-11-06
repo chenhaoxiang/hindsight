@@ -58,7 +58,7 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     _strip_code_fences,
     _strip_reasoning_tags,
 )
-from hindsight_api.engine.remote_retry import jittered_backoff
+from hindsight_api.engine.remote_retry import is_invalid_remote_request, jittered_backoff
 from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -396,6 +396,13 @@ class OpenAIResponsesLLM(LLMInterface):
                 raise
 
             except APIStatusError as e:
+                if is_invalid_remote_request(e):
+                    # A proxy can wrap invalid_value in HTTP 502. Replaying the same
+                    # payload cannot fix it and multiplies the outer worker retries.
+                    logger.error(
+                        "Invalid Responses request (%s/%s, scope=%s), not retrying", self.provider, self.model, scope
+                    )
+                    raise
                 if e.status_code in (401, 403):
                     logger.error(f"Auth error (HTTP {e.status_code}, {self.provider}/{self.model}), not retrying")
                     raise

@@ -21,6 +21,7 @@ from ...config import DEFAULT_RECALL_CHUNKS_MAX_TOKENS, DEFAULT_RECALL_MAX_TOKEN
 from ..llm_interface import LLM_TOOL_CHOICE_REQUIRED, LLMToolChoice
 from ..llm_trace import LLMQueueWait, reset_queue_wait_sink, set_queue_wait_sink
 from ..llm_transport import describe_llm_error
+from ..remote_retry import is_invalid_remote_request, is_transient_remote_error
 from ..response_models import LLMToolCall, LLMToolCallResult
 from .models import (
     DirectiveInfo,
@@ -1413,6 +1414,10 @@ async def _run_reflect_agent_inner(
                         "forcing final synthesis from gathered evidence."
                     )
                     return await _forced_final_synthesis(iteration + 1)
+                # Transport retries already ran inside the provider. A second agent
+                # iteration repeats that whole budget without gathering any evidence.
+                if is_invalid_remote_request(e) or is_transient_remote_error(e):
+                    raise
                 # Any other error: retry (capped, so a persistently failing provider does
                 # not hang the run), then give up. Synthesizing an answer here instead
                 # would be built on an evidence set the failed turn never finished
