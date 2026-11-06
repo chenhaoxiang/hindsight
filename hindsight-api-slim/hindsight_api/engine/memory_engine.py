@@ -26,7 +26,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar, cast
@@ -1909,6 +1909,19 @@ class RefreshTagFiltering:
     tags: list[str] | None
     tags_match: TagsMatch
     tag_groups: list[TagGroup] | None
+
+
+@dataclass(frozen=True)
+class _ExactKnowledgeHit:
+    """A scoped identity result, serialized into the existing search envelope."""
+
+    id: str
+    name: str
+    mental_model_id: str | None
+    source_query: str | None
+    snippet: str
+    updated_at: str | None
+    score: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -20647,12 +20660,16 @@ class MemoryEngine(MemoryEngineInterface):
         """Doc-level hybrid search over a bank's knowledge pages.
 
         Fuses a full-text (BM25) match over the page name + content with vector
-        similarity (``mm.embedding``) using Reciprocal Rank Fusion, in a single
-        round trip. No reranker — this path is tuned for latency. Returns pages
+        similarity (``mm.embedding``) using Reciprocal Rank Fusion. A bounded exact
+        title lookup precedes hybrid ranking, so identity matches cannot disappear
+        below an ANN/BM25 candidate cut. No reranker. Returns pages
         ranked by fused score, each with its ``source_query`` (the question it
         answers) and a short content snippet. Folders are excluded.
 
-        ``score`` is normalized to ``0..1``, where 1.0 is the best a page can do
+        Case-insensitive full-title matches come first with score 1.0; the title is
+        not tokenized, so Chinese titles and punctuation work without a text index.
+        Other pages retain the existing rank-fusion score, normalized to ``0..1``,
+        where 1.0 is the best a non-exact page can do
         on this query: every arm at rank 1. It is a *rank* score, not a relevance
         one — it says where a page placed, never how well it matched, so it is
         only meaningful against the other results for the same query. A one-arm
@@ -20693,13 +20710,47 @@ class MemoryEngine(MemoryEngineInterface):
 
         from .retain import embedding_utils
 
-        # Embed with the query input type (asymmetric models prefix queries).
-        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
-        emb_str = str(emb[0]) if emb and emb[0] else None
-
         kp = fq_table("knowledge_pages")
         mm = fq_table("mental_models")
         join = self._kp_join()
+        exact_tags = tag_filter.clause(3)
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            exact_rows = await conn.fetch(
+                f"""
+                SELECT kp.id, kp.name, kp.mental_model_id,
+                       LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at
+                FROM {join}
+                WHERE kp.bank_id = $1 AND kp.kind = 'page' AND LOWER(kp.name) = LOWER($2)
+                      {exact_tags.sql}
+                ORDER BY kp.name, kp.id
+                LIMIT {limit}
+                """,
+                bank_id,
+                query,
+                *exact_tags.params,
+            )
+        exact_ids = {r["id"] for r in exact_rows}
+        exact_results = [
+            asdict(
+                _ExactKnowledgeHit(
+                    id=r["id"],
+                    name=r["name"],
+                    mental_model_id=r["mental_model_id"],
+                    source_query=r["source_query"],
+                    snippet=_knowledge_snippet(r["snippet"]),
+                    updated_at=r["updated_at"].isoformat() if r["updated_at"] else None,
+                )
+            )
+            for r in exact_rows
+        ]
+        if len(exact_results) == limit:
+            return exact_results
+
+        # Embed only after the scoped identity lookup. An exact-only result does
+        # not depend on a working embedding service or the text-search index.
+        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
+        emb_str = str(emb[0]) if emb and emb[0] else None
 
         # A store that indexes pages answers the ranking; Postgres still hydrates it. The store is
         # given the whole page set and knows nothing about folders, so the join below is what keeps
@@ -20716,7 +20767,7 @@ class MemoryEngine(MemoryEngineInterface):
                 limit=fetch,
             )
             if not matches:
-                return []
+                return exact_results
             order = {m.page_id: i for i, m in enumerate(matches)}
             # ponytail: the store ranks the whole page set, so a filter applied at hydration can
             # leave fewer than `limit` hits; push the filter into the store protocol if that bites.
@@ -20754,7 +20805,7 @@ class MemoryEngine(MemoryEngineInterface):
                 if r["mental_model_id"] in order
             ]
             out.sort(key=lambda d: order[cast(str, d["mental_model_id"])])
-            return out[:limit]
+            return (exact_results + [hit for hit in out if hit["id"] not in exact_ids])[:limit]
 
         # BM25 clauses for the configured text-search backend (same per-backend
         # dispatch the memory-recall BM25 arm uses — see knowledge_bm25_arm).
@@ -20778,7 +20829,7 @@ class MemoryEngine(MemoryEngineInterface):
         tokens = tokenize_query(query) if enable_text_search else []
         include_bm25 = bool(tokens)
         if not include_bm25 and emb_str is None:
-            return []
+            return exact_results
 
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
@@ -20893,7 +20944,7 @@ class MemoryEngine(MemoryEngineInterface):
                     """
                     rows = await conn.fetch(sql, bank_id, bm25_text, *tags_clause.params)
 
-        return [
+        hybrid_results = [
             {
                 "id": r["id"],
                 "name": r["name"],
@@ -20904,7 +20955,9 @@ class MemoryEngine(MemoryEngineInterface):
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
             }
             for r in rows
+            if r["id"] not in exact_ids
         ]
+        return (exact_results + hybrid_results)[:limit]
 
     async def update_knowledge_node(
         self,

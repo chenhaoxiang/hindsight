@@ -382,7 +382,7 @@ fmt.Println(document.Markdown)  // YAML frontmatter + body
 
 ## Search Pages
 
-Document-level hybrid search: a full-text (BM25) match and a vector-similarity match, fused with Reciprocal Rank Fusion. There is no reranking step, which keeps it fast enough to be an agent's first call.
+Full-title matches are returned first (case-insensitive, after trimming the query), with score `1.0`. This bounded identity lookup uses the same bank/tag authorization as every other search arm and works for Chinese titles, punctuation and empty pages without a text index. Remaining results use the existing full-text (BM25) and vector-similarity ranking, fused with Reciprocal Rank Fusion. Exact hits are deduplicated before the final limit; non-exact scores and ordering are unchanged. Scores are rank scores within one result set, not a semantic-confidence threshold. There is no reranking step.
 
 ### Python
 
