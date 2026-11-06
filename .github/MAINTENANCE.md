@@ -157,10 +157,17 @@ No-result, unsupported capability and unavailable service remain distinct.
 - [x] Use legal ecosystem-specific versions; test capability and update comparisons.
 - [x] Make the maintenance update source explicit so the official updater cannot
       silently replace fork-only changes.
-- [ ] Build, inspect and scan public artifacts; publish only from verified source.
-- [ ] Retain rollback artifacts and existing runtime settings/data.
-- [ ] Verify installation bytes, effective settings, read-only health and actual
+- [x] Build, inspect and scan public artifacts; publish only from verified source.
+- [x] Retain rollback artifacts and existing runtime settings/data.
+- [x] Verify installation bytes, effective settings, read-only health and actual
       loaded tools in a safe session. Do not force-reload active sessions.
+
+Initial delivery: [PR #4](https://github.com/chenhaoxiang/hindsight/pull/4),
+merged as `ca1636a5d8072f8570b7e94ea760e705bc45e566`, and immutable Release
+`maintenance-20261106.1`. Its original API identity predates the fork naming
+convention below; preserve that release and its source rather than replacing its
+assets. Local installation and an isolated native SDK session were verified
+separately; this does not claim all existing sessions reloaded.
 
 Acceptance: source, checks, PR merge, Release, disk installation and loaded runtime
 are separately identifiable. A rejected or interrupted validation is retained as such.
@@ -168,8 +175,12 @@ are separately identifiable. A rejected or interrupted validation is retained as
 ### Fixed component build inputs
 
 - API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
-  plus [.github/patches/api-1.2.0-chx.1.patch](patches/api-1.2.0-chx.1.patch),
-  producing Python version `1.2.0+chx.1`. The overlay changes only the six reviewed
+  plus [.github/patches/api-1.2.0-fork.1.patch](patches/api-1.2.0-fork.1.patch).
+  Public API identity and release naming are `1.2.0-fork.1`; Python distribution
+  metadata and wheel names use the equivalent `1.2.0+fork.1`. PEP 440 rejects
+  `1.2.0-fork.1`, while the local-version form satisfies the existing full wrapper
+  dependency `==1.2.0`. Do not use a post-release or change that dependency to
+  work around naming. The overlay changes only the six reviewed
   production modules and the two version declarations. No newer API schema,
   migration or unrelated main-branch feature is included. Keep regression tests
   bound to the public reliability-fix source as well as the stable API export.
@@ -182,7 +193,7 @@ are separately identifiable. A rejected or interrupted validation is retained as
 Build only from committed public source into ignored temporary directories. A
 fresh API export can be prepared with `git archive` at the exact API base. From
 the maintenance repository root, apply the committed zero-context overlay with
-`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-chx.1.patch`.
+`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.1.patch`.
 Use a fresh export and verify the resulting source bytes; this avoids patch-tool
 backup files entering the package. Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
@@ -204,11 +215,27 @@ the pinned public baseline and confirming the `client_id` usage. Do not suppress
 other findings or infer that an arbitrary token-like value is safe. Install only verified bytes, keep previous artifacts, and
 verify the actual loaded integration/API identities separately from disk labels.
 
-## Deferred work
+## Approved follow-up order
 
-Initialization profiling, nested-tool usage accounting, input/consolidation capacity
-planning and grouped recovery of older paused pages are separate follow-ups. They
-must not be silently included as a bulk migration or a replay of real operations.
+- [ ] Deliver the naming correction as a new immutable `api-1.2.0-fork.1` release;
+      verify the Python metadata/display mapping and preserve previous artifacts.
+- [ ] Verify potentially missing source documents and recover only confirmed gaps,
+      through normal retention with original identity and provenance. No bulk replay.
+- [ ] Trial recovery of three to five historical queue/backoff-paused pages, keeping
+      prior content, structure, grounding and source watermarks available for rollback.
+      Diagnose delta/retrieval failures separately; an HTTP success is not quality acceptance.
+- [ ] Compare consolidation batch packing and context cost with isolated fixtures
+      before considering a bounded tuning change. Keep scope serialization and
+      consistency checks; more concurrency cannot parallelize one shared scope.
+- [ ] Bind initiative synthesis to the actual initiative/source scope and make its
+      marker visible before initial synthesis. Test competing projects and asynchronous
+      retention without relabeling historical facts or splitting banks.
+- [ ] Verify source delivery, artifacts, installation and observed recovery separately.
+
+Local operational evidence stays private. No database schema, embedding, inference
+model, reasoning-level or global refresh-frequency change is authorized by this
+follow-up. Initialization profiling, nested-tool usage accounting and storage
+lifecycle tuning remain lower-priority work, not new delivery prerequisites.
 
 ## Completion record
 

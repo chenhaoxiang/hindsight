@@ -231,10 +231,10 @@ diff --git a/hindsight-api-slim/pyproject.toml b/hindsight-api-slim/pyproject.to
 +++ b/hindsight-api-slim/pyproject.toml
 @@ -7 +7 @@
 -version = "1.2.0"
-+version = "1.2.0+chx.1"
++version = "1.2.0+fork.1"
 diff --git a/hindsight-api-slim/hindsight_api/__init__.py b/hindsight-api-slim/hindsight_api/__init__.py
 --- a/hindsight-api-slim/hindsight_api/__init__.py
 +++ b/hindsight-api-slim/hindsight_api/__init__.py
 @@ -43 +43 @@
 -__version__ = "1.2.0"
-+__version__ = "1.2.0+chx.1"
++__version__ = "1.2.0-fork.1"
