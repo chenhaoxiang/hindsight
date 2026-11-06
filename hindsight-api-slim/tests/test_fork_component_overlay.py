@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,4 +40,6 @@ def test_fork_distribution_satisfies_unchanged_api_wrapper(overlay: Path) -> Non
     slim = next(dependency for dependency in dependencies if dependency.name == "hindsight-api-slim")
     # A Python post-release does not satisfy ==base; a local version does. Keep
     # the unchanged full API wrapper usable without publishing under its name.
-    assert Version(distribution[0]) in slim.specifier
+    version = Version(distribution[0])
+    assert slim.specifier == SpecifierSet(f"=={version.base_version}")
+    assert version in slim.specifier
