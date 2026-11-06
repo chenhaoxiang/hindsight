@@ -238,6 +238,21 @@ describe("maybeAutoUpdate", () => {
     binOnPath: extra.binOnPath ?? (() => true),
   });
 
+  it.each(["0.8.5-fork.1", "0.8.5-fork.1+build.2"])(
+    "never replaces maintenance version %s through the official updater",
+    async (version) => {
+      const { runtime, spawn, npmViewOk } = staged(version);
+      const lookup = npmViewOk("99.0.0");
+      const result = await maybeAutoUpdate(
+        { autoUpdate: true },
+        opts(runtime, { spawn, npmView: lookup, selfUpdatable: () => true })
+      );
+      expect(result).toBe("");
+      expect(lookup).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled();
+    }
+  );
+
   it("spawns a detached stage-only update when the registry is ahead", async () => {
     const { runtime, spawn, npmViewOk } = staged("0.4.2");
     const started = await maybeAutoUpdate(

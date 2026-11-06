@@ -396,6 +396,13 @@ export async function maybeAutoUpdate(
 
     const current = stagedVersion(pkgRoot);
     if (!current) return ""; // cannot tell what is installed — never guess and overwrite it
+    // A maintenance build is not an upstream prerelease to replace with npm's stable tag.
+    // Keep this guard even for npx-origin copies; explicit fork updates use pinned fork assets.
+    if (/^\d+\.\d+\.\d+-fork\.\d+(?:\+[0-9A-Za-z.-]+)?$/.test(current)) {
+      log.info("auto-update", "maintenance fork version — use its pinned release assets");
+      stampCheck(file, now, "");
+      return "";
+    }
     // Both guards sit after the interval gate and stamp like any other "checked, nothing to do"
     // outcome, so each states its reason at most once a day instead of on every session start.
     if (!(opts.selfUpdatable ?? selfUpdatable)(runtime)) {
