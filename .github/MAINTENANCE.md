@@ -180,15 +180,19 @@ are separately identifiable. A rejected or interrupted validation is retained as
   query/install over this maintenance identity, even when staged through npx.
 
 Build only from committed public source into ignored temporary directories. A
-fresh API export can be prepared with `git archive` at the exact API base, then
-apply the committed overlay from that export's root with `patch -p1`. Build its
+fresh API export can be prepared with `git archive` at the exact API base. From
+the maintenance repository root, apply the committed zero-context overlay with
+`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-chx.1.patch`.
+Use a fresh export and verify the resulting source bytes; this avoids patch-tool
+backup files entering the package. Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
 The integration uses its committed lockfile, generated skill and `npm run build`,
 then `npm pack --ignore-scripts`. These operations are builds, not publication.
 
 Use a separate maintenance Release tag, not upstream `v*`/`integrations/**` tags,
 never official npm/PyPI publication. Before attaching assets, inspect expanded
-wheel/tar contents, scan them and record public source/patch/artifact hashes.
+wheel/tar contents, reject `.orig`/`.rej`/`.bak` source residue, scan them and record
+public source/patch/artifact hashes.
 Local settings, installation paths, credentials, data, logs and rollback copies
 are not Release assets.
 
