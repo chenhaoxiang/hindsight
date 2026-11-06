@@ -76,6 +76,7 @@ async def test_responses_invalid_value_does_not_retry() -> None:
     [
         ("llm.responses.refresh.queued", False),
         ("llm.responses.refresh.backoff", False),
+        ("mental_model_delta.budget_exhausted", False),
         ("llm.responses.refresh.attempt=1/4", True),
     ],
 )

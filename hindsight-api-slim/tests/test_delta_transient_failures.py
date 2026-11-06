@@ -12,6 +12,7 @@ import pytest
 
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.config import clear_config_cache
 from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
 from tests.test_consolidation_stale_batch import cross_encoder, embeddings  # noqa: F401 (fixtures)
 from tests.test_mental_model_delta import _seed_fact_row, patch_llm_call, patch_reflect  # noqa: F401 (fixtures)
@@ -88,13 +89,21 @@ async def test_transient_edit_keeps_original_error_and_baseline(
             )
         before = await memory.get_mental_model(bank, model["id"], detail="full", request_context=request_context)
 
+        budget_expiry = type(error) is TimeoutError
+        if budget_expiry:
+            monkeypatch.setenv("HINDSIGHT_API_MENTAL_MODEL_DELTA_TIMEOUT", "0.02")
+            clear_config_cache()
+
         async def fail_call(**_kwargs: object) -> None:
+            if budget_expiry:
+                await asyncio.Event().wait()
             raise error
 
         monkeypatch.setattr(memory._mental_model_refresh_llm_config, "call", fail_call)
         with pytest.raises(type(error)) as raised:
             await memory._handle_refresh_mental_model({"bank_id": bank, "mental_model_id": model["id"]})
-        assert raised.value is error
+        if not budget_expiry:
+            assert raised.value is error
         after = await memory.get_mental_model(bank, model["id"], detail="full", request_context=request_context)
         for field in ("content", "structured_content", "last_refreshed_at", "last_memory_seen_at", "source_query"):
             assert after[field] == before[field], field

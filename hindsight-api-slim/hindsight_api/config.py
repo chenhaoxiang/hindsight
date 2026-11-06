@@ -525,6 +525,7 @@ ENV_MENTAL_MODEL_REFRESH_LLM_MAX_RETRIES = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_L
 ENV_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF"
 ENV_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF"
 ENV_MENTAL_MODEL_REFRESH_LLM_TIMEOUT = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_TIMEOUT"
+ENV_MENTAL_MODEL_DELTA_TIMEOUT = "HINDSIGHT_API_MENTAL_MODEL_DELTA_TIMEOUT"
 ENV_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG"
 ENV_MENTAL_MODEL_REFRESH_LLM_REASONING_EFFORT = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_REASONING_EFFORT"
 ENV_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY"
@@ -3510,6 +3511,8 @@ class HindsightConfig:
     mental_model_refresh_llm_initial_backoff: float | None
     mental_model_refresh_llm_max_backoff: float | None
     mental_model_refresh_llm_timeout: float | None
+    # Optional wall budget for the whole edit/retraction phase, not full synthesis.
+    mental_model_delta_timeout: float | None
     mental_model_refresh_llm_litellmrouter_config: dict | None
     mental_model_refresh_llm_reasoning_effort: str | None
     mental_model_refresh_llm_extra_body: dict | None
@@ -4409,6 +4412,8 @@ class HindsightConfig:
         """Validate configuration values and raise errors for invalid combinations."""
         for operation in DECISION_MODEL_OPERATIONS:
             self.decision_model_config(operation)  # raises on an unknown provider or a missing key
+        if self.mental_model_delta_timeout is not None and not (0 < self.mental_model_delta_timeout < float("inf")):
+            raise ValueError(f"{ENV_MENTAL_MODEL_DELTA_TIMEOUT} must be a finite positive number")
         # Validate vector_extension
         validate_extension(self.vector_extension)
 
@@ -4795,6 +4800,7 @@ class HindsightConfig:
             mental_model_refresh_llm_initial_backoff=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF),
             mental_model_refresh_llm_max_backoff=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF),
             mental_model_refresh_llm_timeout=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_TIMEOUT),
+            mental_model_delta_timeout=_env_float(ENV_MENTAL_MODEL_DELTA_TIMEOUT),
             mental_model_refresh_llm_litellmrouter_config=_parse_llm_router_config(
                 ENV_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG
             ),

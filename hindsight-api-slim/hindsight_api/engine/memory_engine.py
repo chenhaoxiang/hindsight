@@ -5310,7 +5310,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # Waiting for a local permit says nothing about whether this
                     # page can be refreshed. Like provider backoff, it must never
                     # turn congestion into a permanent automatic-refresh pause.
-                    pause_automatic=not stage.endswith((".backoff", ".queued")),
+                    pause_automatic=not stage.endswith((".backoff", ".queued", ".budget_exhausted")),
                 )
             finally:
                 _current_schema.reset(token)
@@ -18719,6 +18719,17 @@ class MemoryEngine(MemoryEngineInterface):
         # Both op calls share one LLM handle, built on first use so a refresh that
         # neither retracts nor has new facts still pays no config resolution.
         _op_llm_config: ConfiguredLLMProvider | None = None
+        # Full synthesis has already run. The retraction/edit calls and any corrected
+        # response now share ONE phase budget, clamped to this task's remaining wall time.
+        from ..worker.stage import get_task_deadline
+
+        edit_deadline = get_task_deadline()
+        edit_timeout = get_config().mental_model_delta_timeout
+        if edit_timeout is not None:
+            configured_deadline = asyncio.get_running_loop().time() + edit_timeout
+            edit_deadline = (
+                min(edit_deadline, configured_deadline) if edit_deadline is not None else configured_deadline
+            )
 
         async def _op_llm() -> ConfiguredLLMProvider:
             nonlocal _op_llm_config
@@ -18786,6 +18797,7 @@ class MemoryEngine(MemoryEngineInterface):
                             system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
                             user_prompt=unsay_prompt,
                             scope="mental_model_retraction_ops",
+                            deadline=edit_deadline,
                             max_completion_tokens=get_config().reflect_max_completion_tokens,
                             temperature=get_config().llm_temperature_mental_model_refresh,
                         )
@@ -18924,6 +18936,7 @@ class MemoryEngine(MemoryEngineInterface):
                         system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                         scope="mental_model_delta_ops",
+                        deadline=edit_deadline,
                         document=current_doc,
                         response_format=DeltaOperationList,
                         strict_schema=get_config().llm_strict_schema_reflect,

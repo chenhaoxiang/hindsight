@@ -38,7 +38,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypeVar
 
@@ -815,6 +815,12 @@ class LLMTraceRecorder:
             llm_info["tool_calls"] = [tc.get("name", "") for tc in tool_calls]
         if input_count is not None:
             llm_info["input_count"] = input_count
+        from .llm_attempts import current_provider_attempts
+
+        attempts = current_provider_attempts()
+        if attempts is not None and attempts.total:
+            # Snapshot now: retries and concurrent calls must not mutate a buffered row.
+            llm_info["provider_attempts"] = asdict(attempts.summary())
 
         record = LLMRequestRecord(
             provider=provider,

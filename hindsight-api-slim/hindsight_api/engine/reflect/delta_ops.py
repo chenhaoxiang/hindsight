@@ -41,6 +41,7 @@ or stay the same per refresh, never get worse.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -515,6 +516,48 @@ def _replayed_reply_text(content: Any) -> str:
 
 
 async def request_delta_operations(
+    llm: ConfiguredLLMProvider,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    scope: str,
+    document: StructuredDocument | None = None,
+    deadline: float | None = None,
+    **call_kwargs: Any,
+) -> DeltaOperationList:
+    """One shared edit deadline, including provider retries and the semantic correction.
+
+    An exhausted budget is temporary, never permission to overwrite the old page
+    with a partial candidate. External cancellation is still external cancellation.
+    """
+    from hindsight_api.worker.stage import set_stage
+
+    if deadline is not None and deadline <= asyncio.get_running_loop().time():
+        set_stage("mental_model_delta.budget_exhausted")
+        raise TimeoutError("Delta edit has no remaining stage budget")
+    try:
+        async with asyncio.timeout_at(deadline):
+            result = await _request_delta_operations(
+                llm,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                scope=scope,
+                document=document,
+                **call_kwargs,
+            )
+            # A provider may suppress cancellation or finish between timer ticks.
+            # A late answer must not turn an expired budget into permission to write.
+            if deadline is not None and deadline <= asyncio.get_running_loop().time():
+                raise TimeoutError("Delta edit completed after its stage deadline")
+            return result
+    finally:
+        if deadline is not None and deadline <= asyncio.get_running_loop().time():
+            # Runs even if the outer worker ceiling cancels at the same deadline.
+            # That cancellation must not be mistaken for a deterministic page failure.
+            set_stage("mental_model_delta.budget_exhausted")
+
+
+async def _request_delta_operations(
     llm: ConfiguredLLMProvider,
     *,
     system_prompt: str,

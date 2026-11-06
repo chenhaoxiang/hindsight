@@ -31,6 +31,9 @@ class StageHolder:
     #: nobody has looked at it yet. Must not raise — it runs on the engine's hot
     #: path, and a stage breadcrumb is never worth failing a task over.
     on_progress: Callable[[], None] | None = None
+    # Absolute asyncio loop time for a whole-task ceiling (not an idle ceiling).
+    # Nested edit stages honor the remaining budget instead of starting work past it.
+    deadline: float | None = None
 
 
 _current_holder: ContextVar[StageHolder | None] = ContextVar("hindsight_stage_holder", default=None)
@@ -61,6 +64,12 @@ def set_stage(name: str) -> None:
     holder.updated_at = time.monotonic()
     if holder.on_progress is not None:
         holder.on_progress()
+
+
+def get_task_deadline() -> float | None:
+    """The active task's absolute deadline, or unknown outside an absolute-ceiling task."""
+    holder = _current_holder.get()
+    return holder.deadline if holder is not None else None
 
 
 def get_stage() -> str | None:

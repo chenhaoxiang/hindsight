@@ -2,6 +2,7 @@
 LLM wrapper for unified configuration across providers.
 """
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -1406,6 +1407,9 @@ class LLMProvider:
         # Cleared per call; the provider stashes real usage once a response is in
         # hand so the error path below can attach it if parsing/validation fails.
         usage_token = set_response_usage(None)
+        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
+
+        attempt_token = bind_provider_attempts()
         try:
             cached_prefix = await self._cached_prefix_for(prompt_cache) if prompt_cache is not None else None
             # Providers that own retry loops acquire the shared permits for each
@@ -1442,7 +1446,7 @@ class LLMProvider:
                         **cache_kwarg,
                         **attempt_kwarg,
                     )
-                except Exception as e:
+                except (Exception, asyncio.CancelledError) as e:
                     # The provider call may have succeeded (and incurred token
                     # cost) before local parsing/validation raised; attach the
                     # provider-reported usage to the error trace when available.
@@ -1473,6 +1477,7 @@ class LLMProvider:
         finally:
             reset_request_context(request_token)
             reset_response_usage(usage_token)
+            reset_provider_attempts(attempt_token)
 
         # Single scrub point for every structured/text LLM response in the engine:
         # a model can emit a lone `\udXXX` escape that JSON decoding turns into an
@@ -1649,6 +1654,9 @@ class LLMProvider:
         # Cleared per call; the provider stashes real usage once a response is in
         # hand so the error path below can attach it if parsing/validation fails.
         usage_token = set_response_usage(None)
+        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
+
+        attempt_token = bind_provider_attempts()
         try:
             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
             async with AsyncExitStack() as stack:
@@ -1674,7 +1682,7 @@ class LLMProvider:
                         tool_choice=tool_choice,
                         **attempt_kwarg,
                     )
-                except Exception as e:
+                except (Exception, asyncio.CancelledError) as e:
                     # The provider call may have succeeded (and incurred token
                     # cost) before local parsing/validation raised; attach the
                     # provider-reported usage to the error trace when available.
@@ -1705,6 +1713,7 @@ class LLMProvider:
         finally:
             reset_request_context(request_token)
             reset_response_usage(usage_token)
+            reset_provider_attempts(attempt_token)
 
         # Same scrub for the tool-calling path: the agent's text content and every
         # tool-call argument are model-authored and flow on to storage and reranking.
