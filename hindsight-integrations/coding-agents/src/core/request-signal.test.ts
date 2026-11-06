@@ -25,6 +25,8 @@ describe("per-tool cancellation", () => {
       allStarted = resolve;
     });
     const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      if (String(_url).endsWith("/knowledge-base/tree"))
+        return new Response(JSON.stringify({ roots: [] }));
       const id = String(_url).split("/").pop()!;
       if (id === "ok") return new Response(JSON.stringify({ id, body: "synthetic page" }));
       return new Promise<Response>((resolve, reject) => {
@@ -62,7 +64,12 @@ describe("per-tool cancellation", () => {
     expect(await background).toMatchObject({ id: "background", body: "synthetic page" });
     expect(currentRequestSignal()).toBeUndefined();
     expect((await tool.execute("third", { page_id: "ok" })).isError).toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).includes("/knowledge-base/pages/"))
+    ).toHaveLength(4);
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/knowledge-base/tree"))
+    ).toHaveLength(2);
   });
 
   it("stops a rate-limit sleep rather than sending another attempt", async () => {

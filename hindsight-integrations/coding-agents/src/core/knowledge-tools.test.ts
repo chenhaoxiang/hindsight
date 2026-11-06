@@ -32,12 +32,14 @@ const EXPECTED_TOOLS = [
   "hindsight_list_knowledge_pages",
   "hindsight_read_knowledge_page",
   "hindsight_reflect",
+  "hindsight_recall",
+  "hindsight_recent_memories",
   "hindsight_capture_initiative",
   "hindsight_ingest_document",
 ];
 
 describe("buildKnowledgeTools", () => {
-  it("returns exactly the eight expected tools (as a set)", () => {
+  it("returns exactly the ten expected tools (as a set)", () => {
     const client = stubClient();
     const tools = buildKnowledgeTools(client, "repo-a");
     expect(tools.map((t) => t.name).sort()).toEqual([...EXPECTED_TOOLS].sort());
@@ -192,11 +194,13 @@ describe("buildKnowledgeTools", () => {
     const result = await tool.handler({ query: "upload retries" });
     expect(result.isError).toBeFalsy();
     // The tool passes no limit — the client's pageSearchLimit is the single source for it.
-    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries");
+    expect(client.searchKnowledgePages).toHaveBeenCalledWith("upload retries", {
+      includeFreshness: true,
+    });
     // No `score`: the server's RRF number tops out near 0.03, so a model reading it treats its best
     // hit as 3% relevant. Rank order carries the ranking.
     const payload = JSON.parse(result.content[0].text);
-    expect(payload.pages).toEqual([
+    expect(payload.pages).toMatchObject([
       {
         page: "Uploader guide",
         page_id: "p1",
@@ -240,13 +244,21 @@ describe("buildKnowledgeTools", () => {
     expect(result.content[0].text).toContain("search down");
   });
 
-  it("hindsight_list_knowledge_pages calls client.listPages() with no args", async () => {
-    const client = stubClient({ listPages: vi.fn(async () => ({ pages: [{ id: "p1" }] })) });
+  it("hindsight_list_knowledge_pages requests freshness and returns a bounded roster", async () => {
+    const client = stubClient({
+      listPages: vi.fn(async () => ({ items: [{ id: "p1", name: "Page" }] })),
+    });
     const tools = buildKnowledgeTools(client, "repo-a");
     const tool = findTool(tools, "hindsight_list_knowledge_pages");
     const result = await tool.handler({});
-    expect(client.listPages).toHaveBeenCalledWith();
-    expect(JSON.parse(result.content[0].text)).toEqual({ pages: [{ id: "p1" }] });
+    expect(client.listPages).toHaveBeenCalledWith({ includeFreshness: true });
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      items: [{ id: "p1", name: "Page" }],
+      total: 1,
+      limit: 25,
+      offset: 0,
+      next_offset: null,
+    });
   });
 
   it("hindsight_read_knowledge_page calls client.getPage(page_id)", async () => {
@@ -254,8 +266,15 @@ describe("buildKnowledgeTools", () => {
     const tools = buildKnowledgeTools(client, "repo-a");
     const tool = findTool(tools, "hindsight_read_knowledge_page");
     const result = await tool.handler({ page_id: "p1" });
-    expect(client.getPage).toHaveBeenCalledWith("p1");
-    expect(JSON.parse(result.content[0].text)).toEqual({ id: "p1", name: "X" });
+    expect(client.getPage).toHaveBeenCalledWith("p1", { includeFreshness: true });
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      id: "p1",
+      name: "X",
+      body: "",
+      body_total_chars: 0,
+      next_offset: null,
+      freshness: { state: "unknown" },
+    });
   });
 
   it("hindsight_reflect calls client.reflect(query, {budget: high}) and returns the synthesis", async () => {

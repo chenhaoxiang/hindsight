@@ -78,7 +78,16 @@ const TOOL_GUIDE =
   "- hindsight_list_knowledge_pages / hindsight_read_knowledge_page — BEFORE substantial work, list the pages and " +
   "read the relevant ones to ground yourself in this repo's architecture, conventions, and past decisions instead " +
   "of re-deriving them from the code; follow any [[page:<id>]] links you see.\n" +
-  "- hindsight_reflect(query) — when pages are too shallow and you need the WHY: deep reasoning over the " +
+  "- hindsight_recall(query) — if a page is stale, refresh-failed, missing or too generic, retrieve " +
+  "bounded world/experience facts with document IDs, tags and provenance. Extracted facts can be " +
+  "searchable before consolidation; extraction itself can still be pending. Attribute each fact " +
+  "to its actual project/source, not the whole shared bank, and verify current code/state.\n" +
+  "- hindsight_recent_memories(since) — for recent writes/updates, use an explicit ISO timestamp. " +
+  "This filters memory updated_at, not event dates. It is a bounded list, not semantic search; " +
+  "truncated results are not exhaustive. Do not treat recall's temporal ranking as a strict filter.\n" +
+  "  Page freshness is a scoped-write signal, not proof of correctness; missing metadata is unknown " +
+  "and deletions are not observed. Follow next_offset for bounded page reads/rosters.\n" +
+  "- hindsight_reflect(query) — when pages/facts are too shallow and you need the WHY: deep reasoning over the " +
   "repo's full memory for the past decision and exact values that explain a behavior or bug (slower — " +
   'use deliberately, and credit results with a blockquote header "> 🧠 **From Hindsight memory** — <summary>").\n' +
   "- hindsight_capture_initiative(title, summary) — right after the user approves a plan or finishes brainstorming a " +
@@ -97,7 +106,7 @@ const TOOL_GUIDE =
 const PAGES_FIRST_ON_GOALS =
   "- The user just set a NEW task or goal → search the knowledge pages FIRST with " +
   "hindsight_search_knowledge_pages. No synthesis is injected automatically in this configuration; " +
-  "call hindsight_reflect only when those pages are too shallow and deeper reasoning is needed.\n";
+  "use raw/recent facts when pages lag, and call hindsight_reflect only when deeper reasoning is needed.\n";
 
 export interface ToolGuideOpts {
   /** Add the new-goal pull trigger (no automatic synthesis: cfg.autoInject !== "reflect"). It used to send
@@ -125,7 +134,7 @@ export function buildKnowledgePreamble(pages: PageRef[], opts?: ToolGuideOpts): 
     `${toolGuide(opts)}\n` +
     "ALSO your correction tool: when you verify a Hindsight memory is wrong or stale, ingest a " +
     '"Correction: <topic>" doc stating what memory claimed, what is true now, and the evidence — ' +
-    "newer facts supersede older ones.\n" +
+    "the correction becomes retrievable after extraction; derived pages refresh asynchronously.\n" +
     `${body}\n` +
     "This tool guide and the page list are re-injected for you periodically as things change.\n" +
     "</hindsight_knowledge>"

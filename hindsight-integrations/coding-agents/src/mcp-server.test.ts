@@ -18,7 +18,7 @@ describe("selectTools", () => {
     expect(selectTools(cfg, stubClient, "b")).toEqual([]);
   });
 
-  it("returns the eight hindsight_* tool specs when enabled", () => {
+  it("returns the ten hindsight_* tool specs when enabled", () => {
     const cfg = resolveConfig({});
     const tools = selectTools(cfg, stubClient, "b");
     expect(tools.map((t) => t.name).sort()).toEqual(
@@ -29,6 +29,8 @@ describe("selectTools", () => {
         "hindsight_list_knowledge_pages",
         "hindsight_read_knowledge_page",
         "hindsight_reflect",
+        "hindsight_recall",
+        "hindsight_recent_memories",
         "hindsight_capture_initiative",
         "hindsight_ingest_document",
       ].sort()
@@ -224,6 +226,8 @@ describe("buildMcpServer", () => {
       hindsight_list_knowledge_pages: readOnly,
       hindsight_read_knowledge_page: readOnly,
       hindsight_reflect: readOnly,
+      hindsight_recall: readOnly,
+      hindsight_recent_memories: readOnly,
       hindsight_capture_initiative: nonDestructiveWrite,
       hindsight_ingest_document: nonDestructiveWrite,
     };

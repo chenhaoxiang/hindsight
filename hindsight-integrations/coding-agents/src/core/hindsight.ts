@@ -24,6 +24,12 @@ import {
 import { version as PKG_VERSION } from "../../package.json";
 import { setTimeout as abortableDelay } from "node:timers/promises";
 import { currentRequestSignal, requestDeadline } from "./request-signal";
+import {
+  modelMetadata,
+  readPageFreshness,
+  shapeFreshness,
+  type PageFreshness,
+} from "./page-freshness";
 import { pool, semverGte, sleep } from "./util";
 import type { RetainStamp } from "./retain-stamp";
 
@@ -37,6 +43,10 @@ export interface KnowledgeNode {
   name: string;
   /** The page's source query (OKF `description`) — what a re-sync compares against. */
   description?: string;
+  mental_model_id?: string | null;
+  timestamp?: string | null;
+  is_stale?: boolean | null;
+  last_refresh_failed_at?: string | null;
   /** The page's EFFECTIVE refresh policy, on servers new enough to report it (#3572). Absent
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
   trigger?: CurrentPageTrigger;
@@ -933,10 +943,20 @@ export class HindsightClient {
     }
   }
 
+  /** Read-only transport primitives for the bounded agent tools. Endpoint construction stays in
+   *  this client, alongside every other memory request and its bank/authentication binding. */
+  async recallFactResponse(body: Record<string, unknown>): Promise<Response> {
+    return this.req("POST", this.bankUrl("/memories/recall"), body);
+  }
+
+  async recentFactResponse(query: URLSearchParams): Promise<Response> {
+    return this.req("GET", this.bankUrl(`/memories/list?${query}`));
+  }
+
   /**
-   * Raw recall with no LLM in the loop, so it still answers when reflect's synthesis times out or
-   * 5xxs. The body is `recallOptions` (consolidated observations by default) — a bank that grows
-   * no observations widens it rather than getting nothing back. Returns the texts in rank order.
+   * Raw recall without reflect synthesis, so it can answer when that synthesis times out or 5xxs.
+   * The API may still use configured ranking services. The body is `recallOptions` (consolidated
+   * observations by default); a bank with no observations widens it. Returns texts in rank order.
    *
    * The name predates `recallOptions` (the observation type used to be hardcoded here) and is
    * kept deliberately: this is the client's published surface, so renaming it would break
@@ -1000,12 +1020,21 @@ export class HindsightClient {
    * page read/update in this client goes through the same knowledge-base ids, so a page id from
    * here, from `searchKnowledgePages`, or from a `[[page:<id>]]` link all resolve identically.
    */
-  async listPages(): Promise<unknown> {
-    const items: { id: string; name: string; description?: string; folder?: string }[] = [];
+  async listPages(opts: { includeFreshness?: boolean } = {}): Promise<unknown> {
+    const items: {
+      id: string;
+      name: string;
+      description?: string;
+      folder?: string;
+      last_updated_at?: string | null;
+      freshness?: PageFreshness;
+    }[] = [];
+    const nodesById = new Map<string, KnowledgeNode>();
     const walk = (nodes: KnowledgeNode[], folder?: string): void => {
       for (const n of nodes) {
         if (!n?.id || !n?.name) continue;
         if (n.kind === "page") {
+          nodesById.set(n.id, n);
           items.push({
             id: n.id,
             name: n.name,
@@ -1017,6 +1046,14 @@ export class HindsightClient {
       }
     };
     walk(await this.tree());
+    if (opts.includeFreshness && items.length) {
+      const models = await modelMetadata(this);
+      for (const item of items) {
+        const node = nodesById.get(item.id)!;
+        item.last_updated_at = node.timestamp ?? null;
+        item.freshness = shapeFreshness(models.get(node.mental_model_id ?? ""), node);
+      }
+    }
     return { items };
   }
 
@@ -1026,14 +1063,17 @@ export class HindsightClient {
    * the page — that is 70-95% of the raw bytes and can blow past an MCP host's per-tool-result
    * token cap.
    */
-  async getPage(pageId: string): Promise<unknown> {
+  async getPage(pageId: string, opts: { includeFreshness?: boolean } = {}): Promise<unknown> {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
     const r = await this.req(
       "GET",
       this.bankUrl(`/knowledge-base/pages/${encodeURIComponent(pageId)}`)
     );
     if (r.status === 404) throw new Error(`knowledge page not found: ${pageId}`);
-    return shapePage(await r.json());
+    const page = shapePage(await r.json());
+    return opts.includeFreshness
+      ? { ...(page as Record<string, unknown>), freshness: await readPageFreshness(this, pageId) }
+      : page;
   }
 
   /** Hybrid (BM25 + vector, RRF-fused) server-side search over the bank's knowledge pages.
@@ -1041,9 +1081,17 @@ export class HindsightClient {
    *  hindsight_search_knowledge_pages. */
   async searchKnowledgePages(
     query: string,
-    opts: { limit?: number; timeoutMs?: number } = {}
+    opts: { limit?: number; timeoutMs?: number; includeFreshness?: boolean } = {}
   ): Promise<
-    { id: string; name: string; source_query?: string; snippet: string; score: number }[]
+    {
+      id: string;
+      name: string;
+      source_query?: string;
+      snippet: string;
+      score: number;
+      last_updated_at?: string | null;
+      freshness?: PageFreshness;
+    }[]
   > {
     if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
     const q = `?q=${encodeURIComponent(query)}&limit=${opts.limit ?? this.pageSearchLimit}`;
@@ -1066,14 +1114,24 @@ export class HindsightClient {
         source_query?: string | null;
         snippet?: string;
         score?: number;
+        mental_model_id?: string | null;
+        updated_at?: string | null;
       }[];
     };
+    const models =
+      opts.includeFreshness && j.results?.length ? await modelMetadata(this) : undefined;
     return (j.results ?? []).map((x) => ({
       id: x.id,
       name: x.name,
       ...(x.source_query ? { source_query: x.source_query } : {}),
       snippet: x.snippet ?? "",
       score: x.score ?? 0,
+      ...(opts.includeFreshness
+        ? {
+            last_updated_at: x.updated_at ?? null,
+            freshness: shapeFreshness(models?.get(x.mental_model_id ?? "")),
+          }
+        : {}),
     }));
   }
 
