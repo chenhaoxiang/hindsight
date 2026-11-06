@@ -23,7 +23,8 @@ function server(
   status = "completed",
   visible = true,
   duplicate = false,
-  foreignDuplicate = false
+  foreignDuplicate = false,
+  ambiguousDuplicate = false
 ): Call[] {
   const calls: Call[] = [];
   let sourceId = "";
@@ -60,6 +61,9 @@ function server(
                         tags: [
                           "knowledge:feature-work",
                           `initiative:${foreignDuplicate ? "aaaaaaaa-bbbb-5ccc-8ddd-eeeeeeeeeeee" : sourceId.slice("initiative-source-".length)}`,
+                          ...(ambiguousDuplicate
+                            ? ["initiative:aaaaaaaa-bbbb-5ccc-8ddd-eeeeeeeeeeee"]
+                            : []),
                         ],
                       },
                     ],
@@ -118,6 +122,12 @@ describe("initiative source readiness", () => {
 
   it("does not adopt another plan's same-name duplicate page", async () => {
     const calls = server("completed", true, true, true);
+    await expect(capture()).rejects.toThrow("no page id invented");
+    expect(calls.filter((c) => c.path.endsWith("/memories"))).toHaveLength(1);
+  });
+
+  it("does not adopt a same-source duplicate with ambiguous initiative tags", async () => {
+    const calls = server("completed", true, true, false, true);
     await expect(capture()).rejects.toThrow("no page id invented");
     expect(calls.filter((c) => c.path.endsWith("/memories"))).toHaveLength(1);
   });
@@ -190,6 +200,70 @@ describe("initiative source readiness", () => {
   it("bounds the source wait instead of treating pending as success", async () => {
     const calls = server("pending");
     vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(120_001);
+    await expect(capture()).rejects.toThrow("still pending");
+    expect(calls.some((c) => c.path.endsWith("/pages"))).toBe(false);
+  });
+
+  it.each(["operations", "facts"])(
+    "does not spend global rate-limit patience during the bounded %s read",
+    async (stage) => {
+      const calls = server();
+      const routed = globalThis.fetch;
+      vi.spyOn(Math, "random").mockReturnValue(0.5);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init: RequestInit) => {
+          const path = new URL(url).pathname;
+          if (
+            stage === "operations" ? path.includes("/operations/") : path.endsWith("/memories/list")
+          )
+            return Response.json({}, { status: 429, headers: { "Retry-After": "60" } });
+          return routed(url, init);
+        })
+      );
+      const ctrl = new AbortController();
+      // Bound a broken test too: the old req() would sleep 75 seconds on this 429.
+      const guard = setTimeout(() => ctrl.abort(), 1_000);
+      try {
+        const client = new HindsightClient({
+          apiUrl: "http://fixture.invalid",
+          bank: "shared",
+          rateLimitPatienceMs: 300_000,
+        });
+        const result = withRequestSignal(ctrl.signal, () => capture(client));
+        await expect(result).rejects.toThrow(
+          stage === "operations" ? "source did not complete" : "no visible extracted facts"
+        );
+        expect(ctrl.signal.aborted).toBe(false);
+        expect(calls.some((c) => c.path.endsWith("/pages"))).toBe(false);
+        expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+      } finally {
+        clearTimeout(guard);
+        ctrl.abort();
+      }
+    }
+  );
+
+  it("rejects facts whose response body finishes after the absolute source deadline", async () => {
+    const calls = server();
+    const routed = globalThis.fetch;
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        const parsed = new URL(url);
+        if (parsed.pathname.endsWith("/memories/list")) {
+          const response = Response.json({});
+          response.json = async () => {
+            now = 120_001;
+            return { items: [{ document_id: parsed.searchParams.get("document_id") }] };
+          };
+          return response;
+        }
+        return routed(url, init);
+      })
+    );
     await expect(capture()).rejects.toThrow("still pending");
     expect(calls.some((c) => c.path.endsWith("/pages"))).toBe(false);
   });

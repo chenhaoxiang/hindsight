@@ -1418,10 +1418,15 @@ export class HindsightClient {
         const siblings = folderId
           ? (nodes.find((node) => node.id === folderId)?.children ?? [])
           : nodes;
-        const matches = siblings.filter(
-          (node) =>
-            node.kind === "page" && node.name === args.title && node.tags?.includes(sourceTag!)
-        );
+        const matches = siblings.filter((node) => {
+          const scopes = node.tags?.filter((tag) => /^initiative:[0-9a-f-]{36}$/.test(tag)) ?? [];
+          return (
+            node.kind === "page" &&
+            node.name === args.title &&
+            scopes.length === 1 &&
+            scopes[0] === sourceTag
+          );
+        });
         if (matches.length === 1) id = matches[0].id;
       } else if (r.ok) {
         const page = (await r.json()) as { page_id?: unknown; id?: unknown };
@@ -1467,7 +1472,9 @@ export class HindsightClient {
         "GET",
         this.bankUrl(`/operations/${encodeURIComponent(operationId)}`),
         undefined,
-        [],
+        // Fail closed on throttling: req's global rate-limit patience can renew each fetch
+        // deadline and outlive this capture's absolute budget. An accepted source is retained.
+        [429],
         Math.min(10_000, deadline - Date.now())
       );
       const operation = (await response.json()) as { status?: unknown };
@@ -1484,10 +1491,11 @@ export class HindsightClient {
           "GET",
           this.bankUrl(`/memories/list?${params}`),
           undefined,
-          [],
+          [429],
           Math.min(10_000, remaining)
         );
         const result = (await facts.json()) as { items?: { document_id?: unknown }[] };
+        if (Date.now() >= deadline) break;
         if (
           !facts.ok ||
           !Array.isArray(result.items) ||
