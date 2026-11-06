@@ -627,6 +627,12 @@ calling a handler, and passes cancellation through that call's HTTP requests and
 Concurrent calls and background ingestion do not share a mutable cancellation signal. Cancelling
 a request is not rollback: a write already accepted by the server may still finish.
 
+Maintenance builds marked `-fork.N` are not official npm releases. Their official automatic
+updater exits before a registry lookup or replacement, even for an npx-origin copy. Use pinned
+assets from the [maintenance fork](https://github.com/chenhaoxiang/hindsight/blob/main/.github/MAINTENANCE.md)
+for updates and retain the previous artifact for rollback. The upstream `npx` commands elsewhere
+in this README are explicit upstream installation paths, not the maintenance update source.
+
 ### Opt-in only
 
 By default every project gets memory — that is what makes the plugin zero-setup. If you would

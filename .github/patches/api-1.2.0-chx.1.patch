@@ -1,0 +1,240 @@
+diff --git a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+--- a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
++++ b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+@@ -60,0 +61 @@
++from ..remote_retry import is_invalid_remote_request
+@@ -1643,6 +1644,6 @@
+-    """Oldest-first, but at most ``quota`` facts per consolidation group.
+-
+-    ``memories`` must already be sorted oldest-first: groups are then visited in the order
+-    of their oldest fact, and the round fills from the front. Keying is
+-    ``_consolidation_batch_key``, the same key the dispatcher groups by, so a round that
+-    holds N keys gives the dispatcher N groups to run in parallel.
++    """Give each group its fair quota first, then fill spare capacity oldest-first.
++
++    A quota is a fairness reservation, not a hard ceiling: a bank whose facts all
++    target ``shared`` has only one group. Previously that bank read a fraction of
++    the requested batch, repeatedly paying for small tail calls. Filling unused
++    capacity does not introduce parallel writes or change scope isolation.
+@@ -1650,0 +1652 @@
++    skipped: list[StoredMemory] = []
+@@ -1654,0 +1657 @@
++            skipped.append(m)
+@@ -1659 +1662,2 @@
+-            break
++            return taken
++    taken.extend(skipped[: max(0, limit - len(taken))])
+@@ -1684,4 +1688,4 @@
+-    ``_FAIR_FETCH_OVERFETCH`` rounds and take at most ``ceil(limit / llm_parallelism)`` facts
+-    per group, leaving enough distinct groups in the round to fill the parallel slots. Facts
+-    are still consumed oldest-first *within* a group, which is the ordering consolidation
+-    actually depends on.
++    ``_FAIR_FETCH_OVERFETCH`` rounds and first reserve ``ceil(limit / llm_parallelism)`` facts
++    per group, leaving enough distinct groups to fill the parallel slots. Unused reservations
++    are then filled oldest-first, so a bank with fewer groups still gets a full batch. Facts
++    remain oldest-first *within* each group, which is the ordering consolidation depends on.
+@@ -2122,0 +2127,5 @@
++                        if pass_results and all(r.get("reason") == "source_changed_since_read" for r in pass_results):
++                            # The next fetch must re-read the new scope/version. A
++                            # later pass over this same stale snapshot cannot fix it.
++                            sub_results = pass_results
++                            break
+@@ -2200 +2209 @@
+-                        if str(m["id"]) not in ignored_ids:
++                        if str(m["id"]) not in ignored_ids and r.get("reason") != "source_changed_since_read":
+@@ -3085,0 +3095 @@
++    sources_changed = False
+@@ -3111,0 +3122 @@
++                        sources_changed = True
+@@ -3229,0 +3241,5 @@
++        if sources_changed:
++            # This is not an LLM omission. Re-asking the unchanged in-memory copy
++            # would repeat a response that the version check must reject again.
++            results.append({"action": "deferred", "reason": "source_changed_since_read"})
++            continue
+@@ -3819,0 +3836,4 @@
++        return _BatchFailureClass.PROPAGATE
++    if is_invalid_remote_request(exc, include_generic_type=False):
++        # A provider parameter does not become valid when the fact list is
++        # bisected. Propagate instead of exhausting every fact's retry budget.
+@@ -3993,2 +4013,4 @@
+-                lambda fid, oid: oid in (closest or {}).get(fid, ())
+-                or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact),
++                lambda fid, oid: (
++                    oid in (closest or {}).get(fid, ())
++                    or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact)
++                ),
+diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+--- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
++++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+@@ -730 +730 @@
+-from .remote_retry import RetryPolicy, is_transient_remote_error, status_code_of
++from .remote_retry import RetryPolicy, is_invalid_remote_request, is_transient_remote_error, status_code_of
+@@ -1715,0 +1716 @@
++        or is_invalid_remote_request(e)
+@@ -5250,4 +5251,4 @@
+-        Except when the ceiling fired during a retry backoff (``stage`` ends in
+-        ``.backoff``): the time ran out waiting for a provider that had just failed,
+-        not on a prompt that can never finish. That is the temporary failure #5394
+-        already declines to pause on, so it is recorded without pausing (#5561).
++        Except when the ceiling fired during retry backoff or a local permit wait
++        (``stage`` ends in ``.backoff`` or ``.queued``): congestion is not proof that
++        the prompt cannot finish. The provider-failure path already declines to
++        pause on temporary failures (#5394, #5561); a local queue needs the same rule.
+@@ -5264 +5265,4 @@
+-                    pause_automatic=not stage.endswith(".backoff"),
++                    # Waiting for a local permit says nothing about whether this
++                    # page can be refreshed. Like provider backoff, it must never
++                    # turn congestion into a permanent automatic-refresh pause.
++                    pause_automatic=not stage.endswith((".backoff", ".queued")),
+diff --git a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+--- a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
++++ b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+@@ -61 +61 @@
+-from hindsight_api.engine.remote_retry import jittered_backoff
++from hindsight_api.engine.remote_retry import is_invalid_remote_request, jittered_backoff
+@@ -398,0 +399,7 @@
++                if is_invalid_remote_request(e):
++                    # A proxy can wrap invalid_value in HTTP 502. Replaying the same
++                    # payload cannot fix it and multiplies the outer worker retries.
++                    logger.error(
++                        "Invalid Responses request (%s/%s, scope=%s), not retrying", self.provider, self.model, scope
++                    )
++                    raise
+diff --git a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+--- a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
++++ b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+@@ -23,0 +24 @@
++from ..remote_retry import is_invalid_remote_request, is_transient_remote_error
+@@ -1415,0 +1417,4 @@
++                # Transport retries already ran inside the provider. A second agent
++                # iteration repeats that whole budget without gathering any evidence.
++                if is_invalid_remote_request(e) or is_transient_remote_error(e):
++                    raise
+diff --git a/hindsight-api-slim/hindsight_api/engine/remote_retry.py b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+--- a/hindsight-api-slim/hindsight_api/engine/remote_retry.py
++++ b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+@@ -46,0 +47 @@
++        "RetryableResponsesError",
+@@ -130,0 +132,26 @@
++def is_invalid_remote_request(exc: BaseException, *, include_generic_type: bool = True) -> bool:
++    """Recognize deterministic SDK request errors even when a gateway wraps them in 5xx.
++
++    OpenAI SDK errors expose the structured upstream code/type on the exception.
++    Do not match prose: an overloaded backend mentioning a parameter is still transient.
++    Context overflow stays on reflect's existing partial-evidence synthesis path.
++    Consolidation excludes a generic error type: it may describe an oversized
++    batch that adaptive bisection can rescue, not an invalid provider parameter.
++    """
++    return getattr(exc, "code", None) in {
++        "invalid_value",
++        "invalid_parameter",
++        "unsupported_parameter",
++        "unsupported_value",
++        "unknown_parameter",
++        "missing_required_parameter",
++    } or (
++        include_generic_type
++        and getattr(exc, "type", None) == "invalid_request_error"
++        # Compatible providers also use this generic envelope for 429/5xx. Only an
++        # explicit parameter code may override a transient HTTP status; otherwise a
++        # temporary outage would permanently pause automatic page refreshes.
++        and ((status := status_code_of(exc)) is None or (400 <= status < 500 and status not in _TRANSIENT_STATUS_CODES))
++    )
++
++
+@@ -139,0 +167,2 @@
++    if is_invalid_remote_request(exc):
++        return False
+diff --git a/hindsight-api-slim/hindsight_api/worker/poller.py b/hindsight-api-slim/hindsight_api/worker/poller.py
+--- a/hindsight-api-slim/hindsight_api/worker/poller.py
++++ b/hindsight-api-slim/hindsight_api/worker/poller.py
+@@ -1174,11 +1174,6 @@
+-        # Stage holder is updated by engine code via stage.set_stage(); the
+-        # poller reads it during periodic logging to surface what each
+-        # in-flight task is doing.
+-        holder = StageHolder(stage=f"queued.{task_type}")
+-
+-        # Create background task. The holder is passed in and bound to the
+-        # task's own contextvar scope inside _execute_task_inner so engine
+-        # code running under that task sees it via stage.set_stage().
+-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+-
+-        # Track this task as active
++        # Reserved slots are a floor, not a cap. Starting every claimed refresh
++        # while only two LLM permits exist burns the other jobs' wall budgets in
++        # the semaphore queue. Keep excess refreshes pending instead; admission
++        # and in-flight registration share the lock so concurrent callers agree.
++        refresh_limit = get_config().mental_model_refresh_llm_max_concurrent
++        deferred = False
+@@ -1186,8 +1181,28 @@
+-            self._active_tasks[task.operation_id] = ActiveTaskInfo(
+-                op_type=operation_type,
+-                bank_id=bank_id,
+-                schema=task.schema,
+-                bg_task=bg_task,
+-                started_at=time.monotonic(),
+-                stage_holder=holder,
+-                task_type=task_type,
++            if (
++                task_type == "refresh_mental_model"
++                and refresh_limit is not None
++                and refresh_limit > 0
++                and self._in_flight_by_type.get(operation_type, 0) >= refresh_limit
++            ):
++                deferred = True
++            else:
++                holder = StageHolder(stage=f"queued.{task_type}")
++                bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
++                self._active_tasks[task.operation_id] = ActiveTaskInfo(
++                    op_type=operation_type,
++                    bank_id=bank_id,
++                    schema=task.schema,
++                    bg_task=bg_task,
++                    started_at=time.monotonic(),
++                    stage_holder=holder,
++                    task_type=task_type,
++                )
++                self._in_flight_count += 1
++                self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
++                bg_task.add_done_callback(
++                    lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type))
++                )
++        if deferred:
++            retry_at = datetime.now(timezone.utc) + timedelta(seconds=get_config().worker_task_retry_backoff_seconds)
++            await self._write_terminal(
++                task, "deferred", lambda: self._defer_all(task, retry_at, "waiting for refresh execution capacity")
+@@ -1195,5 +1209,0 @@
+-            self._in_flight_count += 1
+-            self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
+-
+-        # Add cleanup callback
+-        bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
+@@ -1331,3 +1341,12 @@
+-            await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
+-            await self._notify_wall_timeout(task, message, stage)
+-            terminal_success = False
++            config = get_config()
++            if (
++                task_type == "refresh_mental_model"
++                and stage.endswith(".queued")
++                and task.task_dict.get("_retry_count", 0) < config.worker_max_retries
++            ):
++                retry_at = datetime.now(timezone.utc) + timedelta(seconds=config.worker_task_retry_backoff_seconds)
++                await self._write_terminal(task, "retry", lambda: self._schedule_retry_all(task, retry_at, message))
++            else:
++                await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
++                await self._notify_wall_timeout(task, message, stage)
++                terminal_success = False
+diff --git a/hindsight-api-slim/pyproject.toml b/hindsight-api-slim/pyproject.toml
+--- a/hindsight-api-slim/pyproject.toml
++++ b/hindsight-api-slim/pyproject.toml
+@@ -7 +7 @@
+-version = "1.2.0"
++version = "1.2.0+chx.1"
+diff --git a/hindsight-api-slim/hindsight_api/__init__.py b/hindsight-api-slim/hindsight_api/__init__.py
+--- a/hindsight-api-slim/hindsight_api/__init__.py
++++ b/hindsight-api-slim/hindsight_api/__init__.py
+@@ -43 +43 @@
+-__version__ = "1.2.0"
++__version__ = "1.2.0+chx.1"

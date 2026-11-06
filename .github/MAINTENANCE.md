@@ -133,7 +133,14 @@ of an already-started upstream effect.
 - [x] Test stale-page/new-fact, unconsolidated-fact, missing metadata, API failure,
       cancellation and bank/tag-boundary scenarios.
 - [x] Keep automatic multi-step fallback out of the initial default path; none is added.
-- [ ] Complete independent source review and focused PR delivery.
+- [x] Complete independent source review and focused PR delivery.
+
+Delivered in [PR #3](https://github.com/chenhaoxiang/hindsight/pull/3), merged as
+`d4a819cc841b025938f107a1fd75274312f98f6e`. The final candidate passed
+1,487 isolated unit tests, typecheck/lint/build, repeatable generated documentation,
+compiled ten-tool smoke on Node 22/26, independent review and normal remote CI.
+The microsecond comparison correction preserves the API's write-time precision.
+This remains source delivery, not an installed-session acceptance claim.
 
 The explicit tools are `hindsight_recall` and `hindsight_recent_memories`. Recent
 reads use the API's memory-row `updated_at` axis; no event-time substitute or
@@ -146,9 +153,9 @@ No-result, unsupported capability and unavailable service remain distinct.
 
 ### 4. Publish fixed component artifacts and verify installation
 
-- [ ] Pin API and Coding Agents sources/artifacts independently.
-- [ ] Use legal ecosystem-specific versions; test capability and update comparisons.
-- [ ] Make the maintenance update source explicit so the official updater cannot
+- [x] Pin API and Coding Agents sources/artifacts independently.
+- [x] Use legal ecosystem-specific versions; test capability and update comparisons.
+- [x] Make the maintenance update source explicit so the official updater cannot
       silently replace fork-only changes.
 - [ ] Build, inspect and scan public artifacts; publish only from verified source.
 - [ ] Retain rollback artifacts and existing runtime settings/data.
@@ -157,6 +164,41 @@ No-result, unsupported capability and unavailable service remain distinct.
 
 Acceptance: source, checks, PR merge, Release, disk installation and loaded runtime
 are separately identifiable. A rejected or interrupted validation is retained as such.
+
+### Fixed component build inputs
+
+- API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
+  plus [.github/patches/api-1.2.0-chx.1.patch](patches/api-1.2.0-chx.1.patch),
+  producing Python version `1.2.0+chx.1`. The overlay changes only the six reviewed
+  production modules and the two version declarations. No newer API schema,
+  migration or unrelated main-branch feature is included. Keep regression tests
+  bound to the public reliability-fix source as well as the stable API export.
+- Coding Agents: `0.8.5` component tree at
+  `02e498b1537f6aec14c5a799f5a0c193b8394869` equals its maintenance-start tree;
+  the focused maintenance PRs and version/update guard produce `0.8.5-fork.1`.
+  Package/lock/plugin versions must agree. Upstream automatic updating must not
+  query/install over this maintenance identity, even when staged through npx.
+
+Build only from committed public source into ignored temporary directories. A
+fresh API export can be prepared with `git archive` at the exact API base, then
+apply the committed overlay from that export's root with `patch -p1`. Build its
+`hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
+The integration uses its committed lockfile, generated skill and `npm run build`,
+then `npm pack --ignore-scripts`. These operations are builds, not publication.
+
+Use a separate maintenance Release tag, not upstream `v*`/`integrations/**` tags,
+never official npm/PyPI publication. Before attaching assets, inspect expanded
+wheel/tar contents, scan them and record public source/patch/artifact hashes.
+Local settings, installation paths, credentials, data, logs and rollback copies
+are not Release assets.
+
+The upstream API config's `DEFAULT_XAI_OAUTH_CLIENT_ID` can trigger a generic-key
+scanner rule. It is a public application identifier used by the device-code flow,
+not a client secret or user token. Retain the raw finding; classify only that
+specific match after checking the config and auth source are byte-identical to
+the pinned public baseline and confirming the `client_id` usage. Do not suppress
+other findings or infer that an arbitrary token-like value is safe. Install only verified bytes, keep previous artifacts, and
+verify the actual loaded integration/API identities separately from disk labels.
 
 ## Deferred work
 
