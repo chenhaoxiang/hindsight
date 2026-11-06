@@ -41,6 +41,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from hindsight_api.config import get_config
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
 from hindsight_api.engine.cache_affinity import apply_opencode_session
+from hindsight_api.engine.llm_attempts import ProviderAttempt, current_provider_attempts
 from hindsight_api.engine.llm_interface import (
     LLMInterface,
     OutputTooLongError,
@@ -350,14 +351,40 @@ class OpenAIResponsesLLM(LLMInterface):
         real token counts (see #2387).
         """
         last_exception: Exception | None = None
+
+        async def backoff(record: ProviderAttempt, seconds: float) -> None:
+            record.planned_backoff_ms = int(seconds * 1000)
+            # The wall-timeout handler distinguishes temporary backoff from execution.
+            # Previously the last attempt label survived the sleep and could freeze a page.
+            set_stage(f"llm.{self.provider}.{scope}.backoff")
+            started = time.perf_counter()
+            try:
+                await asyncio.sleep(seconds)
+            finally:
+                record.backoff_ms = int((time.perf_counter() - started) * 1000)
+
         for attempt in range(max_retries + 1):
+            log = current_provider_attempts()
+            record = log.start(attempt + 1) if log is not None else ProviderAttempt(attempt=attempt + 1)
+            attempt_started = time.perf_counter()
+            request_started: float | None = None
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
+                    request_started = time.perf_counter()
+                    record.queue_wait_ms = int((request_started - attempt_started) * 1000)
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                     # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
                     # on every byte, so an upstream trickling keep-alive whitespace never trips it
                     # and the call pins its worker slot forever (#4763).
                     response = await asyncio.wait_for(self._create_response(params), timeout=self.timeout)
+                record.outcome = "response"
+                record.http_status = 200
+                record.request_ms = int((time.perf_counter() - request_started) * 1000)
+                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
+                # Only the SDK's bounded correlation id; never headers, error prose or payloads.
+                request_id = getattr(response, "_request_id", None)
+                if isinstance(request_id, str) and len(request_id) <= 128:
+                    record.request_id = request_id
                 usage = self._extract_usage(response)
                 stash_response_usage(
                     LLMResponseUsage(
@@ -369,7 +396,13 @@ class OpenAIResponsesLLM(LLMInterface):
                 )
                 return parse(response)
 
+            except asyncio.CancelledError:
+                record.outcome = "cancelled"
+                record.error_type = "CancelledError"
+                raise
             except json.JSONDecodeError as e:
+                record.outcome = "parse_error"
+                record.error_type = type(e).__name__
                 last_exception = e
                 logger.warning(
                     f"JSON parse error from Responses reply "
@@ -377,11 +410,13 @@ class OpenAIResponsesLLM(LLMInterface):
                     f"{str(e)[:200]}"
                 )
                 if attempt < max_retries:
-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
+                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
                     continue
                 raise
 
             except (APIConnectionError, TimeoutError, RetryableResponsesError) as e:
+                record.outcome = "transport_error"
+                record.error_type = type(e).__name__
                 last_exception = e
                 status_code = getattr(e, "status_code", None) or getattr(
                     getattr(e, "response", None), "status_code", None
@@ -391,11 +426,17 @@ class OpenAIResponsesLLM(LLMInterface):
                     f"attempt {attempt + 1}/{max_retries + 1}): {describe_llm_error(e)}"
                 )
                 if attempt < max_retries:
-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
+                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
                     continue
                 raise
 
             except APIStatusError as e:
+                record.outcome = "http_error"
+                record.error_type = type(e).__name__
+                record.http_status = e.status_code
+                request_id = getattr(e, "request_id", None)
+                if isinstance(request_id, str) and len(request_id) <= 128:
+                    record.request_id = request_id
                 if is_invalid_remote_request(e):
                     # A proxy can wrap invalid_value in HTTP 502. Replaying the same
                     # payload cannot fix it and multiplies the outer worker retries.
@@ -418,13 +459,23 @@ class OpenAIResponsesLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status_code}"
                     )
-                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
+                    await backoff(record, jittered_backoff(attempt, initial_backoff, max_backoff))
                     continue
                 logger.error(
                     f"API error after {max_retries + 1} attempts "
                     f"({self.provider}/{self.model}, scope={scope}): HTTP {e.status_code}"
                 )
                 raise
+            except Exception as e:
+                record.outcome = "error"
+                record.error_type = type(e).__name__
+                raise
+            finally:
+                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
+                if request_started is None:
+                    record.queue_wait_ms = record.elapsed_ms
+                elif record.request_ms is None:
+                    record.request_ms = max(0, record.elapsed_ms - record.queue_wait_ms - record.backoff_ms)
 
         if last_exception:
             raise last_exception

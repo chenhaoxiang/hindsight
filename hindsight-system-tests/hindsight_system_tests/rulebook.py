@@ -502,6 +502,9 @@ class RerankStub:
         self.states = []
         self.repeats = set()
         self.ranked = []
+        self.queries: list[str] = []
+        self.max_input_characters: int | None = None
+        self.token_overhead = 0
 
     def repeat(self, memory_a: str, memory_b: str) -> float:
         return 0.9 if any(a in memory_a and b in memory_b for a, b in self.repeats) else 0.1
@@ -592,6 +595,10 @@ class Stubs:
         self.rerank.verdicts = {}
         self.rerank.states = []
         self.rerank.repeats = set()
+        self.rerank.ranked = []
+        self.rerank.queries = []
+        self.rerank.max_input_characters = None
+        self.rerank.token_overhead = 0
         self.triage.reset()
         self.rejected_requests.clear()
         self.webhooks.clear()

@@ -1241,6 +1241,8 @@ class WorkerPoller:
         # consolidation ceiling from "total runtime" into "time without progress".
         try:
             async with asyncio.timeout(wall_timeout) as cm:
+                if holder is not None and not ceiling.extends_on_progress:
+                    holder.deadline = cm.when()
                 if progress_holder is not None:
 
                     def _extend_deadline() -> None:
@@ -1260,6 +1262,7 @@ class WorkerPoller:
                 finally:
                     if holder is not None:
                         holder.on_progress = None
+                        holder.deadline = None
         except asyncio.TimeoutError as e:
             if cm.expired():
                 raise _WallTimeoutExceeded(wall_timeout, ceiling) from e

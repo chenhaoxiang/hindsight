@@ -33,8 +33,16 @@ class _CapturingConn:
     def __init__(self) -> None:
         self.queries: list[str] = []
         self.params: list[tuple] = []
+        self.exact_queries: list[str] = []
+        self.exact_params: list[tuple] = []
 
     async def fetch(self, query, *params):
+        # The new bounded identity lookup is independent of the hybrid arms these
+        # tests inspect. Keep both query streams available rather than hiding it.
+        if "LOWER(kp.name) = LOWER($2)" in query:
+            self.exact_queries.append(query)
+            self.exact_params.append(params)
+            return []
         self.queries.append(query)
         self.params.append(params)
         return []
@@ -148,6 +156,8 @@ async def test_disabled_without_embedding_returns_nothing(search):
 
     assert result == []
     assert search.conn.queries == []
+    assert search.conn.exact_params == [("bank-1", "some query")]
+    assert "kp.bank_id = $1" in search.conn.exact_queries[0]
 
 
 @pytest.mark.asyncio

@@ -337,12 +337,27 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 }
         return JSONResponse({"model": body.get("model", "stub"), "answers": answers, "usage": {"input_tokens": 1, "output_tokens": 1}})
 
+    @app.post("/tokenize")
+    async def tokenize(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse({"tokens": [ord(char) for char in body["content"]]})
+
+    @app.post("/detokenize")
+    async def detokenize(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse({"content": "".join(chr(token) for token in body["tokens"])})
+
     @app.post("/rerank")
     async def rerank(request: Request) -> JSONResponse:
         body = await request.json()
         validate_rerank(body)
 
         query = body["query"]
+        if stubs.rerank.max_input_characters is not None:
+            if any(len(query) + len(document) + stubs.rerank.token_overhead > stubs.rerank.max_input_characters for document in body["documents"]):
+                return JSONResponse({"error": "fixture input limit exceeded"}, status_code=500)
+        stubs.rerank.queries.append(query)
+        stubs.rerank.ranked.extend(body["documents"])
         results = [
             {"index": index, "relevance_score": stubs.rerank.score(query, document)}
             for index, document in enumerate(body["documents"])
