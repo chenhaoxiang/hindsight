@@ -33,7 +33,14 @@ async def test_embedding_and_rerank_calls_are_in_request_history(client, llm, ba
     for _ in range(50):
         embedding = (await traces.list_llm_requests(bank_id, call_type="embedding", limit=500)).items
         rerank = (await traces.list_llm_requests(bank_id, call_type="rerank", limit=500)).items
-        if {"embedding_document", "embedding_query"} <= {r.scope for r in embedding} and rerank:
+        # Consolidation also embeds queries. Its earlier buffered row must not end the wait
+        # before this recall's embedding and same-run rerank have both been flushed.
+        query_rows = [r for r in embedding if r.scope == "embedding_query" and r.operation == "recall"]
+        retained_rows = [r for r in embedding if r.scope == "embedding_document" and r.operation == "retain"]
+        if retained_rows and any(
+            q.trace_id and any(r.operation == "recall" and r.trace_id == q.trace_id for r in rerank)
+            for q in query_rows
+        ):
             break
         await asyncio.sleep(0.1)
     else:

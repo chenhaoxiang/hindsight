@@ -18,6 +18,8 @@ import { resolveHostMemory } from "../core/host-client";
 import { diag } from "../core/diag";
 import type { ToolSpec } from "../core/knowledge-tools";
 import { RuntimeCore } from "../core/runtime";
+import { withRequestSignal } from "../core/request-signal";
+import { describeError } from "../core/log";
 import { type PiEntry, type PiMessage, readPiEntries, readPiMessages } from "../core/transcript-pi";
 
 // ── Structural subset of the pi extension API ───────────────────────────────────────────────────
@@ -72,10 +74,10 @@ interface ToolDefinition {
   execute(
     toolCallId: string,
     params: Record<string, unknown>,
-    signal?: unknown,
+    signal?: AbortSignal,
     onUpdate?: unknown,
     ctx?: ExtensionContext
-  ): Promise<{ content: { type: "text"; text: string }[]; details: unknown }>;
+  ): Promise<{ content: { type: "text"; text: string }[]; details: unknown; isError?: boolean }>;
 }
 
 interface ExtensionAPI {
@@ -100,11 +102,11 @@ export type ExtensionFactory = (pi: ExtensionAPI) => void;
 /**
  * Adapt a harness-agnostic ToolSpec (MCP-shaped, shared by every harness) to a pi native tool. The
  * spec's Zod raw shape is converted to a JSON Schema for `parameters` — pi's documented type is a
- * TypeBox `TSchema`, which is itself a JSON Schema, and neither host validates tool arguments
- * against it (the agent loop only runs an optional `prepareArguments`), so the schema is passed
- * straight to the model provider. A plain JSON Schema is therefore exactly what the tool needs. The
- * spec's handler returns an MCP `{content:[{text}]}` result and never throws, so we surface the
- * joined text back to the model.
+ * TypeBox `TSchema`, which is itself a JSON Schema. Current pi also validates arguments; parsing
+ * here enforces the bound spec's schema on older pi-family hosts too. Preserve MCP isError in the
+ * native result: returning error prose as a successful tool hid failures from the host. Cancellation
+ * follows this call's HTTP work, not another call sharing its client; it cannot roll back effects
+ * the server has already accepted.
  *
  * `bind` picks the spec to run for the calling session (its bank), since one process can serve
  * sessions in several repositories; undefined means memory is off for that session's repository.
@@ -119,15 +121,41 @@ export function toPiTool(
     label: spec.name,
     description: spec.description,
     parameters,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const bound = bind(ctx);
-      if (!bound) {
-        const text = "Hindsight memory is disabled for this workspace.";
-        return { content: [{ type: "text", text }], details: null };
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      try {
+        signal?.throwIfAborted();
+        const bound = bind(ctx);
+        if (!bound) {
+          const text = "Hindsight memory is disabled for this workspace.";
+          return { content: [{ type: "text", text }], details: null, isError: true };
+        }
+        const parsed = z.object(bound.inputSchema).strict().safeParse(params);
+        if (!parsed.success) {
+          // Report schema issues, never the supplied values (a misplaced credential is still private).
+          const issues = parsed.error.issues.map(({ path, message }) => ({ path, message }));
+          throw new Error(`Invalid Hindsight tool arguments: ${JSON.stringify(issues)}`);
+        }
+        const r = await withRequestSignal(signal, () => bound.handler(parsed.data));
+        signal?.throwIfAborted();
+        const text = r.content?.map((c) => c.text).join("\n") || "";
+        return {
+          content: [{ type: "text", text }],
+          details: null,
+          ...(r.isError ? { isError: true } : {}),
+        };
+      } catch (e) {
+        const error = signal?.aborted
+          ? {
+              code: "cancelled",
+              error: "Hindsight tool cancelled; accepted server effects may still finish.",
+            }
+          : { error: describeError(e) };
+        return {
+          content: [{ type: "text", text: JSON.stringify(error) }],
+          details: null,
+          isError: true,
+        };
       }
-      const r = await bound.handler(params);
-      const text = r.content?.map((c) => c.text).join("\n") || "";
-      return { content: [{ type: "text", text }], details: null };
     },
   };
 }
