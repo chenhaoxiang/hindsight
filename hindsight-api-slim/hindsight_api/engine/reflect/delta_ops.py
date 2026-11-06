@@ -50,6 +50,8 @@ from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
+from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
 from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, parse_llm_json
 
 from .structured_doc import (
@@ -543,6 +545,7 @@ async def request_delta_operations(
                 user_prompt=user_prompt,
                 scope=scope,
                 document=document,
+                deadline=deadline,
                 **call_kwargs,
             )
             # A provider may suppress cancellation or finish between timer ticks.
@@ -550,11 +553,25 @@ async def request_delta_operations(
             if deadline is not None and deadline <= asyncio.get_running_loop().time():
                 raise TimeoutError("Delta edit completed after its stage deadline")
             return result
+    except (OperationCancelledError, ProviderRateLimitResetError):
+        # A caller cancellation or a provider's known reset remains a control signal.
+        raise
+    except Exception as exc:
+        if deadline is not None and deadline <= asyncio.get_running_loop().time() and not isinstance(exc, TimeoutError):
+            # Validation exceptions from a late/cancellation-suppressing provider are
+            # not allowed to turn a spent budget into a structural permanent pause.
+            raise TimeoutError("Delta edit failed after its stage deadline") from exc
+        raise
     finally:
         if deadline is not None and deadline <= asyncio.get_running_loop().time():
             # Runs even if the outer worker ceiling cancels at the same deadline.
             # That cancellation must not be mistaken for a deterministic page failure.
             set_stage("mental_model_delta.budget_exhausted")
+
+
+def _check_edit_deadline(deadline: float | None) -> None:
+    if deadline is not None and deadline <= asyncio.get_running_loop().time():
+        raise TimeoutError("Delta edit completed after its stage deadline")
 
 
 async def _request_delta_operations(
@@ -564,6 +581,7 @@ async def _request_delta_operations(
     user_prompt: str,
     scope: str,
     document: StructuredDocument | None = None,
+    deadline: float | None = None,
     **call_kwargs: Any,
 ) -> DeltaOperationList:
     """Ask the model for an operation list, and once more with the errors if it is refused.
@@ -598,7 +616,9 @@ async def _request_delta_operations(
     touching nothing is a legitimate answer.
     """
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    _check_edit_deadline(deadline)
     first = await llm.call(messages=messages, scope=scope, **call_kwargs)
+    _check_edit_deadline(deadline)
     try:
         op_list = parse_delta_operation_list(first.content)
     except (ValueError, TypeError) as exc:  # DeltaOperationsInvalidError and JSON errors are ValueErrors
@@ -628,7 +648,9 @@ async def _request_delta_operations(
         {"role": "assistant", "content": _replayed_reply_text(first.content)},
         {"role": "user", "content": correction},
     ]
+    _check_edit_deadline(deadline)
     second = await llm.call(messages=retry_messages, scope=scope, **call_kwargs)
+    _check_edit_deadline(deadline)
     return parse_delta_operation_list(second.content)
 
 

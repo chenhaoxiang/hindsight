@@ -171,3 +171,82 @@ def test_delta_budget_is_opt_in_without_lowering_provider_timeout() -> None:
     config = _get_raw_config()
     assert config.mental_model_delta_timeout is None
     assert replace(config, mental_model_delta_timeout=600).llm_timeout == config.llm_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [{"operations": [{"op": "not-a-real-op"}]}, {"operations": None}])
+async def test_late_invalid_answer_cannot_start_a_correction_or_escape_as_schema_error(content) -> None:
+    calls = 0
+
+    class FixtureLLM:
+        async def call(self, **_kwargs: object) -> LLMCallResult:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    pass
+            return LLMCallResult(content=content, usage=TokenUsage())
+
+    with pytest.raises(TimeoutError):
+        await request_delta_operations(
+            FixtureLLM(),
+            system_prompt="fixture",
+            user_prompt="fixture",
+            scope="mental_model_delta_ops",
+            deadline=asyncio.get_running_loop().time() + 0.02,
+        )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exception_after_stage_expiry_is_classified_as_budget_exhaustion() -> None:
+    class FixtureLLM:
+        async def call(self, **_kwargs: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise ValueError("fixture invalid late response")
+
+    with pytest.raises(TimeoutError) as raised:
+        await request_delta_operations(
+            FixtureLLM(),
+            system_prompt="fixture",
+            user_prompt="fixture",
+            scope="mental_model_delta_ops",
+            deadline=asyncio.get_running_loop().time() + 0.02,
+        )
+    assert isinstance(raised.value.__cause__, ValueError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["cancel", "quota-reset"])
+async def test_control_signal_keeps_its_type_when_stage_expiry_races_it(control: str) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from hindsight_api.cancellation import OperationCancelledError
+    from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+
+    error = (
+        OperationCancelledError("fixture cancel")
+        if control == "cancel"
+        else ProviderRateLimitResetError(datetime.now(timezone.utc) + timedelta(hours=1), "fixture quota reset")
+    )
+
+    class FixtureLLM:
+        async def call(self, **_kwargs: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise error
+
+    with pytest.raises(type(error)) as raised:
+        await request_delta_operations(
+            FixtureLLM(),
+            system_prompt="fixture",
+            user_prompt="fixture",
+            scope="mental_model_delta_ops",
+            deadline=asyncio.get_running_loop().time() + 0.02,
+        )
+    assert raised.value is error

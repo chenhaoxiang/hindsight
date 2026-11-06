@@ -5,6 +5,7 @@ suite's isolated pg0; no live model or application database is used.
 """
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import uuid
 
@@ -14,6 +15,7 @@ from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.config import clear_config_cache
 from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 from tests.test_consolidation_stale_batch import cross_encoder, embeddings  # noqa: F401 (fixtures)
 from tests.test_mental_model_delta import _seed_fact_row, patch_llm_call, patch_reflect  # noqa: F401 (fixtures)
 
@@ -24,22 +26,41 @@ class _ProviderStatusError(RuntimeError):
         super().__init__(f"fixture HTTP {status_code}")
 
 
+@dataclass(frozen=True)
+class _FailureScenario:
+    error: BaseException
+    late_invalid: bool = False
+
+
 @pytest.mark.asyncio
 @pytest.mark.memory_backend_incompatible
 @pytest.mark.parametrize("retraction", [False, True], ids=["delta", "retraction"])
 @pytest.mark.parametrize(
-    "error",
+    "scenario",
     [
-        ConnectionError("fixture connection interrupted"),
-        TimeoutError("fixture deadline"),
-        _ProviderStatusError(408),
-        _ProviderStatusError(429),
-        _ProviderStatusError(503),
-        ProviderRateLimitResetError(datetime.now(timezone.utc) + timedelta(hours=1), "fixture quota reset"),
-        OperationCancelledError("fixture cancelled"),
-        asyncio.CancelledError(),
+        _FailureScenario(ConnectionError("fixture connection interrupted")),
+        _FailureScenario(TimeoutError("fixture deadline")),
+        _FailureScenario(_ProviderStatusError(408)),
+        _FailureScenario(_ProviderStatusError(429)),
+        _FailureScenario(_ProviderStatusError(503)),
+        _FailureScenario(
+            ProviderRateLimitResetError(datetime.now(timezone.utc) + timedelta(hours=1), "fixture quota reset")
+        ),
+        _FailureScenario(OperationCancelledError("fixture cancelled")),
+        _FailureScenario(asyncio.CancelledError()),
+        _FailureScenario(TimeoutError("fixture invalid late answer"), late_invalid=True),
     ],
-    ids=["connection", "timeout", "http408", "http429", "http503", "quota-reset", "cooperative-cancel", "task-cancel"],
+    ids=[
+        "connection",
+        "timeout",
+        "http408",
+        "http429",
+        "http503",
+        "quota-reset",
+        "cooperative-cancel",
+        "task-cancel",
+        "late-invalid",
+    ],
 )
 async def test_transient_edit_keeps_original_error_and_baseline(
     memory: MemoryEngine,
@@ -47,9 +68,10 @@ async def test_transient_edit_keeps_original_error_and_baseline(
     monkeypatch: pytest.MonkeyPatch,
     patch_reflect,
     patch_llm_call,
-    error: BaseException,
+    scenario: _FailureScenario,
     retraction: bool,
 ) -> None:
+    error = scenario.error
     bank = "test-edit-transient-" + uuid.uuid4().hex[:10]
     query = "What does the fixture team know?"
     try:
@@ -94,9 +116,21 @@ async def test_transient_edit_keeps_original_error_and_baseline(
             monkeypatch.setenv("HINDSIGHT_API_MENTAL_MODEL_DELTA_TIMEOUT", "0.02")
             clear_config_cache()
 
-        async def fail_call(**_kwargs: object) -> None:
+        calls = 0
+
+        async def fail_call(**_kwargs: object) -> LLMCallResult | None:
+            nonlocal calls
+            calls += 1
+            malformed = LLMCallResult(content={"operations": [{"op": "not-a-real-op"}]}, usage=TokenUsage())
+            if scenario.late_invalid and calls > 1:
+                return malformed
             if budget_expiry:
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    if scenario.late_invalid:
+                        return malformed
+                    raise
             raise error
 
         monkeypatch.setattr(memory._mental_model_refresh_llm_config, "call", fail_call)
@@ -104,6 +138,8 @@ async def test_transient_edit_keeps_original_error_and_baseline(
             await memory._handle_refresh_mental_model({"bank_id": bank, "mental_model_id": model["id"]})
         if not budget_expiry:
             assert raised.value is error
+        if scenario.late_invalid:
+            assert calls == 1, "An expired phase cannot start a structural correction"
         after = await memory.get_mental_model(bank, model["id"], detail="full", request_context=request_context)
         for field in ("content", "structured_content", "last_refreshed_at", "last_memory_seen_at", "source_query"):
             assert after[field] == before[field], field
