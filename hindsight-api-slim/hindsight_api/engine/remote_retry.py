@@ -145,7 +145,14 @@ def is_invalid_remote_request(exc: BaseException, *, include_generic_type: bool 
         "unsupported_value",
         "unknown_parameter",
         "missing_required_parameter",
-    } or (include_generic_type and getattr(exc, "type", None) == "invalid_request_error")
+    } or (
+        include_generic_type
+        and getattr(exc, "type", None) == "invalid_request_error"
+        # Compatible providers also use this generic envelope for 429/5xx. Only an
+        # explicit parameter code may override a transient HTTP status; otherwise a
+        # temporary outage would permanently pause automatic page refreshes.
+        and ((status := status_code_of(exc)) is None or (400 <= status < 500 and status not in _TRANSIENT_STATUS_CODES))
+    )
 
 
 def is_transient_remote_error(exc: BaseException) -> bool:

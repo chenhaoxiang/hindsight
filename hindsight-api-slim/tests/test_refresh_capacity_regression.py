@@ -32,6 +32,19 @@ def test_invalid_value_wrapped_in_502_is_not_transient() -> None:
     assert _classify_batch_failure(error) is _BatchFailureClass.PROPAGATE
 
 
+@pytest.mark.parametrize("status", [408, 409, 425, 429, 502, 503])
+def test_generic_request_error_type_does_not_override_transient_http_status(status: int) -> None:
+    # Some compatible gateways use this generic envelope for rate limits and outages too.
+    error = openai.APIStatusError(
+        "temporarily unavailable",
+        response=httpx.Response(status, request=httpx.Request("POST", "https://fixture.invalid/v1/responses")),
+        body={"type": "invalid_request_error", "code": "provider_unavailable"},
+    )
+    assert not is_invalid_remote_request(error)
+    assert is_transient_remote_error(error)
+    assert not _is_non_retryable_task_error(error)
+
+
 def test_context_overflow_can_still_reach_adaptive_bisection() -> None:
     error = openai.BadRequestError(
         "context overflow",
