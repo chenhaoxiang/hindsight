@@ -244,6 +244,32 @@ model, reasoning-level or global refresh-frequency change is authorized by this
 follow-up. Initialization profiling, nested-tool usage accounting and storage
 lifecycle tuning remain lower-priority work, not new delivery prerequisites.
 
+## Refresh resilience follow-up
+
+Approved implementation order (no model, reasoning, embedding or schema change):
+
+1. Preserve transient transport, quota/defer and cancellation causes through the
+   delta and retraction legs. Never convert a temporary outage into a structural
+   refusal that permanently pauses the page. Real schema/reference failures still
+   preserve content/structure/grounding/watermarks and fail closed.
+2. Expose bounded provider-attempt metadata and real backoff stages, separately
+   from logical-call success and worker retry counts. Bound delta editing against
+   one stage deadline and the task's remaining budget; keep full synthesis separate.
+3. Account for query plus candidate text in a configurable reranker input budget,
+   with provider-template/tokenizer headroom and boundary verification. Do not
+   increase GPU batch or truncate stored source documents to hide a ranking error.
+4. Prefer exact knowledge-page title matches without broadening bank/tag access;
+   preserve hybrid search for non-exact queries.
+5. Backport to the independently pinned stable API, build a new immutable
+   `1.2.0-fork.N` artifact (`1.2.0+fork.N` Python metadata), retain rollback,
+   verify installation and recover only small preserved page groups.
+
+Use deterministic/isolated-store and blackbox regressions for the control flow.
+Any real quality sample is bounded and judged separately; generated text being
+nonempty is not semantic acceptance. Operational traces and real recovery data
+stay outside the public repository. No bulk replay, bank split, global relabeling,
+worker-concurrency increase or removal of consistency guards is part of this batch.
+
 ## Completion record
 
 Update the relevant checkboxes when the associated work is actually complete. Keep

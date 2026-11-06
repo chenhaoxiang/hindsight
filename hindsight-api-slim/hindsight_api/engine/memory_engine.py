@@ -18809,6 +18809,13 @@ class MemoryEngine(MemoryEngineInterface):
                             f"{len(unsay_outcome.applied)} op(s), skipped {len(unsay_outcome.skipped)}"
                         )
                     except Exception as exc:
+                        # A transport outage or control signal is not an invalid edit. Preserve
+                        # its type for the task's retry/defer/cancel policy; swallowing it here
+                        # could advance the watermark while leaving a retired claim in place.
+                        if isinstance(
+                            exc, (OperationCancelledError, ProviderRateLimitResetError)
+                        ) or is_transient_remote_error(exc):
+                            raise
                         # Leave based_on alone so the next refresh sees the same
                         # retraction and tries again.
                         logger.warning(
@@ -18968,6 +18975,13 @@ class MemoryEngine(MemoryEngineInterface):
                                 "operations for the reason each was dropped."
                             )
                 except Exception as exc:
+                    # Do not turn a temporary provider failure into delta_ops_failed: that
+                    # refusal pauses automatic refresh and hides the original retryability.
+                    # Structural/schema failures still follow the data-preserving refusal.
+                    if isinstance(
+                        exc, (OperationCancelledError, ProviderRateLimitResetError)
+                    ) or is_transient_remote_error(exc):
+                        raise
                     logger.warning(
                         f"[MENTAL_MODELS] Structured delta failed for {mental_model_id} "
                         f"({exc}); delta operations were not applied"
