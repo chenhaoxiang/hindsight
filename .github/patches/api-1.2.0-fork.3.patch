@@ -300,12 +300,12 @@ index 30f61e21f..d6f45b7cd 100644
 @@ -1707,0 +1716 @@ class LLMProvider:
 +            reset_provider_attempts(attempt_token)
 diff --git a/hindsight-api-slim/hindsight_api/engine/memories/base.py b/hindsight-api-slim/hindsight_api/engine/memories/base.py
-index fbb524a3d..044f5e1dd 100644
+index fbb524a3d..f46eccc4e 100644
 --- a/hindsight-api-slim/hindsight_api/engine/memories/base.py
 +++ b/hindsight-api-slim/hindsight_api/engine/memories/base.py
 @@ -59,0 +60 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 +    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
-@@ -3586,0 +3588,30 @@ class MemoriesExtension(Extension, ABC):
+@@ -3586,0 +3588,45 @@ class MemoriesExtension(Extension, ABC):
 +    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
 +        """Whether this store can atomically relocate chunk FKs without replacing facts.
 +
@@ -326,6 +326,21 @@ index fbb524a3d..044f5e1dd 100644
 +    ) -> list["ChunkSnapshot"]:
 +        return []
 +
++    async def compatible_recovery_chunks(
++        self,
++        *,
++        conn: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        content_hash: str,
++        expected_hashes: dict[int, str],
++        source_context: str | None,
++        source_strategy: str | None,
++    ) -> dict[int, str] | None:
++        """Position-bound recovery for stores supporting stable layouts; None declines."""
++        return None
++
 +    async def stage_stable_chunk_reuse(
 +        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
 +    ) -> "StagedChunkReuse | None":
@@ -333,15 +348,15 @@ index fbb524a3d..044f5e1dd 100644
 +
 +    async def finish_stable_chunk_reuse(
 +        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
-+    ) -> None:
++    ) -> int:
 +        raise NotImplementedError("Store does not support atomic stable chunk reuse")
 +
 diff --git a/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
 new file mode 100644
-index 000000000..72d06d473
+index 000000000..426ff376d
 --- /dev/null
 +++ b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,257 @@
 +"""Postgres-only transactional relocation of unchanged chunk references.
 +
 +No schema change: facts keep their UUIDs while temporary chunk rows carry their
@@ -360,6 +375,50 @@ index 000000000..72d06d473
 +    StagedChunkMove,
 +    StagedChunkReuse,
 +)
++
++
++async def compatible_recovery_chunks(
++    *,
++    conn: Any,
++    fq_table: Callable[[str], str],
++    bank_id: str,
++    document_id: str,
++    content_hash: str,
++    expected_hashes: dict[int, str],
++    source_context: str | None,
++    source_strategy: str | None,
++) -> dict[int, str] | None:
++    """Only resume committed positions under the same source/extraction contract.
++
++    A body hash does not identify a chunk layout. In particular, a stable layout
++    must never be overwritten by greedy recovery while keeping its old facts.
++    Call again under the document lock before writing a recovered/later batch.
++    """
++    matches = await conn.fetchval(
++        f"SELECT 1 FROM {fq_table('documents')} WHERE bank_id = $1 AND id = $2 AND content_hash = $3 "
++        "AND NULLIF(retain_params->>'context', '') IS NOT DISTINCT FROM NULLIF($4::text, '') "
++        "AND NULLIF(retain_params->>'strategy', '') IS NOT DISTINCT FROM NULLIF($5::text, '')",
++        bank_id,
++        document_id,
++        content_hash,
++        source_context,
++        source_strategy,
++    )
++    if not matches:
++        return None
++    rows = await conn.fetch(
++        f"SELECT chunk_index, content_hash FROM {fq_table('chunks')} "
++        "WHERE bank_id = $1 AND document_id = $2 ORDER BY chunk_index LIMIT $3",
++        bank_id,
++        document_id,
++        len(expected_hashes) + 1,
++    )
++    if any(
++        row["chunk_index"] not in expected_hashes or expected_hashes[row["chunk_index"]] != row["content_hash"]
++        for row in rows
++    ):
++        return None
++    return {row["chunk_index"]: row["content_hash"] for row in rows}
 +
 +
 +async def load_chunks(
@@ -447,17 +506,25 @@ index 000000000..72d06d473
 +        StagedChunkMove(
 +            original=old_by_id[chunk.reuse_from],
 +            temporary_id=build_chunk_id(bank_id, document_id, temporary_base + offset),
++            temporary_index=temporary_base + offset,
 +            target_id=build_chunk_id(bank_id, document_id, chunk.chunk_index),
 +            target_index=chunk.chunk_index,
 +        )
 +        for offset, chunk in enumerate(moving)
 +        if chunk.reuse_from is not None
 +    ]
-+    if not moves:
-+        return StagedChunkReuse(moves=[])
++    # Validation only: moving fact rows BEFORE the obsolete-source sweep would
++    # violate its whole-write-set UUID lock order across shared observations.
++    return StagedChunkReuse(moves=moves)
++
++
++async def _move_to_temporary(
++    *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, moves: list[StagedChunkMove]
++) -> int:
 +    old_ids = [move.original.chunk_id for move in moves]
 +    temp_ids = [move.temporary_id for move in moves]
-+    # Same document -> fact lock order as normal source writers/consolidation.
++    # The standard obsolete-source sweep has already acquired its full fact /
++    # observation / co-source write set in UUID order. Only now lock moving facts.
 +    units = await conn.fetch(
 +        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2 "
 +        "AND chunk_id = ANY($3::text[]) ORDER BY id FOR NO KEY UPDATE",
@@ -478,7 +545,7 @@ index 000000000..72d06d473
 +        document_id,
 +        old_ids,
 +        temp_ids,
-+        list(range(temporary_base, temporary_base + len(moves))),
++        [move.temporary_index for move in moves],
 +    )
 +    # Only a source LOCATION changed. Do not turn this bookkeeping into a content
 +    # edit: UUID/text/embedding/times/scopes/consolidation stamps remain untouched.
@@ -497,7 +564,7 @@ index 000000000..72d06d473
 +        document_id,
 +        old_ids,
 +    )
-+    return StagedChunkReuse(moves=moves, moved_fact_count=len(units))
++    return len(units)
 +
 +
 +async def finish_reuse(
@@ -507,10 +574,13 @@ index 000000000..72d06d473
 +    bank_id: str,
 +    document_id: str,
 +    staged: StagedChunkReuse,
-+) -> None:
-+    """Restore final chunk IDs after genuinely obsolete targets have been invalidated."""
++) -> int:
++    """Move references only AFTER the standard obsolete-source/observation sweep."""
 +    if not staged.moves:
-+        return
++        return 0
++    moved_count = await _move_to_temporary(
++        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, moves=staged.moves
++    )
 +    temp_ids = [move.temporary_id for move in staged.moves]
 +    target_ids = [move.target_id for move in staged.moves]
 +    await conn.execute(
@@ -543,15 +613,16 @@ index 000000000..72d06d473
 +        document_id,
 +        temp_ids,
 +    )
++    return moved_count
 diff --git a/hindsight-api-slim/hindsight_api/engine/memories/postgres.py b/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
-index 3f8023e4e..4a332c5e0 100644
+index 3f8023e4e..d2803800f 100644
 --- a/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
 +++ b/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
 @@ -67,0 +68 @@ from .pg import retain as pg_retain
 +from .pg import stable_chunks as pg_stable_chunks
 @@ -73,0 +75 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 +    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
-@@ -1213,0 +1216,39 @@ class PostgresMemories(MemoriesExtension):
+@@ -1213,0 +1216,62 @@ class PostgresMemories(MemoriesExtension):
 +    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
 +        return backend.backend_type == "postgresql"
 +
@@ -577,6 +648,29 @@ index 3f8023e4e..4a332c5e0 100644
 +                source_strategy=source_strategy,
 +            )
 +
++    async def compatible_recovery_chunks(
++        self,
++        *,
++        conn: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        content_hash: str,
++        expected_hashes: dict[int, str],
++        source_context: str | None,
++        source_strategy: str | None,
++    ) -> dict[int, str] | None:
++        return await pg_stable_chunks.compatible_recovery_chunks(
++            conn=conn,
++            fq_table=fq_store_table,
++            bank_id=bank_id,
++            document_id=document_id,
++            content_hash=content_hash,
++            expected_hashes=expected_hashes,
++            source_context=source_context,
++            source_strategy=source_strategy,
++        )
++
 +    async def stage_stable_chunk_reuse(
 +        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
 +    ) -> "StagedChunkReuse | None":
@@ -586,13 +680,13 @@ index 3f8023e4e..4a332c5e0 100644
 +
 +    async def finish_stable_chunk_reuse(
 +        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
-+    ) -> None:
-+        await pg_stable_chunks.finish_reuse(
++    ) -> int:
++        return await pg_stable_chunks.finish_reuse(
 +            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, staged=staged
 +        )
 +
 diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
-index 5d6476eb5..9fb50d401 100644
+index 5d6476eb5..0622c2eb8 100644
 --- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 +++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 @@ -29 +29 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
@@ -642,9 +736,9 @@ index 5d6476eb5..9fb50d401 100644
 +        # fallback. Larger/multi-document inputs keep the old token splitter.
 +        bounded_stable_pass = False
 +        retain_config = None
-@@ -7473,0 +7498,33 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -7473,0 +7498,43 @@ class MemoryEngine(MemoryEngineInterface):
 +            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
-+            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, is_jsonl_source
++            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, fits_stable_chunk_budget, is_jsonl_source
 +
 +            bounded_stable_pass = (
 +                retain_config.retain_stable_chunks
@@ -658,6 +752,7 @@ index 5d6476eb5..9fb50d401 100644
 +                from .retain import attachment_content, fact_storage
 +
 +                incoming = contents[0].get("content", "")
++                candidate_body = incoming
 +                appending = contents[0].get("update_mode") == "append"
 +                bounded_stable_pass = not attachment_content.contains_attachment(incoming) and await asyncio.to_thread(
 +                    is_jsonl_source, incoming, 1 if appending else 2
@@ -675,11 +770,20 @@ index 5d6476eb5..9fb50d401 100644
 +                        and not attachment_content.contains_attachment(base_text)
 +                        and await asyncio.to_thread(is_jsonl_source, base_text)
 +                    )
++                    if bounded_stable_pass:
++                        candidate_body = base_text + "\n" + incoming
++                if bounded_stable_pass:
++                    bounded_stable_pass = await asyncio.to_thread(
++                        fits_stable_chunk_budget,
++                        candidate_body,
++                        retain_config.retain_chunk_size,
++                        retain_config.retain_structured_chunk_size,
++                    )
 +        if retain_session is None and total_tokens > tokens_per_batch and not bounded_stable_pass:
-@@ -7483 +7540 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -7483 +7550 @@ class MemoryEngine(MemoryEngineInterface):
 -            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
 +            assert retain_config is not None
-@@ -18629,0 +18687,11 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18629,0 +18697,11 @@ class MemoryEngine(MemoryEngineInterface):
 +        # Full synthesis has already run. The retraction/edit calls and any corrected
 +        # response now share ONE phase budget, clamped to this task's remaining wall time.
 +        from ..worker.stage import get_task_deadline
@@ -691,9 +795,9 @@ index 5d6476eb5..9fb50d401 100644
 +            edit_deadline = (
 +                min(edit_deadline, configured_deadline) if edit_deadline is not None else configured_deadline
 +            )
-@@ -18696,0 +18765 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18696,0 +18775 @@ class MemoryEngine(MemoryEngineInterface):
 +                            deadline=edit_deadline,
-@@ -18719,0 +18789,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18719,0 +18799,7 @@ class MemoryEngine(MemoryEngineInterface):
 +                        # A transport outage or control signal is not an invalid edit. Preserve
 +                        # its type for the task's retry/defer/cancel policy; swallowing it here
 +                        # could advance the watermark while leaving a retired claim in place.
@@ -701,9 +805,9 @@ index 5d6476eb5..9fb50d401 100644
 +                            exc, (OperationCancelledError, ProviderRateLimitResetError)
 +                        ) or is_transient_remote_error(exc):
 +                            raise
-@@ -18827,0 +18904 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18827,0 +18914 @@ class MemoryEngine(MemoryEngineInterface):
 +                        deadline=edit_deadline,
-@@ -18878,0 +18956,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18878,0 +18966,7 @@ class MemoryEngine(MemoryEngineInterface):
 +                    # Do not turn a temporary provider failure into delta_ops_failed: that
 +                    # refusal pauses automatic refresh and hides the original retryability.
 +                    # Structural/schema failures still follow the data-preserving refusal.
@@ -711,24 +815,24 @@ index 5d6476eb5..9fb50d401 100644
 +                        exc, (OperationCancelledError, ProviderRateLimitResetError)
 +                    ) or is_transient_remote_error(exc):
 +                        raise
-@@ -20531,2 +20615,3 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20531,2 +20625,3 @@ class MemoryEngine(MemoryEngineInterface):
 -        similarity (``mm.embedding``) using Reciprocal Rank Fusion, in a single
 -        round trip. No reranker — this path is tuned for latency. Returns pages
 +        similarity (``mm.embedding``) using Reciprocal Rank Fusion. A bounded exact
 +        title lookup precedes hybrid ranking, so identity matches cannot disappear
 +        below an ANN/BM25 candidate cut. No reranker. Returns pages
-@@ -20536 +20621,4 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20536 +20631,4 @@ class MemoryEngine(MemoryEngineInterface):
 -        ``score`` is normalized to ``0..1``, where 1.0 is the best a page can do
 +        Case-insensitive full-title matches come first with score 1.0; the title is
 +        not tokenized, so Chinese titles and punctuation work without a text index.
 +        Other pages retain the existing rank-fusion score, normalized to ``0..1``,
 +        where 1.0 is the best a non-exact page can do
-@@ -20577,4 +20664,0 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20577,4 +20674,0 @@ class MemoryEngine(MemoryEngineInterface):
 -        # Embed with the query input type (asymmetric models prefix queries).
 -        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
 -        emb_str = str(emb[0]) if emb and emb[0] else None
 -
-@@ -20583,0 +20668,38 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20583,0 +20678,38 @@ class MemoryEngine(MemoryEngineInterface):
 +        exact_tags = tag_filter.clause(3)
 +        backend = await self._get_backend()
 +        async with acquire_with_retry(backend) as conn:
@@ -767,21 +871,21 @@ index 5d6476eb5..9fb50d401 100644
 +        # not depend on a working embedding service or the text-search index.
 +        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
 +        emb_str = str(emb[0]) if emb and emb[0] else None
-@@ -20600 +20722 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20600 +20732 @@ class MemoryEngine(MemoryEngineInterface):
 -                return []
 +                return exact_results
-@@ -20638 +20760 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20638 +20770 @@ class MemoryEngine(MemoryEngineInterface):
 -            return out[:limit]
 +            return (exact_results + [hit for hit in out if hit["id"] not in exact_ids])[:limit]
-@@ -20662 +20784 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20662 +20794 @@ class MemoryEngine(MemoryEngineInterface):
 -            return []
 +            return exact_results
-@@ -20777 +20899 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20777 +20909 @@ class MemoryEngine(MemoryEngineInterface):
 -        return [
 +        hybrid_results = [
-@@ -20787,0 +20910 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20787,0 +20920 @@ class MemoryEngine(MemoryEngineInterface):
 +            if r["id"] not in exact_ids
-@@ -20788,0 +20912 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20788,0 +20922 @@ class MemoryEngine(MemoryEngineInterface):
 +        return (exact_results + hybrid_results)[:limit]
 diff --git a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
 index 54a7a03e0..028a916e2 100644
@@ -1126,19 +1230,156 @@ index 000000000..ad0f7f2ef
 +                        task.cancel()
 +                await asyncio.gather(*tasks, return_exceptions=True)
 diff --git a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
-index 796a65125..464f6056a 100644
+index 796a65125..1c01ca38b 100644
 --- a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 +++ b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 @@ -15 +15 @@ from collections.abc import Awaitable, Callable
 -from dataclasses import dataclass
 +from dataclasses import asdict, dataclass
 @@ -508,0 +509 @@ from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_
-+from .stable_chunks import StableChunkPlan, plan_stable_chunks
-@@ -2035,0 +2037 @@ async def retain_batch(
++from .stable_chunks import MAX_STABLE_SOURCE_CHARS, StableChunkPlan, is_jsonl_source, plan_stable_chunks
+@@ -2010,0 +2012,6 @@ async def retain_batch(
++    stable_recovery_plan: StableChunkPlan | None = None
++
++    def preserve_recovery_layout(plan: StableChunkPlan) -> None:
++        nonlocal stable_recovery_plan
++        stable_recovery_plan = plan
++
+@@ -2035,0 +2043,2 @@ async def retain_batch(
 +                single_input=original_count == 1,
-@@ -3809,0 +3812 @@ async def _try_delta_retain(
++                recovery_plan_callback=preserve_recovery_layout,
+@@ -2077,0 +2087,6 @@ async def retain_batch(
++    if stable_recovery_plan is not None:
++        # Resume missing chunks at the verified persisted positions, not at a
++        # fresh greedy layout. Extraction remains producer/consumer bounded.
++        all_pre_chunks = [chunk.text for chunk in stable_recovery_plan.chunks]
++        chunk_to_content = [0] * len(all_pre_chunks)
++
+@@ -2634,8 +2649,20 @@ async def _streaming_retain_batch(
+-    try:
+-        if not force_reextract:
+-            existing_chunk_hashes = await _get_memories_recov().recovery_chunk_hashes(
+-                backend=pool,
+-                fq_table=fq_table,
+-                bank_id=bank_id,
+-                document_id=effective_doc_id,
+-                content_hash=new_content_hash,
++    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
++    recovery_store = _get_memories_recov()
++    recovery_expected_hashes: dict[int, str] | None = None
++    recovery_positions: dict[int, str] | None = None
++    recovery_context = retain_params.get("context") or None
++    recovery_strategy = retain_params.get("strategy") or None
++    if (
++        recovery_store.supports_stable_chunk_reuse(pool)
++        and len(combined_content) <= MAX_STABLE_SOURCE_CHARS
++        and await asyncio.to_thread(is_jsonl_source, combined_content)
++    ):
++        # This remains active when the feature is turned OFF: existing non-greedy
++        # layouts still exist. Same body != same layout/extraction contract.
++        if full_document_body is None:
++            recovery_expected_hashes = {
++                chunk_index_offset + i: chunk_storage.compute_chunk_hash(text) for i, text in enumerate(all_pre_chunks)
++            }
++        else:
++            complete_chunks = await asyncio.to_thread(
++                _chunk_contents_for_delta, [RetainContent(content=combined_content)], config
+@@ -2643,5 +2670,15 @@ async def _streaming_retain_batch(
+-            if existing_chunk_hashes:
+-                is_recovery = True
+-                log_buffer.append(
+-                    f"[streaming] RECOVERY: found {len(existing_chunk_hashes)} already-committed chunks — "
+-                    f"will skip matching and preserve existing data"
++            recovery_expected_hashes = {
++                index: chunk_storage.compute_chunk_hash(text) for index, text in complete_chunks.items()
++            }
++        recovery_positions = {}
++        if not force_reextract:
++            async with acquire_with_retry(pool) as conn:
++                compatible = await recovery_store.compatible_recovery_chunks(
++                    conn=conn,
++                    fq_table=fq_table,
++                    bank_id=bank_id,
++                    document_id=effective_doc_id,
++                    content_hash=new_content_hash,
++                    expected_hashes=recovery_expected_hashes,
++                    source_context=recovery_context,
++                    source_strategy=recovery_strategy,
+@@ -2649,2 +2686,23 @@ async def _streaming_retain_batch(
+-    except Exception:
+-        pass  # If we can't load, just process all chunks
++            if compatible is None and not is_first_batch:
++                raise RuntimeError("Document layout or extraction contract changed between retain slices; retry")
++            recovery_positions = compatible or {}
++            is_recovery = bool(recovery_positions)
++    else:
++        try:
++            if not force_reextract:
++                existing_chunk_hashes = await recovery_store.recovery_chunk_hashes(
++                    backend=pool,
++                    fq_table=fq_table,
++                    bank_id=bank_id,
++                    document_id=effective_doc_id,
++                    content_hash=new_content_hash,
++                )
++                is_recovery = bool(existing_chunk_hashes)
++        except Exception:
++            pass  # Legacy stores keep their existing recovery behavior.
++    if is_recovery:
++        committed = len(recovery_positions) if recovery_positions is not None else len(existing_chunk_hashes)
++        log_buffer.append(
++            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
++            "will skip matching positions and preserve existing data"
++        )
+@@ -2665,2 +2722,0 @@ async def _streaming_retain_batch(
+-    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
+-
+@@ -2896 +2952,5 @@ async def _streaming_retain_batch(
+-                if chunk_hash in existing_chunk_hashes:
++                if (
++                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
++                    if recovery_positions is not None
++                    else chunk_hash in existing_chunk_hashes
++                ):
+@@ -3343,0 +3404,18 @@ async def _streaming_retain_batch(
++                    if recovery_expected_hashes is not None and (
++                        is_recovery or doc_tracking_done[0] or not is_first_batch
++                    ):
++                        compatible = await recovery_store.compatible_recovery_chunks(
++                            conn=conn,
++                            fq_table=fq_table,
++                            bank_id=bank_id,
++                            document_id=effective_doc_id,
++                            content_hash=new_content_hash,
++                            expected_hashes=recovery_expected_hashes,
++                            source_context=recovery_context,
++                            source_strategy=recovery_strategy,
++                        )
++                        if compatible is None:
++                            raise RuntimeError(
++                                "Document layout or extraction contract changed before recovery write; retry"
++                            )
++
+@@ -3601,0 +3680,15 @@ async def _streaming_retain_batch(
++                        if recovery_expected_hashes is not None and (is_recovery or not is_first_batch):
++                            compatible = await recovery_store.compatible_recovery_chunks(
++                                conn=conn,
++                                fq_table=fq_table,
++                                bank_id=bank_id,
++                                document_id=effective_doc_id,
++                                content_hash=new_content_hash,
++                                expected_hashes=recovery_expected_hashes,
++                                source_context=recovery_context,
++                                source_strategy=recovery_strategy,
++                            )
++                            if compatible is None:
++                                raise RuntimeError(
++                                    "Document layout or extraction contract changed before recovery completion; retry"
++                                )
+@@ -3809,0 +3903,2 @@ async def _try_delta_retain(
 +    single_input: bool = False,
-@@ -3847,0 +3851,8 @@ async def _try_delta_retain(
++    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
+@@ -3847,0 +3943,8 @@ async def _try_delta_retain(
 +    stable_enabled = (
 +        bool(getattr(config, "retain_stable_chunks", False))
 +        and config.store_document_text
@@ -1147,13 +1388,13 @@ index 796a65125..464f6056a 100644
 +        and not _store_owned_delta
 +        and _delta_store.supports_stable_chunk_reuse(pool)
 +    )
-@@ -3868 +3879 @@ async def _try_delta_retain(
+@@ -3868 +3971 @@ async def _try_delta_retain(
 -    if document_prefetch is not None and full_document_body is None:
 +    if document_prefetch is not None and full_document_body is None and not stable_enabled:
-@@ -3885 +3896 @@ async def _try_delta_retain(
+@@ -3885 +3988 @@ async def _try_delta_retain(
 -            include_text=full_document_body is not None,
 +            include_text=full_document_body is not None or stable_enabled,
-@@ -3923 +3934,35 @@ async def _try_delta_retain(
+@@ -3923 +4026,35 @@ async def _try_delta_retain(
 -    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
 +    stable_plan: StableChunkPlan | None = None
 +    if stable_enabled:
@@ -1190,7 +1431,7 @@ index 796a65125..464f6056a 100644
 +    new_chunks_with_contents = (
 +        stable_plan.texts if stable_plan is not None else _chunk_contents_for_delta(_diff_contents, config)
 +    )
-@@ -3936,6 +3981,14 @@ async def _try_delta_retain(
+@@ -3936,6 +4073,14 @@ async def _try_delta_retain(
 -
 -    log_buffer.append(
 -        f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
@@ -1211,13 +1452,16 @@ index 796a65125..464f6056a 100644
 +            f"{len(changed_indices)} changed, {len(new_indices)} new, "
 +            f"{len(removed_indices)} removed"
 +        )
-@@ -4103 +4156,4 @@ async def _try_delta_retain(
+@@ -3984,0 +4130,2 @@ async def _try_delta_retain(
++        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
++            recovery_plan_callback(stable_plan)
+@@ -4103 +4250,4 @@ async def _try_delta_retain(
 -    meta_token = set_call_metadata({"document_id": effective_doc_id})
 +    call_metadata: dict[str, Any] = {"document_id": effective_doc_id}
 +    if stable_plan is not None:
 +        call_metadata["chunk_reuse"] = asdict(stable_plan.stats)
 +    meta_token = set_call_metadata(call_metadata)
-@@ -4203,0 +4260,13 @@ async def _try_delta_retain(
+@@ -4203,0 +4354,13 @@ async def _try_delta_retain(
 +                staged_reuse = None
 +                if stable_plan is not None:
 +                    staged_reuse = await _delta_store.stage_stable_chunk_reuse(
@@ -1231,7 +1475,7 @@ index 796a65125..464f6056a 100644
 +                        log_buffer.append("[delta] Chunk snapshot moved before reuse; preserving it and falling back")
 +                        return False
 +
-@@ -4242,5 +4311,9 @@ async def _try_delta_retain(
+@@ -4242,5 +4405,9 @@ async def _try_delta_retain(
 -                chunks_to_delete = [
 -                    existing_by_index[idx].chunk_id
 -                    for idx in changed_indices + removed_indices
@@ -1246,7 +1490,7 @@ index 796a65125..464f6056a 100644
 +                        if idx in existing_by_index
 +                    ]
 +                )
-@@ -4252,2 +4325,6 @@ async def _try_delta_retain(
+@@ -4252,2 +4419,6 @@ async def _try_delta_retain(
 -                    f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 -                    f"invalidated {invalidated_obs} observation(s) "
 +                    + (
@@ -1255,9 +1499,9 @@ index 796a65125..464f6056a 100644
 +                        else f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 +                    )
 +                    + f"invalidated {invalidated_obs} observation(s) "
-@@ -4256,0 +4334,21 @@ async def _try_delta_retain(
+@@ -4256,0 +4428,21 @@ async def _try_delta_retain(
 +                if staged_reuse is not None and stable_plan is not None:
-+                    await _delta_store.finish_stable_chunk_reuse(
++                    moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
 +                        conn=conn,
 +                        fq_table=fq_table,
 +                        bank_id=bank_id,
@@ -1267,7 +1511,7 @@ index 796a65125..464f6056a 100644
 +                    if operation_id:
 +                        from dataclasses import replace
 +
-+                        summary = replace(stable_plan.stats, moved_fact_refs=staged_reuse.moved_fact_count)
++                        summary = replace(stable_plan.stats, moved_fact_refs=moved_fact_count)
 +                        await conn.execute(
 +                            f"UPDATE {fq_table('async_operations')} SET result_metadata = "
 +                            "COALESCE(result_metadata, '{}'::jsonb) || jsonb_build_object('chunk_reuse', $3::jsonb) "
@@ -1277,7 +1521,7 @@ index 796a65125..464f6056a 100644
 +                            json.dumps(asdict(summary)),
 +                        )
 +
-@@ -4367,0 +4466,6 @@ async def _try_delta_retain(
+@@ -4367,0 +4560,6 @@ async def _try_delta_retain(
 +    if stable_plan is not None:
 +        # Delta content slots address changed chunks, not caller input slots. This
 +        # bounded path accepts ONE original input, including an append's prepend.
@@ -1286,10 +1530,10 @@ index 796a65125..464f6056a 100644
 +        result_unit_ids = [[identity for ids in result_unit_ids for identity in ids]]
 diff --git a/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py b/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py
 new file mode 100644
-index 000000000..c5a667c9a
+index 000000000..901fe5b2f
 --- /dev/null
 +++ b/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,240 @@
 +"""Bounded, source-ordered reuse of complete JSONL chunks.
 +
 +The ordinary greedy splitter remains unchanged. A historical insertion shifts its
@@ -1386,6 +1630,7 @@ index 000000000..c5a667c9a
 +class StagedChunkMove:
 +    original: ChunkSnapshot
 +    temporary_id: str
++    temporary_index: int
 +    target_id: str
 +    target_index: int
 +
@@ -1393,7 +1638,6 @@ index 000000000..c5a667c9a
 +@dataclass(frozen=True)
 +class StagedChunkReuse:
 +    moves: list[StagedChunkMove]
-+    moved_fact_count: int = 0
 +
 +
 +def is_jsonl_source(text: str, minimum_lines: int = 2) -> bool:
@@ -1404,6 +1648,20 @@ index 000000000..c5a667c9a
 +        return all(isinstance(json.loads(line), dict) for line in lines)
 +    except (ValueError, TypeError):
 +        return False
++
++
++def fits_stable_chunk_budget(text: str, max_chars: int, structured_chunk_size: int | None) -> bool:
++    """Stop at the first over-budget chunk before bypassing the outer splitter."""
++    from . import fact_extraction
++
++    if len(text) > MAX_STABLE_SOURCE_CHARS:
++        return False
++    for index, _chunk in enumerate(
++        fact_extraction.iter_chunks(text, max_chars, structured_chunk_size=structured_chunk_size)
++    ):
++        if index >= MAX_STABLE_CHUNKS:
++            return False
++    return True
 +
 +
 +def _at_line_boundaries(body: str, start: int, end: int) -> bool:
@@ -1490,21 +1748,21 @@ index 000000000..c5a667c9a
 +            continue
 +        if fact_extraction.chunk_text(text, max_chars, structured_chunk_size=structured_chunk_size) != [text]:
 +            continue
-+        old_start = old_body.find(text, old_cursor)
-+        if old_start < 0:
++        old_start = old_body.find(text)
++        if old_start < old_cursor or old_body.find(text, old_start + 1) >= 0:
 +            continue
 +        old_end = old_start + len(text)
 +        old_cursor = old_end
 +        if not _at_line_boundaries(old_body, old_start, old_end):
 +            continue
-+        start = new_body.find(text, new_cursor)
-+        if start < 0 or new_body.find(text, start + 1) >= 0:
++        start = new_body.find(text)
++        if start < new_cursor or new_body.find(text, start + 1) >= 0:
 +            continue
 +        end = start + len(text)
 +        if not _at_line_boundaries(new_body, start, end):
 +            continue
 +        # Repack a growing tail so repeated tiny appends do not each add a chunk.
-+        if old.chunk_index == len(old_chunks) - 1 and new_body[end:].strip():
++        if old.chunk_index == len(old_chunks) - 1 and not old_body[old_end:].strip() and new_body[end:].strip():
 +            continue
 +        append_gap(new_cursor, start)
 +        plan.append(PlannedChunk(chunk_index=len(plan), text=text, reuse_from=old.chunk_id))
