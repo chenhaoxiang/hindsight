@@ -175,16 +175,18 @@ are separately identifiable. A rejected or interrupted validation is retained as
 ### Fixed component build inputs
 
 - API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
-  plus [.github/patches/api-1.2.0-fork.2.patch](patches/api-1.2.0-fork.2.patch)
-  for the refresh-resilience candidate. Preserve the previously released
-  [fork.1 overlay](patches/api-1.2.0-fork.1.patch) unchanged.
-  Candidate public API identity and release naming are `1.2.0-fork.2`; Python
-  distribution metadata and wheel names use the equivalent `1.2.0+fork.2`. PEP 440 rejects
-  `1.2.0-fork.2`, while the local-version form satisfies the existing full wrapper
+  plus [.github/patches/api-1.2.0-fork.3.patch](patches/api-1.2.0-fork.3.patch)
+  for the incremental-retain candidate. Preserve the previously released
+  [fork.1 overlay](patches/api-1.2.0-fork.1.patch) and
+  [fork.2 overlay](patches/api-1.2.0-fork.2.patch) unchanged.
+  Candidate public API identity and release naming are `1.2.0-fork.3`; Python
+  distribution metadata and wheel names use the equivalent `1.2.0+fork.3`. PEP 440 rejects
+  `1.2.0-fork.3`, while the local-version form satisfies the existing full wrapper
   dependency `==1.2.0`. Do not use a post-release or change that dependency to
-  work around naming. The fork.2 overlay changes only fourteen production
-  modules and the two version declarations, combining the previous reliability
-  fixes with the scoped refresh, trace, ranking-input and exact-title changes. No newer API schema,
+  work around naming. The fork.3 overlay changes only nineteen production
+  modules and the two version declarations, combining the previous reliability,
+  refresh, trace, ranking-input and exact-title fixes with opt-in stable JSONL
+  chunk reuse. No newer API schema,
   migration or unrelated main-branch feature is included. Keep regression tests
   bound to the public reliability-fix source as well as the stable API export.
 - Coding Agents: `0.8.5` component tree at
@@ -196,7 +198,7 @@ are separately identifiable. A rejected or interrupted validation is retained as
 Build only from committed public source into ignored temporary directories. A
 fresh API export can be prepared with `git archive` at the exact API base. From
 the maintenance repository root, apply the committed zero-context overlay with
-`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.2.patch`.
+`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.3.patch`.
 Use a fresh export and verify the resulting source bytes; this avoids patch-tool
 backup files entering the package. Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
