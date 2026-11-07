@@ -167,7 +167,9 @@ async def test_insert_append_and_correction_keep_the_right_source_identities(stu
         document = await client.documents.get_document(bank, DOCUMENT)
         assert document.original_text == "\n".join(lines)
         # Same-body replay neither changes identities nor invents new sources.
-        await retain(document.original_text)
+        noop_metadata = await retain(document.original_text, queued=True)
+        assert "chunk_reuse" not in noop_metadata  # metadata-only is intentionally not an aggregate
+        assert noop_metadata["unit_ids_count"] == 0
         assert {text: item.id for text, item in (await raw()).items()} == {
             text: item.id for text, item in corrected.items()
         }

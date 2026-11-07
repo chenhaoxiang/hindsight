@@ -94,6 +94,7 @@ class StableChunkPlan:
 class StagedChunkMove:
     original: ChunkSnapshot
     temporary_id: str
+    temporary_index: int
     target_id: str
     target_index: int
 
@@ -101,7 +102,6 @@ class StagedChunkMove:
 @dataclass(frozen=True)
 class StagedChunkReuse:
     moves: list[StagedChunkMove]
-    moved_fact_count: int = 0
 
 
 def is_jsonl_source(text: str, minimum_lines: int = 2) -> bool:
@@ -112,6 +112,20 @@ def is_jsonl_source(text: str, minimum_lines: int = 2) -> bool:
         return all(isinstance(json.loads(line), dict) for line in lines)
     except (ValueError, TypeError):
         return False
+
+
+def fits_stable_chunk_budget(text: str, max_chars: int, structured_chunk_size: int | None) -> bool:
+    """Stop at the first over-budget chunk before bypassing the outer splitter."""
+    from . import fact_extraction
+
+    if len(text) > MAX_STABLE_SOURCE_CHARS:
+        return False
+    for index, _chunk in enumerate(
+        fact_extraction.iter_chunks(text, max_chars, structured_chunk_size=structured_chunk_size)
+    ):
+        if index >= MAX_STABLE_CHUNKS:
+            return False
+    return True
 
 
 def _at_line_boundaries(body: str, start: int, end: int) -> bool:
@@ -198,21 +212,21 @@ def plan_stable_chunks(
             continue
         if fact_extraction.chunk_text(text, max_chars, structured_chunk_size=structured_chunk_size) != [text]:
             continue
-        old_start = old_body.find(text, old_cursor)
-        if old_start < 0:
+        old_start = old_body.find(text)
+        if old_start < old_cursor or old_body.find(text, old_start + 1) >= 0:
             continue
         old_end = old_start + len(text)
         old_cursor = old_end
         if not _at_line_boundaries(old_body, old_start, old_end):
             continue
-        start = new_body.find(text, new_cursor)
-        if start < 0 or new_body.find(text, start + 1) >= 0:
+        start = new_body.find(text)
+        if start < new_cursor or new_body.find(text, start + 1) >= 0:
             continue
         end = start + len(text)
         if not _at_line_boundaries(new_body, start, end):
             continue
         # Repack a growing tail so repeated tiny appends do not each add a chunk.
-        if old.chunk_index == len(old_chunks) - 1 and new_body[end:].strip():
+        if old.chunk_index == len(old_chunks) - 1 and not old_body[old_end:].strip() and new_body[end:].strip():
             continue
         append_gap(new_cursor, start)
         plan.append(PlannedChunk(chunk_index=len(plan), text=text, reuse_from=old.chunk_id))

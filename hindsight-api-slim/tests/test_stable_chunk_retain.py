@@ -186,11 +186,14 @@ async def test_relocation_failure_rolls_back_source_facts_chunks_and_observation
     async with (await memory._get_pool()).acquire() as conn:
         proof = await _insert_observation(memory, conn, bank, "Rollback keeps valid evidence.", [uuid.UUID(anchor)])
 
+    move_to_temporary = pg_stable._move_to_temporary
+
     async def fail_after_staging(**kwargs):
-        assert kwargs["staged"].moves
+        assert kwargs["moves"]
+        assert await move_to_temporary(**kwargs) > 0
         raise RuntimeError("fixture finalization failure")
 
-    monkeypatch.setattr(pg_stable, "finish_reuse", fail_after_staging)
+    monkeypatch.setattr(pg_stable, "_move_to_temporary", fail_after_staging)
     lines.insert(40, json.dumps({"role": "user", "content": "A new insertion."}))
     with pytest.raises(RuntimeError, match="fixture finalization failure"):
         await memory.retain_async(
@@ -239,12 +242,16 @@ async def test_cancelled_relocation_is_invisible_and_rolls_back(memory, request_
     reached = asyncio.Event()
     hold = asyncio.Event()
 
+    move_to_temporary = pg_stable._move_to_temporary
+
     async def held_finish(**kwargs):
-        assert kwargs["staged"].moves
+        assert kwargs["moves"]
+        moved = await move_to_temporary(**kwargs)
         reached.set()
         await hold.wait()
+        return moved
 
-    monkeypatch.setattr(pg_stable, "finish_reuse", held_finish)
+    monkeypatch.setattr(pg_stable, "_move_to_temporary", held_finish)
     lines.insert(40, json.dumps({"role": "user", "content": "An inserted fixture."}))
     pending = asyncio.create_task(
         memory.retain_async(

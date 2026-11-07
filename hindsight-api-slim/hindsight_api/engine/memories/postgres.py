@@ -1238,6 +1238,29 @@ class PostgresMemories(MemoriesExtension):
                 source_strategy=source_strategy,
             )
 
+    async def compatible_recovery_chunks(
+        self,
+        *,
+        conn: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        content_hash: str,
+        expected_hashes: dict[int, str],
+        source_context: str | None,
+        source_strategy: str | None,
+    ) -> dict[int, str] | None:
+        return await pg_stable_chunks.compatible_recovery_chunks(
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            document_id=document_id,
+            content_hash=content_hash,
+            expected_hashes=expected_hashes,
+            source_context=source_context,
+            source_strategy=source_strategy,
+        )
+
     async def stage_stable_chunk_reuse(
         self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
     ) -> "StagedChunkReuse | None":
@@ -1247,8 +1270,8 @@ class PostgresMemories(MemoriesExtension):
 
     async def finish_stable_chunk_reuse(
         self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
-    ) -> None:
-        await pg_stable_chunks.finish_reuse(
+    ) -> int:
+        return await pg_stable_chunks.finish_reuse(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, staged=staged
         )
 

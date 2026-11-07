@@ -3613,6 +3613,21 @@ class MemoriesExtension(Extension, ABC):
     ) -> list["ChunkSnapshot"]:
         return []
 
+    async def compatible_recovery_chunks(
+        self,
+        *,
+        conn: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        content_hash: str,
+        expected_hashes: dict[int, str],
+        source_context: str | None,
+        source_strategy: str | None,
+    ) -> dict[int, str] | None:
+        """Position-bound recovery for stores supporting stable layouts; None declines."""
+        return None
+
     async def stage_stable_chunk_reuse(
         self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
     ) -> "StagedChunkReuse | None":
@@ -3620,7 +3635,7 @@ class MemoriesExtension(Extension, ABC):
 
     async def finish_stable_chunk_reuse(
         self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
-    ) -> None:
+    ) -> int:
         raise NotImplementedError("Store does not support atomic stable chunk reuse")
 
     async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:

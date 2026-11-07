@@ -10,7 +10,13 @@ import pytest
 from hindsight_api.engine.memories.base import MemoriesExtension
 from hindsight_api.engine.memories.postgres import PostgresMemories
 from hindsight_api.engine.retain.fact_extraction import chunk_text
-from hindsight_api.engine.retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, ChunkSnapshot, plan_stable_chunks
+from hindsight_api.engine.retain.stable_chunks import (
+    MAX_STABLE_CHUNKS,
+    MAX_STABLE_SOURCE_CHARS,
+    ChunkSnapshot,
+    fits_stable_chunk_budget,
+    plan_stable_chunks,
+)
 
 
 def _line(index: int) -> str:
@@ -69,6 +75,20 @@ def test_repeated_old_chunks_are_never_matched_as_a_hash_set() -> None:
     assert "\n".join(chunk.text for chunk in plan.chunks) == new_body
 
 
+def test_new_duplicate_before_the_cursor_is_not_a_unique_occurrence() -> None:
+    lines = [json.dumps({"role": "user", "content": letter + "x" * 20}) for letter in "ABC"]
+    body = "\n".join(lines)
+    old = _snapshot(body, 55)
+    assert len(old) == 3
+    after = "\n".join([lines[1], lines[0], lines[1], lines[2]])
+    plan = plan_stable_chunks(body, after, old, max_chars=55, structured_chunk_size=55)
+    assert plan is not None
+    assert old[1].chunk_id not in plan.reused_ids
+    assert old[1].chunk_id in plan.obsolete_ids
+    assert plan.reused_ids == {old[0].chunk_id, old[2].chunk_id}
+    assert "\n".join(chunk.text for chunk in plan.chunks) == after
+
+
 def test_completed_same_body_with_a_short_tail_is_not_partial_recovery() -> None:
     body = "\n".join([_line(1), json.dumps({"role": "user", "content": "short"})])
     old = _snapshot(body, 200)
@@ -95,6 +115,13 @@ def test_unsupported_or_unverified_inputs_keep_the_old_path(kind: str) -> None:
     else:
         old[1] = replace(old[1], chunk_index=100)
     assert plan_stable_chunks(before, after, old, max_chars=400, structured_chunk_size=400) is None
+
+
+@pytest.mark.parametrize("count, fits", [(MAX_STABLE_CHUNKS, True), (MAX_STABLE_CHUNKS + 1, False)])
+def test_outer_splitter_budget_declines_before_more_than_512_chunks(count: int, fits: bool) -> None:
+    body = "\n".join(json.dumps({"role": "user", "content": f"Fixture {i:04d}"}) for i in range(count))
+    assert len(body) < MAX_STABLE_SOURCE_CHARS and len(chunk_text(body, 55, structured_chunk_size=55)) == count
+    assert fits_stable_chunk_budget(body, 55, 55) is fits
 
 
 def test_capability_is_explicit_and_postgres_only() -> None:

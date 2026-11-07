@@ -514,7 +514,7 @@ from . import timing as _timing
 from .embedding_coalescer import CoalescingEmbedder
 from .entity_labels import label_tag_keys
 from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_bytes
-from .stable_chunks import StableChunkPlan, plan_stable_chunks
+from .stable_chunks import MAX_STABLE_SOURCE_CHARS, StableChunkPlan, is_jsonl_source, plan_stable_chunks
 from .types import (
     CausalRelation,
     ChunkMetadata,
@@ -2032,6 +2032,12 @@ async def retain_batch(
     # delta ran with no concurrency control at all.
     from ..memories import get_memories as _get_memories_delta
 
+    stable_recovery_plan: StableChunkPlan | None = None
+
+    def preserve_recovery_layout(plan: StableChunkPlan) -> None:
+        nonlocal stable_recovery_plan
+        stable_recovery_plan = plan
+
     _delta_provider = _get_memories_delta()
     if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
         with track_observation_changes() as delta_changes:
@@ -2058,6 +2064,7 @@ async def retain_batch(
                 full_document_body=full_document_body,
                 delta_full_body=_delta_full_body,
                 single_input=original_count == 1,
+                recovery_plan_callback=preserve_recovery_layout,
                 document_body_hash=document_body_hash,
                 append_base_hash=append_base_hash,
                 attachment_loader=attachment_loader,
@@ -2099,6 +2106,12 @@ async def retain_batch(
         ):
             all_pre_chunks.append(chunk)
             chunk_to_content.append(content_idx)
+
+    if stable_recovery_plan is not None:
+        # Resume missing chunks at the verified persisted positions, not at a
+        # fresh greedy layout. Extraction remains producer/consumer bounded.
+        all_pre_chunks = [chunk.text for chunk in stable_recovery_plan.chunks]
+        chunk_to_content = [0] * len(all_pre_chunks)
 
     # Memory: after chunking, the original content bodies in RetainContent are
     # no longer needed (all_pre_chunks holds the working set). Clear them so
@@ -2659,23 +2672,66 @@ async def _streaming_retain_batch(
     # preserves every existing unit and skips every matching chunk, which is exactly the
     # silent no-op #3899 reports. Skipping the probe also skips its two queries.
     # `conn` is the pool: only Postgres acquires a connection for the probe.
-    try:
-        if not force_reextract:
-            existing_chunk_hashes = await _get_memories_recov().recovery_chunk_hashes(
-                backend=pool,
-                fq_table=fq_table,
-                bank_id=bank_id,
-                document_id=effective_doc_id,
-                content_hash=new_content_hash,
+    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
+    recovery_store = _get_memories_recov()
+    recovery_expected_hashes: dict[int, str] | None = None
+    recovery_positions: dict[int, str] | None = None
+    recovery_context = retain_params.get("context") or None
+    recovery_strategy = retain_params.get("strategy") or None
+    if (
+        recovery_store.supports_stable_chunk_reuse(pool)
+        and len(combined_content) <= MAX_STABLE_SOURCE_CHARS
+        and await asyncio.to_thread(is_jsonl_source, combined_content)
+    ):
+        # This remains active when the feature is turned OFF: existing non-greedy
+        # layouts still exist. Same body != same layout/extraction contract.
+        if full_document_body is None:
+            recovery_expected_hashes = {
+                chunk_index_offset + i: chunk_storage.compute_chunk_hash(text) for i, text in enumerate(all_pre_chunks)
+            }
+        else:
+            complete_chunks = await asyncio.to_thread(
+                _chunk_contents_for_delta, [RetainContent(content=combined_content)], config
             )
-            if existing_chunk_hashes:
-                is_recovery = True
-                log_buffer.append(
-                    f"[streaming] RECOVERY: found {len(existing_chunk_hashes)} already-committed chunks — "
-                    f"will skip matching and preserve existing data"
+            recovery_expected_hashes = {
+                index: chunk_storage.compute_chunk_hash(text) for index, text in complete_chunks.items()
+            }
+        recovery_positions = {}
+        if not force_reextract:
+            async with acquire_with_retry(pool) as conn:
+                compatible = await recovery_store.compatible_recovery_chunks(
+                    conn=conn,
+                    fq_table=fq_table,
+                    bank_id=bank_id,
+                    document_id=effective_doc_id,
+                    content_hash=new_content_hash,
+                    expected_hashes=recovery_expected_hashes,
+                    source_context=recovery_context,
+                    source_strategy=recovery_strategy,
                 )
-    except Exception:
-        pass  # If we can't load, just process all chunks
+            if compatible is None and not is_first_batch:
+                raise RuntimeError("Document layout or extraction contract changed between retain slices; retry")
+            recovery_positions = compatible or {}
+            is_recovery = bool(recovery_positions)
+    else:
+        try:
+            if not force_reextract:
+                existing_chunk_hashes = await recovery_store.recovery_chunk_hashes(
+                    backend=pool,
+                    fq_table=fq_table,
+                    bank_id=bank_id,
+                    document_id=effective_doc_id,
+                    content_hash=new_content_hash,
+                )
+                is_recovery = bool(existing_chunk_hashes)
+        except Exception:
+            pass  # Legacy stores keep their existing recovery behavior.
+    if is_recovery:
+        committed = len(recovery_positions) if recovery_positions is not None else len(existing_chunk_hashes)
+        log_buffer.append(
+            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
+            "will skip matching positions and preserve existing data"
+        )
 
     # ---------------------------------------------------------------------------
     # Document tracking is DEFERRED to the first consumer batch TXN.
@@ -2690,8 +2746,6 @@ async def _streaming_retain_batch(
     # workers. Each batch TXN also verifies document ownership via content_hash
     # to detect when a concurrent request has taken over the document.
     # See _run_mini_batch_db_work() for the implementation.
-    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
-
     # Route the document's bulky bodies (extracted text + ordered chunk texts) to the store's
     # dedicated document store when it owns one — up front, before the streaming batches
     # write facts. Idempotent and content-addressed, so this is safe here and dedups a re-ingest;
@@ -2921,7 +2975,11 @@ async def _streaming_retain_batch(
         try:
             for i, chunk_text in enumerate(all_pre_chunks):
                 chunk_hash = chunk_storage.compute_chunk_hash(chunk_text)
-                if chunk_hash in existing_chunk_hashes:
+                if (
+                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
+                    if recovery_positions is not None
+                    else chunk_hash in existing_chunk_hashes
+                ):
                     # Memory: skipped chunks aren't needed either.
                     all_pre_chunks[i] = ""
                     skipped_total += 1
@@ -3369,6 +3427,24 @@ async def _streaming_retain_batch(
                         document_id=effective_doc_id,
                     )
 
+                    if recovery_expected_hashes is not None and (
+                        is_recovery or doc_tracking_done[0] or not is_first_batch
+                    ):
+                        compatible = await recovery_store.compatible_recovery_chunks(
+                            conn=conn,
+                            fq_table=fq_table,
+                            bank_id=bank_id,
+                            document_id=effective_doc_id,
+                            content_hash=new_content_hash,
+                            expected_hashes=recovery_expected_hashes,
+                            source_context=recovery_context,
+                            source_strategy=recovery_strategy,
+                        )
+                        if compatible is None:
+                            raise RuntimeError(
+                                "Document layout or extraction contract changed before recovery write; retry"
+                            )
+
                     if not doc_tracking_done[0]:
                         # Append compare-and-swap, under the row lock and before any write: an
                         # append that lost its read-modify-write race must abort here rather than
@@ -3627,6 +3703,21 @@ async def _streaming_retain_batch(
                         await _edge_provider.lock_pending_document(
                             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
                         )
+                        if recovery_expected_hashes is not None and (is_recovery or not is_first_batch):
+                            compatible = await recovery_store.compatible_recovery_chunks(
+                                conn=conn,
+                                fq_table=fq_table,
+                                bank_id=bank_id,
+                                document_id=effective_doc_id,
+                                content_hash=new_content_hash,
+                                expected_hashes=recovery_expected_hashes,
+                                source_context=recovery_context,
+                                source_strategy=recovery_strategy,
+                            )
+                            if compatible is None:
+                                raise RuntimeError(
+                                    "Document layout or extraction contract changed before recovery completion; retry"
+                                )
                         if is_recovery:
                             await fact_storage.upsert_document_metadata(
                                 conn,
@@ -3836,6 +3927,7 @@ async def _try_delta_retain(
     # deliberately not for an append.
     delta_full_body: str | None = None,
     single_input: bool = False,
+    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
     document_body_hash: str | None = None,
     append_base_hash: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
@@ -4061,6 +4153,8 @@ async def _try_delta_retain(
     # path resumes the same work slice by slice instead: its recovery probe matches this same hash
     # and skips the committed chunks.
     if chunks_to_process and document_body_hash is not None and doc_hash_at_load == document_body_hash:
+        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
+            recovery_plan_callback(stable_plan)
         log_buffer.append(
             f"[delta] Document {effective_doc_id} is a partially written copy of this body — "
             f"resuming slice by slice instead of extracting {len(chunks_to_process)} chunks at once"
@@ -4358,7 +4452,7 @@ async def _try_delta_retain(
                 )
 
                 if staged_reuse is not None and stable_plan is not None:
-                    await _delta_store.finish_stable_chunk_reuse(
+                    moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
                         conn=conn,
                         fq_table=fq_table,
                         bank_id=bank_id,
@@ -4368,7 +4462,7 @@ async def _try_delta_retain(
                     if operation_id:
                         from dataclasses import replace
 
-                        summary = replace(stable_plan.stats, moved_fact_refs=staged_reuse.moved_fact_count)
+                        summary = replace(stable_plan.stats, moved_fact_refs=moved_fact_count)
                         await conn.execute(
                             f"UPDATE {fq_table('async_operations')} SET result_metadata = "
                             "COALESCE(result_metadata, '{}'::jsonb) || jsonb_build_object('chunk_reuse', $3::jsonb) "

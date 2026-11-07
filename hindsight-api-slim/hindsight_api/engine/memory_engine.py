@@ -7551,7 +7551,7 @@ class MemoryEngine(MemoryEngineInterface):
         retain_config = None
         if retain_session is None and total_tokens > tokens_per_batch:
             retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
-            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, is_jsonl_source
+            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, fits_stable_chunk_budget, is_jsonl_source
 
             bounded_stable_pass = (
                 retain_config.retain_stable_chunks
@@ -7565,6 +7565,7 @@ class MemoryEngine(MemoryEngineInterface):
                 from .retain import attachment_content, fact_storage
 
                 incoming = contents[0].get("content", "")
+                candidate_body = incoming
                 appending = contents[0].get("update_mode") == "append"
                 bounded_stable_pass = not attachment_content.contains_attachment(incoming) and await asyncio.to_thread(
                     is_jsonl_source, incoming, 1 if appending else 2
@@ -7581,6 +7582,15 @@ class MemoryEngine(MemoryEngineInterface):
                         and len(base_text) + len(incoming) + 1 <= MAX_STABLE_SOURCE_CHARS
                         and not attachment_content.contains_attachment(base_text)
                         and await asyncio.to_thread(is_jsonl_source, base_text)
+                    )
+                    if bounded_stable_pass:
+                        candidate_body = base_text + "\n" + incoming
+                if bounded_stable_pass:
+                    bounded_stable_pass = await asyncio.to_thread(
+                        fits_stable_chunk_budget,
+                        candidate_body,
+                        retain_config.retain_chunk_size,
+                        retain_config.retain_structured_chunk_size,
                     )
         if retain_session is None and total_tokens > tokens_per_batch and not bounded_stable_pass:
             # Split into smaller batches based on token count

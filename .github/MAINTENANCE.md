@@ -315,9 +315,17 @@ Source acceptance for this candidate:
   and observation evidence unchanged. Genuine edits still invalidate their facts
   and observations. Rollback, task cancellation, stale same-hash recovery,
   concurrent append and cross-bank isolation have dedicated store regressions.
-- A queued retain records bounded `chunk_reuse` counts on its executing operation;
-  a receipt parent is not an aggregate of these counts. Source text is not added
-  to these diagnostic fields.
+- A committed queued stable delta records bounded `chunk_reuse` counts on its
+  executing operation; a receipt parent is not an aggregate of these counts.
+  Metadata-only/no-op retains intentionally omit them: absence is not a zero-work
+  or reuse aggregate. Source text is not added to these diagnostic fields.
+- Recovery binds hashes to chunk positions and rechecks layout and extraction
+  context/strategy under the document lock, including after the flag is disabled.
+  A partial stable layout resumes its verified positions through the bounded
+  producer/consumer pipeline. Incompatible layouts retire old sources normally;
+  a concurrent layout change fails closed instead of overwriting surviving facts.
+  The standard obsolete-source observation sweep runs before any moving-fact
+  write, preserving its existing cross-document lock order.
 - The internal packing comparison is not adopted: mechanical packing tests alone
   cannot establish semantic equivalence. Retain the previous configuration when
   a bounded quality trial is inconclusive; do not rewind memory data.

@@ -18,6 +18,50 @@ from ...retain.stable_chunks import (
 )
 
 
+async def compatible_recovery_chunks(
+    *,
+    conn: Any,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    document_id: str,
+    content_hash: str,
+    expected_hashes: dict[int, str],
+    source_context: str | None,
+    source_strategy: str | None,
+) -> dict[int, str] | None:
+    """Only resume committed positions under the same source/extraction contract.
+
+    A body hash does not identify a chunk layout. In particular, a stable layout
+    must never be overwritten by greedy recovery while keeping its old facts.
+    Call again under the document lock before writing a recovered/later batch.
+    """
+    matches = await conn.fetchval(
+        f"SELECT 1 FROM {fq_table('documents')} WHERE bank_id = $1 AND id = $2 AND content_hash = $3 "
+        "AND NULLIF(retain_params->>'context', '') IS NOT DISTINCT FROM NULLIF($4::text, '') "
+        "AND NULLIF(retain_params->>'strategy', '') IS NOT DISTINCT FROM NULLIF($5::text, '')",
+        bank_id,
+        document_id,
+        content_hash,
+        source_context,
+        source_strategy,
+    )
+    if not matches:
+        return None
+    rows = await conn.fetch(
+        f"SELECT chunk_index, content_hash FROM {fq_table('chunks')} "
+        "WHERE bank_id = $1 AND document_id = $2 ORDER BY chunk_index LIMIT $3",
+        bank_id,
+        document_id,
+        len(expected_hashes) + 1,
+    )
+    if any(
+        row["chunk_index"] not in expected_hashes or expected_hashes[row["chunk_index"]] != row["content_hash"]
+        for row in rows
+    ):
+        return None
+    return {row["chunk_index"]: row["content_hash"] for row in rows}
+
+
 async def load_chunks(
     *,
     conn: Any,
@@ -103,17 +147,25 @@ async def stage_reuse(
         StagedChunkMove(
             original=old_by_id[chunk.reuse_from],
             temporary_id=build_chunk_id(bank_id, document_id, temporary_base + offset),
+            temporary_index=temporary_base + offset,
             target_id=build_chunk_id(bank_id, document_id, chunk.chunk_index),
             target_index=chunk.chunk_index,
         )
         for offset, chunk in enumerate(moving)
         if chunk.reuse_from is not None
     ]
-    if not moves:
-        return StagedChunkReuse(moves=[])
+    # Validation only: moving fact rows BEFORE the obsolete-source sweep would
+    # violate its whole-write-set UUID lock order across shared observations.
+    return StagedChunkReuse(moves=moves)
+
+
+async def _move_to_temporary(
+    *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, moves: list[StagedChunkMove]
+) -> int:
     old_ids = [move.original.chunk_id for move in moves]
     temp_ids = [move.temporary_id for move in moves]
-    # Same document -> fact lock order as normal source writers/consolidation.
+    # The standard obsolete-source sweep has already acquired its full fact /
+    # observation / co-source write set in UUID order. Only now lock moving facts.
     units = await conn.fetch(
         f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2 "
         "AND chunk_id = ANY($3::text[]) ORDER BY id FOR NO KEY UPDATE",
@@ -134,7 +186,7 @@ async def stage_reuse(
         document_id,
         old_ids,
         temp_ids,
-        list(range(temporary_base, temporary_base + len(moves))),
+        [move.temporary_index for move in moves],
     )
     # Only a source LOCATION changed. Do not turn this bookkeeping into a content
     # edit: UUID/text/embedding/times/scopes/consolidation stamps remain untouched.
@@ -153,7 +205,7 @@ async def stage_reuse(
         document_id,
         old_ids,
     )
-    return StagedChunkReuse(moves=moves, moved_fact_count=len(units))
+    return len(units)
 
 
 async def finish_reuse(
@@ -163,10 +215,13 @@ async def finish_reuse(
     bank_id: str,
     document_id: str,
     staged: StagedChunkReuse,
-) -> None:
-    """Restore final chunk IDs after genuinely obsolete targets have been invalidated."""
+) -> int:
+    """Move references only AFTER the standard obsolete-source/observation sweep."""
     if not staged.moves:
-        return
+        return 0
+    moved_count = await _move_to_temporary(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, moves=staged.moves
+    )
     temp_ids = [move.temporary_id for move in staged.moves]
     target_ids = [move.target_id for move in staged.moves]
     await conn.execute(
@@ -199,3 +254,4 @@ async def finish_reuse(
         document_id,
         temp_ids,
     )
+    return moved_count
