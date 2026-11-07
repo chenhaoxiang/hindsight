@@ -186,8 +186,12 @@ are separately identifiable. A rejected or interrupted validation is retained as
   work around naming. The fork.3 overlay changes only nineteen production
   modules and the two version declarations, combining the previous reliability,
   refresh, trace, ranking-input and exact-title fixes with opt-in stable JSONL
-  chunk reuse. No newer API schema,
-  migration or unrelated main-branch feature is included. Keep regression tests
+  chunk reuse. It also backports only the append-composition fix from upstream
+  `30d547ba00989297057a9679f2d59f30a554b240` (#6293/#6354), already present in the
+  maintenance source: metadata-equivalent text/JSONL parts are chunked as their
+  stored body instead of shifting boundaries on the next append. Parts with
+  distinct metadata stay separate and JSON-array merging remains unchanged.
+  No newer API schema, migration or unrelated main-branch feature is included. Keep regression tests
   bound to the public reliability-fix source as well as the stable API export.
 - Coding Agents: `0.8.5` component tree at
   `02e498b1537f6aec14c5a799f5a0c193b8394869` equals its maintenance-start tree;
@@ -339,6 +343,12 @@ Source acceptance for this candidate:
   corrections, project identity, budgets and proposal/report authority; it is not
   a whole-bank or consolidation-quality score. Retain failed harness attempts and
   reuse completed outputs instead of repeatedly resampling paid extraction.
+
+The expanded stable-client check exposed a pre-existing repeated plain-text
+append duplicate, also reproduced against the previous immutable API. Its narrow
+upstream append-composition fix above is included rather than importing a newer
+whole API. This does not claim every oversized append is globally re-chunked:
+inputs outside the opt-in stable budget keep the established sliced path.
 
 Stable backport, independent review, PR/CI merge, immutable artifact publication,
 installation and feature activation remain separate delivery steps.

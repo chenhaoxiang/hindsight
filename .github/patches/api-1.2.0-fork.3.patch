@@ -1280,32 +1280,59 @@ index 000000000..ad0f7f2ef
 +                        task.cancel()
 +                await asyncio.gather(*tasks, return_exceptions=True)
 diff --git a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
-index 796a65125..b9fdf31e9 100644
+index 796a65125..054a361b0 100644
 --- a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 +++ b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 @@ -15 +15 @@ from collections.abc import Awaitable, Callable
 -from dataclasses import dataclass
 +from dataclasses import asdict, dataclass
-@@ -508,0 +509 @@ from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_
+@@ -240,0 +241,7 @@ def join_document_parts(texts: list[str]) -> str:
++def _same_fields_but_content(items: "list[RetainContentDict]") -> bool:
++    """Whether the items differ only in their content, i.e. one caller item plus the stored body
++    prepended as a copy of it. Attachment names describe each part's own text, so they don't count."""
++    rest = [{k: v for k, v in item.items() if k not in ("content", "attachment_filenames")} for item in items]
++    return all(r == rest[0] for r in rest[1:])
++
++
+@@ -508,0 +516 @@ from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_
 +from .stable_chunks import MAX_STABLE_SOURCE_CHARS, StableChunkPlan, is_jsonl_source, plan_stable_chunks
-@@ -2010,0 +2012,6 @@ async def retain_batch(
+@@ -1901,3 +1909,4 @@ async def retain_batch(
+-            # Collapse to the merged array when every part is one, so `original_text` stays valid
+-            # JSON (#2409). `merge_json_array_parts` is the same function the splitter predicts an
+-            # oversized append's body with, so the two cannot disagree about what this produces.
++            # Collapse the parts into ONE item. A JSON array when every part is one, so
++            # `original_text` stays valid JSON (#2409). `merge_json_array_parts` is the same function
++            # the splitter predicts an oversized append's body with, so the two cannot disagree
++            # about what this produces.
+@@ -1907 +1916,9 @@ async def retain_batch(
+-            _merged_text = merge_json_array_parts([_item.get("content", "") for _item in contents_dicts])
++            _parts = [_item.get("content", "") for _item in contents_dicts]
++            _merged_text = merge_json_array_parts(_parts)
++            if _merged_text is None and _same_fields_but_content(contents_dicts):
++                # Plain text and JSONL too (#6293): ONE item with the very body join_document_parts
++                # stores, so this append is chunked the way the next append re-chunks the stored
++                # body. As two items, the new text started its own chunks apart from the stored
++                # tail, and the next append shifted all their boundaries and re-extracted them.
++                # Items whose other fields differ (tags, metadata, timestamps) keep their own.
++                _merged_text = join_document_parts(_parts)
+@@ -2010,0 +2028,6 @@ async def retain_batch(
 +    stable_recovery_plan: StableChunkPlan | None = None
 +
 +    def preserve_recovery_layout(plan: StableChunkPlan) -> None:
 +        nonlocal stable_recovery_plan
 +        stable_recovery_plan = plan
 +
-@@ -2035,0 +2043,2 @@ async def retain_batch(
+@@ -2035,0 +2059,2 @@ async def retain_batch(
 +                single_input=original_count == 1,
 +                recovery_plan_callback=preserve_recovery_layout,
-@@ -2077,0 +2087,6 @@ async def retain_batch(
+@@ -2077,0 +2103,6 @@ async def retain_batch(
 +    if stable_recovery_plan is not None:
 +        # Resume missing chunks at the verified persisted positions, not at a
 +        # fresh greedy layout. Extraction remains producer/consumer bounded.
 +        all_pre_chunks = [chunk.text for chunk in stable_recovery_plan.chunks]
 +        chunk_to_content = [0] * len(all_pre_chunks)
 +
-@@ -2634,8 +2649,20 @@ async def _streaming_retain_batch(
+@@ -2634,8 +2665,20 @@ async def _streaming_retain_batch(
 -    try:
 -        if not force_reextract:
 -            existing_chunk_hashes = await _get_memories_recov().recovery_chunk_hashes(
@@ -1334,7 +1361,7 @@ index 796a65125..b9fdf31e9 100644
 +        else:
 +            complete_chunks = await asyncio.to_thread(
 +                _chunk_contents_for_delta, [RetainContent(content=combined_content)], config
-@@ -2643,5 +2670,15 @@ async def _streaming_retain_batch(
+@@ -2643,5 +2686,15 @@ async def _streaming_retain_batch(
 -            if existing_chunk_hashes:
 -                is_recovery = True
 -                log_buffer.append(
@@ -1355,7 +1382,7 @@ index 796a65125..b9fdf31e9 100644
 +                    expected_hashes=recovery_expected_hashes,
 +                    source_context=recovery_context,
 +                    source_strategy=recovery_strategy,
-@@ -2649,2 +2686,26 @@ async def _streaming_retain_batch(
+@@ -2649,2 +2702,26 @@ async def _streaming_retain_batch(
 -    except Exception:
 -        pass  # If we can't load, just process all chunks
 +            if compatible is None and not is_first_batch:
@@ -1384,10 +1411,10 @@ index 796a65125..b9fdf31e9 100644
 +            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
 +            "will skip matching positions and preserve existing data"
 +        )
-@@ -2665,2 +2725,0 @@ async def _streaming_retain_batch(
+@@ -2665,2 +2741,0 @@ async def _streaming_retain_batch(
 -    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
 -
-@@ -2825,0 +2885,20 @@ async def _streaming_retain_batch(
+@@ -2825,0 +2901,20 @@ async def _streaming_retain_batch(
 +    async def validate_streaming_write_layout(conn: Any) -> None:
 +        """One locked guard for all three SQL streaming write entrances."""
 +        if recovery_expected_hashes is None or (not is_recovery and not doc_tracking_done[0] and is_first_batch):
@@ -1408,24 +1435,24 @@ index 796a65125..b9fdf31e9 100644
 +                raise ConcurrentAppendConflict(message)
 +            raise RuntimeError(message)
 +
-@@ -2896 +2975,5 @@ async def _streaming_retain_batch(
+@@ -2896 +2991,5 @@ async def _streaming_retain_batch(
 -                if chunk_hash in existing_chunk_hashes:
 +                if (
 +                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
 +                    if recovery_positions is not None
 +                    else chunk_hash in existing_chunk_hashes
 +                ):
-@@ -3140,0 +3224 @@ async def _streaming_retain_batch(
+@@ -3140,0 +3240 @@ async def _streaming_retain_batch(
 +                        await validate_streaming_write_layout(conn)
-@@ -3343,0 +3428,2 @@ async def _streaming_retain_batch(
+@@ -3343,0 +3444,2 @@ async def _streaming_retain_batch(
 +                    await validate_streaming_write_layout(conn)
 +
-@@ -3601,0 +3688 @@ async def _streaming_retain_batch(
+@@ -3601,0 +3704 @@ async def _streaming_retain_batch(
 +                        await validate_streaming_write_layout(conn)
-@@ -3809,0 +3897,2 @@ async def _try_delta_retain(
+@@ -3809,0 +3913,2 @@ async def _try_delta_retain(
 +    single_input: bool = False,
 +    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
-@@ -3847,0 +3937,8 @@ async def _try_delta_retain(
+@@ -3847,0 +3953,8 @@ async def _try_delta_retain(
 +    stable_enabled = (
 +        bool(getattr(config, "retain_stable_chunks", False))
 +        and config.store_document_text
@@ -1434,13 +1461,13 @@ index 796a65125..b9fdf31e9 100644
 +        and not _store_owned_delta
 +        and _delta_store.supports_stable_chunk_reuse(pool)
 +    )
-@@ -3868 +3965 @@ async def _try_delta_retain(
+@@ -3868 +3981 @@ async def _try_delta_retain(
 -    if document_prefetch is not None and full_document_body is None:
 +    if document_prefetch is not None and full_document_body is None and not stable_enabled:
-@@ -3885 +3982 @@ async def _try_delta_retain(
+@@ -3885 +3998 @@ async def _try_delta_retain(
 -            include_text=full_document_body is not None,
 +            include_text=full_document_body is not None or stable_enabled,
-@@ -3923 +4020,35 @@ async def _try_delta_retain(
+@@ -3923 +4036,35 @@ async def _try_delta_retain(
 -    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
 +    stable_plan: StableChunkPlan | None = None
 +    if stable_enabled:
@@ -1477,7 +1504,7 @@ index 796a65125..b9fdf31e9 100644
 +    new_chunks_with_contents = (
 +        stable_plan.texts if stable_plan is not None else _chunk_contents_for_delta(_diff_contents, config)
 +    )
-@@ -3936,6 +4067,14 @@ async def _try_delta_retain(
+@@ -3936,6 +4083,14 @@ async def _try_delta_retain(
 -
 -    log_buffer.append(
 -        f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
@@ -1498,16 +1525,16 @@ index 796a65125..b9fdf31e9 100644
 +            f"{len(changed_indices)} changed, {len(new_indices)} new, "
 +            f"{len(removed_indices)} removed"
 +        )
-@@ -3984,0 +4124,2 @@ async def _try_delta_retain(
+@@ -3984,0 +4140,2 @@ async def _try_delta_retain(
 +        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
 +            recovery_plan_callback(stable_plan)
-@@ -4103 +4244,4 @@ async def _try_delta_retain(
+@@ -4103 +4260,4 @@ async def _try_delta_retain(
 -    meta_token = set_call_metadata({"document_id": effective_doc_id})
 +    call_metadata: dict[str, Any] = {"document_id": effective_doc_id}
 +    if stable_plan is not None:
 +        call_metadata["chunk_reuse"] = asdict(stable_plan.stats)
 +    meta_token = set_call_metadata(call_metadata)
-@@ -4203,0 +4348,13 @@ async def _try_delta_retain(
+@@ -4203,0 +4364,13 @@ async def _try_delta_retain(
 +                staged_reuse = None
 +                if stable_plan is not None:
 +                    staged_reuse = await _delta_store.stage_stable_chunk_reuse(
@@ -1521,7 +1548,7 @@ index 796a65125..b9fdf31e9 100644
 +                        log_buffer.append("[delta] Chunk snapshot moved before reuse; preserving it and falling back")
 +                        return False
 +
-@@ -4242,5 +4399,9 @@ async def _try_delta_retain(
+@@ -4242,5 +4415,9 @@ async def _try_delta_retain(
 -                chunks_to_delete = [
 -                    existing_by_index[idx].chunk_id
 -                    for idx in changed_indices + removed_indices
@@ -1536,7 +1563,7 @@ index 796a65125..b9fdf31e9 100644
 +                        if idx in existing_by_index
 +                    ]
 +                )
-@@ -4252,2 +4413,6 @@ async def _try_delta_retain(
+@@ -4252,2 +4429,6 @@ async def _try_delta_retain(
 -                    f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 -                    f"invalidated {invalidated_obs} observation(s) "
 +                    + (
@@ -1545,7 +1572,7 @@ index 796a65125..b9fdf31e9 100644
 +                        else f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 +                    )
 +                    + f"invalidated {invalidated_obs} observation(s) "
-@@ -4256,0 +4422,21 @@ async def _try_delta_retain(
+@@ -4256,0 +4438,21 @@ async def _try_delta_retain(
 +                if staged_reuse is not None and stable_plan is not None:
 +                    moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
 +                        conn=conn,
@@ -1567,7 +1594,7 @@ index 796a65125..b9fdf31e9 100644
 +                            json.dumps(asdict(summary)),
 +                        )
 +
-@@ -4367,0 +4554,6 @@ async def _try_delta_retain(
+@@ -4367,0 +4570,6 @@ async def _try_delta_retain(
 +    if stable_plan is not None:
 +        # Delta content slots address changed chunks, not caller input slots. This
 +        # bounded path accepts ONE original input, including an append's prepend.
