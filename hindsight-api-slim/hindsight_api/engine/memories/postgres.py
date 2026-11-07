@@ -65,12 +65,14 @@ from .pg import counts, curation, documents, engine_curation, graph, reads, writ
 from .pg import expand as pg_expand
 from .pg import links as pg_links
 from .pg import retain as pg_retain
+from .pg import stable_chunks as pg_stable_chunks
 from .pg import transfer as pg_transfer
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..consolidation.consolidator import _TemporalBounds
     from ..embeddings import Embeddings
     from ..response_models import MemoryFact
+    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
     from ..retain.types import CausalRelation, ProcessedFact
     from ..search.graph_retrieval import GraphRetriever
     from ..transfer.export import _LoadedExport, _UnitLocation
@@ -1209,6 +1211,68 @@ class PostgresMemories(MemoriesExtension):
     ) -> DocumentChunkState:
         return await pg_retain.load_document_chunks(
             pool=backend, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, include_text=include_text
+        )
+
+    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
+        return backend.backend_type == "postgresql"
+
+    async def load_stable_chunks(
+        self,
+        *,
+        backend: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        source_context: str | None = None,
+        source_strategy: str | None = None,
+    ) -> list["ChunkSnapshot"]:
+        from ..db_utils import acquire_with_retry
+
+        async with acquire_with_retry(backend) as conn:
+            return await pg_stable_chunks.load_chunks(
+                conn=conn,
+                fq_table=fq_store_table,
+                bank_id=bank_id,
+                document_id=document_id,
+                source_context=source_context,
+                source_strategy=source_strategy,
+            )
+
+    async def compatible_recovery_chunks(
+        self,
+        *,
+        conn: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        content_hash: str,
+        expected_hashes: dict[int, str],
+        source_context: str | None,
+        source_strategy: str | None,
+    ) -> dict[int, str] | None:
+        return await pg_stable_chunks.compatible_recovery_chunks(
+            conn=conn,
+            fq_table=fq_store_table,
+            bank_id=bank_id,
+            document_id=document_id,
+            content_hash=content_hash,
+            expected_hashes=expected_hashes,
+            source_context=source_context,
+            source_strategy=source_strategy,
+        )
+
+    async def stage_stable_chunk_reuse(
+        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
+    ) -> "StagedChunkReuse | None":
+        return await pg_stable_chunks.stage_reuse(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, plan=plan
+        )
+
+    async def finish_stable_chunk_reuse(
+        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
+    ) -> int:
+        return await pg_stable_chunks.finish_reuse(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, staged=staged
         )
 
     async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:

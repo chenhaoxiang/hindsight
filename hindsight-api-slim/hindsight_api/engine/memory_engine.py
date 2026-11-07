@@ -7541,8 +7541,58 @@ class MemoryEngine(MemoryEngineInterface):
         # for slice 1: the delta check runs for the handful of documents in that slice and is
         # silently skipped for every other document in the retain.
         #
-        # Postgres keeps splitting. Its writes really are per sub-batch, so the bound is real there.
+        # Postgres normally keeps splitting: each slice commits independently. A
+        # bounded, opt-in single-document reuse pass must finish the WHOLE delta,
+        # however: later greedy slices would otherwise overwrite its anchored suffix
+        # and replace precisely the facts it just preserved. The orchestrator still
+        # bounds extraction concurrency, and unsupported plans retain its streaming
+        # fallback. Larger/multi-document inputs keep the old token splitter.
+        bounded_stable_pass = False
+        retain_config = None
         if retain_session is None and total_tokens > tokens_per_batch:
+            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
+            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, fits_stable_chunk_budget, is_jsonl_source
+
+            bounded_stable_pass = (
+                retain_config.retain_stable_chunks
+                and retain_config.store_document_text
+                and len(contents) == 1
+                and bool(document_id or contents[0].get("document_id"))
+                and len(contents[0].get("content", "")) <= MAX_STABLE_SOURCE_CHARS
+                and _store.supports_stable_chunk_reuse(self._backend)
+            )
+            if bounded_stable_pass:
+                from .retain import attachment_content, fact_storage
+
+                incoming = contents[0].get("content", "")
+                candidate_body = incoming
+                appending = contents[0].get("update_mode") == "append"
+                bounded_stable_pass = not attachment_content.contains_attachment(incoming) and await asyncio.to_thread(
+                    is_jsonl_source, incoming, 1 if appending else 2
+                )
+                if bounded_stable_pass and appending:
+                    # A tail's size alone does not bound the complete append. Keep
+                    # oversized/format-changing bases on the existing sliced path.
+                    async with acquire_with_retry(await self._get_backend()) as conn:
+                        base_text = await fact_storage.get_document_content(
+                            conn, bank_id, document_id or contents[0]["document_id"]
+                        )
+                    bounded_stable_pass = (
+                        base_text is not None
+                        and len(base_text) + len(incoming) + 1 <= MAX_STABLE_SOURCE_CHARS
+                        and not attachment_content.contains_attachment(base_text)
+                        and await asyncio.to_thread(is_jsonl_source, base_text)
+                    )
+                    if bounded_stable_pass:
+                        candidate_body = base_text + "\n" + incoming
+                if bounded_stable_pass:
+                    bounded_stable_pass = await asyncio.to_thread(
+                        fits_stable_chunk_budget,
+                        candidate_body,
+                        retain_config.retain_chunk_size,
+                        retain_config.retain_structured_chunk_size,
+                    )
+        if retain_session is None and total_tokens > tokens_per_batch and not bounded_stable_pass:
             # Split into smaller batches based on token count
             logger.info(
                 f"Large batch detected ({total_tokens:,} tokens from {len(contents)} items). Splitting into sub-batches of ~{tokens_per_batch:,} tokens each..."
@@ -7552,7 +7602,7 @@ class MemoryEngine(MemoryEngineInterface):
             # retain config before splitting — the splitter and the orchestrator
             # must chunk identically for the slices to line up with what gets
             # stored (see _split_contents_into_sub_batches).
-            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
+            assert retain_config is not None
             chunking_config = self._retain_chunking_config(retain_config)
 
             # In update_mode="append", retain_batch prepends the existing document

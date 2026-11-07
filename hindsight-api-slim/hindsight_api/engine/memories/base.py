@@ -57,6 +57,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..consolidation.consolidator import _TemporalBounds
     from ..embeddings import Embeddings
     from ..response_models import MemoryFact
+    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
     from ..retain.types import CausalRelation, EmbeddingLike, EntityResolutionResult, ProcessedFact
     from ..search.retrieval import GraphRetriever
     from ..transfer.export import _LoadedExport, _UnitLocation
@@ -3591,6 +3592,51 @@ class MemoriesExtension(Extension, ABC):
         connection for the two reads. Here ONE record read."""
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id, include_text=include_text)
         return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=include_text)
+
+    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
+        """Whether this store can atomically relocate chunk FKs without replacing facts.
+
+        Opt-in capability: external stores and Oracle keep their established retain
+        path until they implement equivalent reference/transaction guarantees.
+        """
+        return False
+
+    async def load_stable_chunks(
+        self,
+        *,
+        backend: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        source_context: str | None = None,
+        source_strategy: str | None = None,
+    ) -> list["ChunkSnapshot"]:
+        return []
+
+    async def compatible_recovery_chunks(
+        self,
+        *,
+        conn: Any,
+        fq_table: Callable[[str], str],
+        bank_id: str,
+        document_id: str,
+        content_hash: str,
+        expected_hashes: dict[int, str],
+        source_context: str | None,
+        source_strategy: str | None,
+    ) -> dict[int, str] | None:
+        """Position-bound recovery for stores supporting stable layouts; None declines."""
+        return None
+
+    async def stage_stable_chunk_reuse(
+        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
+    ) -> "StagedChunkReuse | None":
+        return None
+
+    async def finish_stable_chunk_reuse(
+        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
+    ) -> int:
+        raise NotImplementedError("Store does not support atomic stable chunk reuse")
 
     async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:
         """The document's chunks (id, index, content hash), in chunk order."""

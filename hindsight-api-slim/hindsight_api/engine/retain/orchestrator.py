@@ -12,7 +12,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, tzinfo
 from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
@@ -514,6 +514,7 @@ from . import timing as _timing
 from .embedding_coalescer import CoalescingEmbedder
 from .entity_labels import label_tag_keys
 from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_bytes
+from .stable_chunks import MAX_STABLE_SOURCE_CHARS, StableChunkPlan, is_jsonl_source, plan_stable_chunks
 from .types import (
     CausalRelation,
     ChunkMetadata,
@@ -2031,6 +2032,12 @@ async def retain_batch(
     # delta ran with no concurrency control at all.
     from ..memories import get_memories as _get_memories_delta
 
+    stable_recovery_plan: StableChunkPlan | None = None
+
+    def preserve_recovery_layout(plan: StableChunkPlan) -> None:
+        nonlocal stable_recovery_plan
+        stable_recovery_plan = plan
+
     _delta_provider = _get_memories_delta()
     if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
         with track_observation_changes() as delta_changes:
@@ -2056,6 +2063,8 @@ async def retain_batch(
                 document_prefetch=document_prefetch,
                 full_document_body=full_document_body,
                 delta_full_body=_delta_full_body,
+                single_input=original_count == 1,
+                recovery_plan_callback=preserve_recovery_layout,
                 document_body_hash=document_body_hash,
                 append_base_hash=append_base_hash,
                 attachment_loader=attachment_loader,
@@ -2097,6 +2106,12 @@ async def retain_batch(
         ):
             all_pre_chunks.append(chunk)
             chunk_to_content.append(content_idx)
+
+    if stable_recovery_plan is not None:
+        # Resume missing chunks at the verified persisted positions, not at a
+        # fresh greedy layout. Extraction remains producer/consumer bounded.
+        all_pre_chunks = [chunk.text for chunk in stable_recovery_plan.chunks]
+        chunk_to_content = [0] * len(all_pre_chunks)
 
     # Memory: after chunking, the original content bodies in RetainContent are
     # no longer needed (all_pre_chunks holds the working set). Clear them so
@@ -2657,23 +2672,69 @@ async def _streaming_retain_batch(
     # preserves every existing unit and skips every matching chunk, which is exactly the
     # silent no-op #3899 reports. Skipping the probe also skips its two queries.
     # `conn` is the pool: only Postgres acquires a connection for the probe.
-    try:
-        if not force_reextract:
-            existing_chunk_hashes = await _get_memories_recov().recovery_chunk_hashes(
-                backend=pool,
-                fq_table=fq_table,
-                bank_id=bank_id,
-                document_id=effective_doc_id,
-                content_hash=new_content_hash,
+    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
+    recovery_store = _get_memories_recov()
+    recovery_expected_hashes: dict[int, str] | None = None
+    recovery_positions: dict[int, str] | None = None
+    recovery_context = retain_params.get("context") or None
+    recovery_strategy = retain_params.get("strategy") or None
+    if (
+        recovery_store.supports_stable_chunk_reuse(pool)
+        and len(combined_content) <= MAX_STABLE_SOURCE_CHARS
+        and await asyncio.to_thread(is_jsonl_source, combined_content)
+    ):
+        # This remains active when the feature is turned OFF: existing non-greedy
+        # layouts still exist. Same body != same layout/extraction contract.
+        if full_document_body is None:
+            recovery_expected_hashes = {
+                chunk_index_offset + i: chunk_storage.compute_chunk_hash(text) for i, text in enumerate(all_pre_chunks)
+            }
+        else:
+            complete_chunks = await asyncio.to_thread(
+                _chunk_contents_for_delta, [RetainContent(content=combined_content)], config
             )
-            if existing_chunk_hashes:
-                is_recovery = True
-                log_buffer.append(
-                    f"[streaming] RECOVERY: found {len(existing_chunk_hashes)} already-committed chunks — "
-                    f"will skip matching and preserve existing data"
+            recovery_expected_hashes = {
+                index: chunk_storage.compute_chunk_hash(text) for index, text in complete_chunks.items()
+            }
+        recovery_positions = {}
+        if not force_reextract:
+            async with acquire_with_retry(pool) as conn:
+                compatible = await recovery_store.compatible_recovery_chunks(
+                    conn=conn,
+                    fq_table=fq_table,
+                    bank_id=bank_id,
+                    document_id=effective_doc_id,
+                    content_hash=new_content_hash,
+                    expected_hashes=recovery_expected_hashes,
+                    source_context=recovery_context,
+                    source_strategy=recovery_strategy,
                 )
-    except Exception:
-        pass  # If we can't load, just process all chunks
+            if compatible is None and not is_first_batch:
+                message = "Document layout or extraction contract changed between retain slices; retry"
+                if append_base_hash is not None:
+                    raise ConcurrentAppendConflict(message)
+                raise RuntimeError(message)
+            recovery_positions = compatible or {}
+            is_recovery = bool(recovery_positions)
+    else:
+        try:
+            if not force_reextract:
+                existing_chunk_hashes = await recovery_store.recovery_chunk_hashes(
+                    backend=pool,
+                    fq_table=fq_table,
+                    bank_id=bank_id,
+                    document_id=effective_doc_id,
+                    content_hash=new_content_hash,
+                )
+                is_recovery = bool(existing_chunk_hashes)
+        except Exception:
+            pass  # Legacy stores keep their existing recovery behavior.
+    if is_recovery:
+        committed = len(recovery_positions) if recovery_positions is not None else len(existing_chunk_hashes)
+        log_buffer.append(
+            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
+            "will skip matching positions and preserve existing data"
+        )
 
     # ---------------------------------------------------------------------------
     # Document tracking is DEFERRED to the first consumer batch TXN.
@@ -2688,8 +2749,6 @@ async def _streaming_retain_batch(
     # workers. Each batch TXN also verifies document ownership via content_hash
     # to detect when a concurrent request has taken over the document.
     # See _run_mini_batch_db_work() for the implementation.
-    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
-
     # Route the document's bulky bodies (extracted text + ordered chunk texts) to the store's
     # dedicated document store when it owns one — up front, before the streaming batches
     # write facts. Idempotent and content-addressed, so this is safe here and dedups a re-ingest;
@@ -2849,6 +2908,26 @@ async def _streaming_retain_batch(
             f"Document {effective_doc_id} was updated by a concurrent retain while this append was extracting"
         )
 
+    async def validate_streaming_write_layout(conn: Any) -> None:
+        """One locked guard for all three SQL streaming write entrances."""
+        if recovery_expected_hashes is None or (not is_recovery and not doc_tracking_done[0] and is_first_batch):
+            return
+        compatible = await recovery_store.compatible_recovery_chunks(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            document_id=effective_doc_id,
+            content_hash=new_content_hash,
+            expected_hashes=recovery_expected_hashes,
+            source_context=recovery_context,
+            source_strategy=recovery_strategy,
+        )
+        if compatible is None:
+            message = "Document layout or extraction contract changed before streaming write; retry"
+            if append_base_hash is not None:
+                raise ConcurrentAppendConflict(message)
+            raise RuntimeError(message)
+
     # Every chunk task embeds only its own chunk's facts, which makes each embedding
     # call one text wide — and in `chunks` extraction mode, where there is no LLM call
     # to overlap, that single round trip is the whole per-chunk cost (issue #3784).
@@ -2919,7 +2998,11 @@ async def _streaming_retain_batch(
         try:
             for i, chunk_text in enumerate(all_pre_chunks):
                 chunk_hash = chunk_storage.compute_chunk_hash(chunk_text)
-                if chunk_hash in existing_chunk_hashes:
+                if (
+                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
+                    if recovery_positions is not None
+                    else chunk_hash in existing_chunk_hashes
+                ):
                     # Memory: skipped chunks aren't needed either.
                     all_pre_chunks[i] = ""
                     skipped_total += 1
@@ -3164,6 +3247,7 @@ async def _streaming_retain_batch(
                             document_id=effective_doc_id,
                         )
                         _assert_append_base_unchanged(existing_hash)
+                        await validate_streaming_write_layout(conn)
                         if is_recovery:
                             await fact_storage.upsert_document_metadata(
                                 conn,
@@ -3366,6 +3450,8 @@ async def _streaming_retain_batch(
                         bank_id=bank_id,
                         document_id=effective_doc_id,
                     )
+
+                    await validate_streaming_write_layout(conn)
 
                     if not doc_tracking_done[0]:
                         # Append compare-and-swap, under the row lock and before any write: an
@@ -3625,6 +3711,7 @@ async def _streaming_retain_batch(
                         await _edge_provider.lock_pending_document(
                             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
                         )
+                        await validate_streaming_write_layout(conn)
                         if is_recovery:
                             await fact_storage.upsert_document_metadata(
                                 conn,
@@ -3833,6 +3920,8 @@ async def _try_delta_retain(
     # `full_document_body`, which is what gets WRITTEN — the two are the same for a replacement and
     # deliberately not for an append.
     delta_full_body: str | None = None,
+    single_input: bool = False,
+    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
     document_body_hash: str | None = None,
     append_base_hash: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
@@ -3871,6 +3960,14 @@ async def _try_delta_retain(
 
     _delta_store = _get_memories_delta()
     _store_owned_delta = _delta_store.store_owned_for(bank_id)
+    stable_enabled = (
+        bool(getattr(config, "retain_stable_chunks", False))
+        and config.store_document_text
+        and single_input
+        and full_document_body is None  # Never complete a whole plan inside a greedy slice.
+        and not _store_owned_delta
+        and _delta_store.supports_stable_chunk_reuse(pool)
+    )
 
     # Need a single document_id
     effective_doc_id = document_id
@@ -3891,7 +3988,7 @@ async def _try_delta_retain(
     # document's record in one read; that answers here when no text is wanted (the prefetch
     # deliberately carries no bodies, so an append still reads its own). Absent from the prefetch
     # means the document does not exist — an answer, not a miss to retry.
-    if document_prefetch is not None and full_document_body is None:
+    if document_prefetch is not None and full_document_body is None and not stable_enabled:
         # May be the in-flight read rather than its result -- see where it is started. Resolved
         # here, which is the first point that actually needs it.
         if isinstance(document_prefetch, asyncio.Task):
@@ -3908,7 +4005,7 @@ async def _try_delta_retain(
             fq_table=fq_table,
             bank_id=bank_id,
             document_id=effective_doc_id,
-            include_text=full_document_body is not None,
+            include_text=full_document_body is not None or stable_enabled,
         )
     doc_hash_at_load = state.content_hash
     original_text_at_load = state.original_text
@@ -3946,7 +4043,41 @@ async def _try_delta_retain(
     # `contents` — see the gate in `retain_batch`.
     step_start = time.perf_counter()
     _diff_contents = [RetainContent(content=delta_full_body)] if delta_full_body is not None else contents
-    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
+    stable_plan: StableChunkPlan | None = None
+    if stable_enabled:
+        reuse_params = _build_retain_params(contents_dicts, document_tags)[0]
+        source_context = reuse_params.get("context") or None
+        source_strategy = reuse_params.get("strategy") or None
+        snapshots = await _delta_store.load_stable_chunks(
+            backend=pool,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            document_id=effective_doc_id,
+            source_context=source_context,
+            source_strategy=source_strategy,
+        )
+        if {(s.chunk_id, s.chunk_index, s.content_hash) for s in snapshots} != {
+            (s.chunk_id, s.chunk_index, s.content_hash) for s in existing_chunks
+        }:
+            return None  # Snapshot moved, including same-hash sliced recovery.
+        new_body = "\n".join(content.content for content in contents)
+        stable_plan = await asyncio.to_thread(
+            plan_stable_chunks,
+            original_text_at_load,
+            new_body,
+            snapshots,
+            max_chars=config.retain_chunk_size,
+            structured_chunk_size=config.retain_structured_chunk_size,
+            source_context=source_context,
+            source_strategy=source_strategy,
+        )
+        if stable_plan is not None:
+            # Same-body retries with unfinished chunks must resume through streaming,
+            # not buy one large atomic extraction of everything not yet written.
+            document_body_hash = hashlib.sha256(new_body.encode()).hexdigest()
+    new_chunks_with_contents = (
+        stable_plan.texts if stable_plan is not None else _chunk_contents_for_delta(_diff_contents, config)
+    )
     log_buffer.append(
         f"[delta] Chunked new content: {len(new_chunks_with_contents)} chunks in {time.perf_counter() - step_start:.3f}s"
     )
@@ -3959,12 +4090,20 @@ async def _try_delta_retain(
     changed_indices = diff.changed
     new_indices = diff.new
     removed_indices = diff.removed
+    if stable_plan is not None:
+        unchanged_indices = [chunk.chunk_index for chunk in stable_plan.chunks if chunk.reuse_from is not None]
+        changed_indices = [i for i in stable_plan.extraction_indices if i in existing_by_index]
+        new_indices = [i for i in stable_plan.extraction_indices if i not in existing_by_index]
+        retired = set(stable_plan.obsolete_ids)
+        removed_indices = [chunk.chunk_index for chunk in stable_plan.old_chunks if chunk.chunk_id in retired]
+        log_buffer.append(f"[delta] Stable chunk reuse: {asdict(stable_plan.stats)}")
 
-    log_buffer.append(
-        f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
-        f"{len(changed_indices)} changed, {len(new_indices)} new, "
-        f"{len(removed_indices)} removed"
-    )
+    if stable_plan is None:
+        log_buffer.append(
+            f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
+            f"{len(changed_indices)} changed, {len(new_indices)} new, "
+            f"{len(removed_indices)} removed"
+        )
 
     if not unchanged_indices:
         # `delta_full_body`, not `full_document_body`: this branch is the OVERSIZED REPLACEMENT
@@ -4008,6 +4147,8 @@ async def _try_delta_retain(
     # path resumes the same work slice by slice instead: its recovery probe matches this same hash
     # and skips the committed chunks.
     if chunks_to_process and document_body_hash is not None and doc_hash_at_load == document_body_hash:
+        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
+            recovery_plan_callback(stable_plan)
         log_buffer.append(
             f"[delta] Document {effective_doc_id} is a partially written copy of this body — "
             f"resuming slice by slice instead of extracting {len(chunks_to_process)} chunks at once"
@@ -4126,7 +4267,10 @@ async def _try_delta_retain(
     # to it (a document accrues one trace per full/delta retain).
     from ..llm_trace import reset_call_metadata, set_call_metadata
 
-    meta_token = set_call_metadata({"document_id": effective_doc_id})
+    call_metadata: dict[str, Any] = {"document_id": effective_doc_id}
+    if stable_plan is not None:
+        call_metadata["chunk_reuse"] = asdict(stable_plan.stats)
+    meta_token = set_call_metadata(call_metadata)
     try:
         embedded = await _extract_and_embed(
             delta_contents,
@@ -4227,6 +4371,19 @@ async def _try_delta_retain(
                     # an append) verifies the base this content was built on.
                     return False
 
+                staged_reuse = None
+                if stable_plan is not None:
+                    staged_reuse = await _delta_store.stage_stable_chunk_reuse(
+                        conn=conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        document_id=effective_doc_id,
+                        plan=stable_plan,
+                    )
+                    if staged_reuse is None:
+                        log_buffer.append("[delta] Chunk snapshot moved before reuse; preserving it and falling back")
+                        return False
+
                 # Update document metadata (no delete)
                 step_start = time.perf_counter()
                 # When this sub-batch is one slice of an oversized item
@@ -4265,20 +4422,49 @@ async def _try_delta_retain(
 
                 # Delete changed and removed chunks (cascades to memory_units and links)
                 step_start = time.perf_counter()
-                chunks_to_delete = [
-                    existing_by_index[idx].chunk_id
-                    for idx in changed_indices + removed_indices
-                    if idx in existing_by_index
-                ]
+                chunks_to_delete = (
+                    stable_plan.obsolete_ids
+                    if stable_plan is not None
+                    else [
+                        existing_by_index[idx].chunk_id
+                        for idx in changed_indices + removed_indices
+                        if idx in existing_by_index
+                    ]
+                )
                 invalidated_obs = await chunk_storage.delete_chunks_by_ids(
                     conn, chunks_to_delete, bank_id, ops=pool.ops
                 )
                 log_buffer.append(
                     f"  Deleted {len(chunks_to_delete)} chunks "
-                    f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
-                    f"invalidated {invalidated_obs} observation(s) "
+                    + (
+                        "(retired source chunks), "
+                        if stable_plan is not None
+                        else f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
+                    )
+                    + f"invalidated {invalidated_obs} observation(s) "
                     f"in {time.perf_counter() - step_start:.3f}s"
                 )
+
+                if staged_reuse is not None and stable_plan is not None:
+                    moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
+                        conn=conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        document_id=effective_doc_id,
+                        staged=staged_reuse,
+                    )
+                    if operation_id:
+                        from dataclasses import replace
+
+                        summary = replace(stable_plan.stats, moved_fact_refs=moved_fact_count)
+                        await conn.execute(
+                            f"UPDATE {fq_table('async_operations')} SET result_metadata = "
+                            "COALESCE(result_metadata, '{}'::jsonb) || jsonb_build_object('chunk_reuse', $3::jsonb) "
+                            "WHERE bank_id = $1 AND operation_id = $2",
+                            bank_id,
+                            uuid.UUID(str(operation_id)),
+                            json.dumps(asdict(summary)),
+                        )
 
                 # Changed/removed units were deleted above. Sync unchanged
                 # survivors; new/changed units inserted below already carry
@@ -4391,6 +4577,12 @@ async def _try_delta_retain(
     # changed/new chunks (see ``_build_delta_contents``) — i.e. exactly what
     # the LLM pipeline saw this call. Unchanged chunks contribute zero.
     processed_tokens = _count_delta_content_tokens(delta_contents)
+    if stable_plan is not None:
+        # Delta content slots address changed chunks, not caller input slots. This
+        # bounded path accepts ONE original input, including an append's prepend.
+        # Flatten all created chunk results back into that one slot, never dropping
+        # ids beyond the first changed chunk at the splitter/group merge seam.
+        result_unit_ids = [[identity for ids in result_unit_ids for identity in ids]]
     return RetainBatchResult(result_unit_ids, usage, processed_tokens)
 
 

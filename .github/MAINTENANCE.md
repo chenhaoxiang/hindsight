@@ -175,17 +175,23 @@ are separately identifiable. A rejected or interrupted validation is retained as
 ### Fixed component build inputs
 
 - API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
-  plus [.github/patches/api-1.2.0-fork.2.patch](patches/api-1.2.0-fork.2.patch)
-  for the refresh-resilience candidate. Preserve the previously released
-  [fork.1 overlay](patches/api-1.2.0-fork.1.patch) unchanged.
-  Candidate public API identity and release naming are `1.2.0-fork.2`; Python
-  distribution metadata and wheel names use the equivalent `1.2.0+fork.2`. PEP 440 rejects
-  `1.2.0-fork.2`, while the local-version form satisfies the existing full wrapper
+  plus [.github/patches/api-1.2.0-fork.3.patch](patches/api-1.2.0-fork.3.patch)
+  for the incremental-retain candidate. Preserve the previously released
+  [fork.1 overlay](patches/api-1.2.0-fork.1.patch) and
+  [fork.2 overlay](patches/api-1.2.0-fork.2.patch) unchanged.
+  Candidate public API identity and release naming are `1.2.0-fork.3`; Python
+  distribution metadata and wheel names use the equivalent `1.2.0+fork.3`. PEP 440 rejects
+  `1.2.0-fork.3`, while the local-version form satisfies the existing full wrapper
   dependency `==1.2.0`. Do not use a post-release or change that dependency to
-  work around naming. The fork.2 overlay changes only fourteen production
-  modules and the two version declarations, combining the previous reliability
-  fixes with the scoped refresh, trace, ranking-input and exact-title changes. No newer API schema,
-  migration or unrelated main-branch feature is included. Keep regression tests
+  work around naming. The fork.3 overlay changes only nineteen production
+  modules and the two version declarations, combining the previous reliability,
+  refresh, trace, ranking-input and exact-title fixes with opt-in stable JSONL
+  chunk reuse. It also backports only the append-composition fix from upstream
+  `30d547ba00989297057a9679f2d59f30a554b240` (#6293/#6354), already present in the
+  maintenance source: metadata-equivalent text/JSONL parts are chunked as their
+  stored body instead of shifting boundaries on the next append. Parts with
+  distinct metadata stay separate and JSON-array merging remains unchanged.
+  No newer API schema, migration or unrelated main-branch feature is included. Keep regression tests
   bound to the public reliability-fix source as well as the stable API export.
 - Coding Agents: `0.8.5` component tree at
   `02e498b1537f6aec14c5a799f5a0c193b8394869` equals its maintenance-start tree;
@@ -196,7 +202,7 @@ are separately identifiable. A rejected or interrupted validation is retained as
 Build only from committed public source into ignored temporary directories. A
 fresh API export can be prepared with `git archive` at the exact API base. From
 the maintenance repository root, apply the committed zero-context overlay with
-`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.2.patch`.
+`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.3.patch`.
 Use a fresh export and verify the resulting source bytes; this avoids patch-tool
 backup files entering the package. Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
@@ -274,6 +280,78 @@ Any real quality sample is bounded and judged separately; generated text being
 nonempty is not semantic acceptance. Operational traces and real recovery data
 stay outside the public repository. No bulk replay, bank split, global relabeling,
 worker-concurrency increase or removal of consistency guards is part of this batch.
+
+## Incremental-retain optimization follow-up
+
+Approved order for the next focused batch:
+
+1. Compare internal candidate reads/round caps of `50/100` with `48/96` while
+   keeping LLM batches at 8, the current model/reasoning, evidence budgets and
+   shared-scope serialization. Check effective overrides and preserve rollback.
+   This is a small possible packing gain, not a capacity or quality guarantee.
+2. Reuse complete, byte-identical old chunks in source order and re-cut changed
+   gaps, avoiding the boundary cascade after historical JSONL insertions/deletions.
+   Preserve unchanged fact IDs, embeddings and valid observation evidence while
+   atomically maintaining correct chunk positions/references. Real edits/deletions
+   still invalidate their sources. Keep CAS, cancellation, retries and explicit
+   re-extraction intact; unsupported/ambiguous cases retain the safe old path.
+3. Add only the diagnostic counts/reasons needed to distinguish new work from
+   reconstruction. Do not log source text, credentials or private paths.
+4. Validate with isolated synthetic lifecycle and published-client stories, then
+   a bounded quality comparison before activation. Backport to the independently
+   pinned stable API and publish a new immutable `-fork.N` component artifact.
+
+Do not change the global splitter of every populated document, the public chunk-ID
+format, schema, embedding, model/reasoning, evidence budgets or shared write
+concurrency. No whole-bank replay/refresh or silent historical relabeling. The
+source-specific retraction-readiness proposal is a separate future contract,
+not part of this batch. Preserve input/source integrity instead of treating fewer
+calls or nonempty generated text as semantic acceptance.
+
+Source acceptance for this candidate:
+
+- `HINDSIGHT_API_RETAIN_STABLE_CHUNKS` is off by default and bank-configurable.
+  PostgreSQL reuse is limited to one JSONL document of at most 2 Mi characters
+  and 512 chunks. Attachments, ambiguous anchors, unsupported stores and changed
+  extraction context/strategy are not silently reused. Normal forced reprocessing
+  still extracts the source again.
+- Relocation keeps fact UUIDs, text, embeddings, creation/update/consolidation times
+  and observation evidence unchanged. Genuine edits still invalidate their facts
+  and observations. Rollback, task cancellation, stale same-hash recovery,
+  concurrent append and cross-bank isolation have dedicated store regressions.
+- A committed queued stable delta records bounded `chunk_reuse` counts on its
+  executing operation; a receipt parent is not an aggregate of these counts.
+  Metadata-only/no-op retains intentionally omit them: absence is not a zero-work
+  or reuse aggregate. Source text is not added to these diagnostic fields.
+- Recovery binds hashes to chunk positions and rechecks layout and extraction
+  context/strategy under the document lock, including after the flag is disabled.
+  A partial stable layout resumes its verified positions through the bounded
+  producer/consumer pipeline. Incompatible layouts retire old sources normally;
+  all three SQL streaming write entrances (including a 0-fact consumer batch)
+  recheck under the lock. Concurrent append conflicts retain their typed retry/
+  defer behavior instead of becoming terminal generic failures.
+  Staging prelocks the union of document facts, retiring observations and their
+  surviving co-sources in one UUID order, revalidating expansions before writes.
+  The standard obsolete-source sweep then runs before moving facts; lock-only
+  moving sources never become retirement inputs. This covers shared-source
+  observations split across more than one observation row.
+- The internal packing comparison is not adopted: mechanical packing tests alone
+  cannot establish semantic equivalence. Retain the previous configuration when
+  a bounded quality trial is inconclusive; do not rewind memory data.
+- Real-model synthetic extraction and independent semantic adjudication are
+  separate from deterministic lifecycle tests. The narrow sample covers dated
+  corrections, project identity, budgets and proposal/report authority; it is not
+  a whole-bank or consolidation-quality score. Retain failed harness attempts and
+  reuse completed outputs instead of repeatedly resampling paid extraction.
+
+The expanded stable-client check exposed a pre-existing repeated plain-text
+append duplicate, also reproduced against the previous immutable API. Its narrow
+upstream append-composition fix above is included rather than importing a newer
+whole API. This does not claim every oversized append is globally re-chunked:
+inputs outside the opt-in stable budget keep the established sliced path.
+
+Stable backport, independent review, PR/CI merge, immutable artifact publication,
+installation and feature activation remain separate delivery steps.
 
 ## Completion record
 

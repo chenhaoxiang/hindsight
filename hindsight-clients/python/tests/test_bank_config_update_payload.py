@@ -1,4 +1,35 @@
+import pytest
+
 from hindsight_client import Hindsight
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+def test_sync_stable_chunk_config_preserves_false_and_omits_unset(monkeypatch, value):
+    captured = {}
+
+    async def fake_update(self, bank_id, updates):
+        captured.update(updates)
+        return {"bank_id": bank_id, "config": {}, "overrides": updates}
+
+    monkeypatch.setattr(Hindsight, "_aupdate_bank_config", fake_update)
+    client = Hindsight(base_url="http://example.invalid")
+    client.update_bank_config("test-bank", retain_stable_chunks=value)
+    assert captured == ({} if value is None else {"retain_stable_chunks": value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [True, False, None])
+async def test_async_stable_chunk_config_preserves_false_and_omits_unset(monkeypatch, value):
+    captured = {}
+
+    async def fake_update(self, bank_id, updates):
+        captured.update(updates)
+        return {"bank_id": bank_id, "config": {}, "overrides": updates}
+
+    monkeypatch.setattr(Hindsight, "_aupdate_bank_config", fake_update)
+    client = Hindsight(base_url="http://example.invalid")
+    await client.aupdate_bank_config("test-bank", retain_stable_chunks=value)
+    assert captured == ({} if value is None else {"retain_stable_chunks": value})
 
 
 def test_update_bank_config_can_set_retain_structured_chunk_size(monkeypatch):
