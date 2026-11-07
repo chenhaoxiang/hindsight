@@ -32,6 +32,16 @@ describe("full bank config surface mapping", () => {
     mockedReflect.mockResolvedValue({ data: { text: "ok" } } as any);
   });
 
+  test.each([true, false])(
+    "forwards stable chunk reuse %s without dropping false",
+    async (value) => {
+      await client.updateBankConfig("bank", { retainStableChunks: value });
+
+      const body = mockedUpdateConfig.mock.calls[0][0].body as any;
+      expect(body.updates).toEqual({ retain_stable_chunks: value });
+    }
+  );
+
   test("maps the recall budget group onto the updates map", async () => {
     await client.updateBankConfig("bank", {
       recallMaxTokens: 4096,

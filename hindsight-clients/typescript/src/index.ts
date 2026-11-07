@@ -919,6 +919,9 @@ export class HindsightClient {
   async updateBankConfig(
     bankId: string,
     options: {
+      /** Opt into bounded PostgreSQL JSONL source-chunk reuse. False disables it;
+       *  undefined leaves the bank override unchanged. */
+      retainStableChunks?: boolean;
       reflectMission?: string;
       retainMission?: string;
       retainExtractionMode?: string;
@@ -1055,6 +1058,8 @@ export class HindsightClient {
     if (options.retainChunkSize !== undefined) updates.retain_chunk_size = options.retainChunkSize;
     if (options.retainStructuredChunkSize !== undefined)
       updates.retain_structured_chunk_size = options.retainStructuredChunkSize;
+    if (options.retainStableChunks !== undefined)
+      updates.retain_stable_chunks = options.retainStableChunks;
     if (options.retainMaxAttachmentsPerChunk !== undefined)
       updates.retain_max_attachments_per_chunk = options.retainMaxAttachmentsPerChunk;
     if (options.entityLabels !== undefined) updates.entity_labels = options.entityLabels;

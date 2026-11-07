@@ -2928,6 +2928,8 @@ class Hindsight:
         self,
         bank_id: str,
         *,
+        # Stable source reuse (opt-in)
+        retain_stable_chunks: bool | None = None,
         # Reflect settings
         reflect_mission: str | None = None,
         reflect_source_facts_max_tokens: int | None = None,
@@ -3006,6 +3008,7 @@ class Hindsight:
         return _run_async(
             self.aupdate_bank_config(
                 bank_id=bank_id,
+                retain_stable_chunks=retain_stable_chunks,
                 reflect_mission=reflect_mission,
                 reflect_source_facts_max_tokens=reflect_source_facts_max_tokens,
                 retain_mission=retain_mission,
@@ -3073,6 +3076,8 @@ class Hindsight:
         self,
         bank_id: str,
         *,
+        # Stable source reuse (opt-in)
+        retain_stable_chunks: bool | None = None,
         # Reflect settings
         reflect_mission: str | None = None,
         reflect_source_facts_max_tokens: int | None = None,
@@ -3166,6 +3171,8 @@ class Hindsight:
             retain_default_strategy: Default retain strategy name.
             retain_strategies: Named strategy definitions (dict of strategy name to config).
             retain_chunk_batch_size: Number of chunks per sub-batch in chunks extraction mode.
+            retain_stable_chunks: Opt into bounded PostgreSQL JSONL source-chunk reuse.
+                False explicitly disables reuse; None leaves the bank override unchanged.
             store_document_text: Persist the original document text alongside extracted facts.
             default_timezone: IANA zone (e.g. ``"Europe/Rome"``) a retain time with no UTC offset is read in.
             entity_labels: Controlled vocabulary for entity labels — a list of label-group
@@ -3248,6 +3255,7 @@ class Hindsight:
                 "retain_custom_instructions": retain_custom_instructions,
                 "retain_chunk_size": retain_chunk_size,
                 "retain_structured_chunk_size": retain_structured_chunk_size,
+                "retain_stable_chunks": retain_stable_chunks,
                 "retain_max_attachments_per_chunk": retain_max_attachments_per_chunk,
                 "retain_default_strategy": retain_default_strategy,
                 "retain_strategies": retain_strategies,
