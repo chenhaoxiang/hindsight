@@ -275,6 +275,59 @@ nonempty is not semantic acceptance. Operational traces and real recovery data
 stay outside the public repository. No bulk replay, bank split, global relabeling,
 worker-concurrency increase or removal of consistency guards is part of this batch.
 
+## Incremental-retain optimization follow-up
+
+Approved order for the next focused batch:
+
+1. Compare internal candidate reads/round caps of `50/100` with `48/96` while
+   keeping LLM batches at 8, the current model/reasoning, evidence budgets and
+   shared-scope serialization. Check effective overrides and preserve rollback.
+   This is a small possible packing gain, not a capacity or quality guarantee.
+2. Reuse complete, byte-identical old chunks in source order and re-cut changed
+   gaps, avoiding the boundary cascade after historical JSONL insertions/deletions.
+   Preserve unchanged fact IDs, embeddings and valid observation evidence while
+   atomically maintaining correct chunk positions/references. Real edits/deletions
+   still invalidate their sources. Keep CAS, cancellation, retries and explicit
+   re-extraction intact; unsupported/ambiguous cases retain the safe old path.
+3. Add only the diagnostic counts/reasons needed to distinguish new work from
+   reconstruction. Do not log source text, credentials or private paths.
+4. Validate with isolated synthetic lifecycle and published-client stories, then
+   a bounded quality comparison before activation. Backport to the independently
+   pinned stable API and publish a new immutable `-fork.N` component artifact.
+
+Do not change the global splitter of every populated document, the public chunk-ID
+format, schema, embedding, model/reasoning, evidence budgets or shared write
+concurrency. No whole-bank replay/refresh or silent historical relabeling. The
+source-specific retraction-readiness proposal is a separate future contract,
+not part of this batch. Preserve input/source integrity instead of treating fewer
+calls or nonempty generated text as semantic acceptance.
+
+Source acceptance for this candidate:
+
+- `HINDSIGHT_API_RETAIN_STABLE_CHUNKS` is off by default and bank-configurable.
+  PostgreSQL reuse is limited to one JSONL document of at most 2 Mi characters
+  and 512 chunks. Attachments, ambiguous anchors, unsupported stores and changed
+  extraction context/strategy are not silently reused. Normal forced reprocessing
+  still extracts the source again.
+- Relocation keeps fact UUIDs, text, embeddings, creation/update/consolidation times
+  and observation evidence unchanged. Genuine edits still invalidate their facts
+  and observations. Rollback, task cancellation, stale same-hash recovery,
+  concurrent append and cross-bank isolation have dedicated store regressions.
+- A queued retain records bounded `chunk_reuse` counts on its executing operation;
+  a receipt parent is not an aggregate of these counts. Source text is not added
+  to these diagnostic fields.
+- The internal packing comparison is not adopted: mechanical packing tests alone
+  cannot establish semantic equivalence. Retain the previous configuration when
+  a bounded quality trial is inconclusive; do not rewind memory data.
+- Real-model synthetic extraction and independent semantic adjudication are
+  separate from deterministic lifecycle tests. The narrow sample covers dated
+  corrections, project identity, budgets and proposal/report authority; it is not
+  a whole-bank or consolidation-quality score. Retain failed harness attempts and
+  reuse completed outputs instead of repeatedly resampling paid extraction.
+
+Stable backport, independent review, PR/CI merge, immutable artifact publication,
+installation and feature activation remain separate delivery steps.
+
 ## Completion record
 
 Update the relevant checkboxes when the associated work is actually complete. Keep

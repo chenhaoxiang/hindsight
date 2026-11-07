@@ -895,6 +895,7 @@ ENV_LLM_DEBUG_DUMP_4XX = "HINDSIGHT_API_LLM_DEBUG_DUMP_4XX"
 # Retain settings
 ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
 ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
+ENV_RETAIN_STABLE_CHUNKS = "HINDSIGHT_API_RETAIN_STABLE_CHUNKS"
 ENV_RETAIN_STRUCTURED_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_STRUCTURED_CHUNK_SIZE"
 ENV_RETAIN_EXTRACT_CAUSAL_LINKS = "HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS"
 ENV_RETAIN_OPTIONAL_FACT_DIMENSIONS = "HINDSIGHT_API_RETAIN_OPTIONAL_FACT_DIMENSIONS"
@@ -1851,6 +1852,7 @@ DEFAULT_BANK_STATS_CACHE_MAX_ENTRIES = 1024  # LRU bound across (schema, bank) k
 # Retain settings
 DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 64000  # Max tokens for fact extraction LLM call
 DEFAULT_RETAIN_CHUNK_SIZE = 3000  # Max chars per chunk for fact extraction
+DEFAULT_RETAIN_STABLE_CHUNKS = False  # Opt-in exact JSONL chunk reuse on supported SQL stores
 DEFAULT_RETAIN_EXTRACT_CAUSAL_LINKS = True  # Extract causal links between facts
 # Let a fact leave when/where/who/why empty instead of filling them with "N/A" (#4457).
 # Off by default because it is not free: the four fields become `string | null` and the
@@ -3738,6 +3740,7 @@ class HindsightConfig:
     # Retain settings
     retain_max_completion_tokens: int
     retain_chunk_size: int
+    retain_stable_chunks: bool
     retain_structured_chunk_size: int | None
     retain_extract_causal_links: bool
     retain_optional_fact_dimensions: bool
@@ -4197,6 +4200,7 @@ class HindsightConfig:
         "default_timezone",
         # Retention settings (behavioral)
         "retain_chunk_size",
+        "retain_stable_chunks",
         "retain_structured_chunk_size",
         "retain_extraction_mode",
         "retain_mission",
@@ -5423,6 +5427,7 @@ class HindsightConfig:
                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
             ),
             retain_chunk_size=int(os.getenv(ENV_RETAIN_CHUNK_SIZE, str(DEFAULT_RETAIN_CHUNK_SIZE))),
+            retain_stable_chunks=_parse_boolean_env(ENV_RETAIN_STABLE_CHUNKS, DEFAULT_RETAIN_STABLE_CHUNKS),
             retain_structured_chunk_size=_parse_optional_positive_int(
                 ENV_RETAIN_STRUCTURED_CHUNK_SIZE,
                 os.getenv(ENV_RETAIN_STRUCTURED_CHUNK_SIZE),
