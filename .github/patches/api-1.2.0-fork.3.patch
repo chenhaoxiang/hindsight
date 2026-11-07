@@ -353,10 +353,10 @@ index fbb524a3d..f46eccc4e 100644
 +
 diff --git a/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
 new file mode 100644
-index 000000000..426ff376d
+index 000000000..524afa1f4
 --- /dev/null
 +++ b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,307 @@
 +"""Postgres-only transactional relocation of unchanged chunk references.
 +
 +No schema change: facts keep their UUIDs while temporary chunk rows carry their
@@ -364,6 +364,7 @@ index 000000000..426ff376d
 +normal obsolete-chunk invalidation, and finalization in ONE transaction.
 +"""
 +
++import uuid
 +from collections.abc import Callable
 +from typing import Any
 +
@@ -455,6 +456,51 @@ index 000000000..426ff376d
 +    ]
 +
 +
++async def _lock_reuse_write_set(
++    *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: StableChunkPlan
++) -> bool:
++    """Lock the UNION, not two individually sorted writer sets.
++
++    Include all document facts because metadata/tag synchronization can write
++    stationary anchors too. Only obsolete sources select observations to retire;
++    moving sources are lock-only and must not invalidate their valid evidence.
++    """
++    facts = await conn.fetch(
++        f"SELECT id, chunk_id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2",
++        bank_id,
++        document_id,
++    )
++    retired = set(plan.obsolete_ids)
++    outgoing = [uuid.UUID(str(row["id"])) for row in facts if row["chunk_id"] in retired]
++
++    async def sweep_write_ids() -> set[uuid.UUID]:
++        if not outgoing:
++            return set()
++        rows = await conn.fetch(
++            f"SELECT id, source_memory_ids FROM {fq_table('memory_units')} "
++            "WHERE bank_id = $1 AND fact_type = 'observation' AND source_memory_ids && $2::uuid[]",
++            bank_id,
++            outgoing,
++        )
++        identities = {uuid.UUID(str(row["id"])) for row in rows}
++        for row in rows:
++            identities.update(uuid.UUID(str(value)) for value in (row["source_memory_ids"] or []))
++        return identities
++
++    write_ids = {uuid.UUID(str(row["id"])) for row in facts} | await sweep_write_ids()
++    if write_ids:
++        await conn.fetch(
++            f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) "
++            "ORDER BY id FOR NO KEY UPDATE",
++            bank_id,
++            sorted(write_ids),
++        )
++    # Observation creation takes SHARE on its sources. A publication that won
++    # while we waited may expand the set: retry without writes, never acquire an
++    # extra lower UUID after holding the original set.
++    return await sweep_write_ids() <= write_ids
++
++
 +async def stage_reuse(
 +    *,
 +    conn: Any,
@@ -513,8 +559,12 @@ index 000000000..426ff376d
 +        for offset, chunk in enumerate(moving)
 +        if chunk.reuse_from is not None
 +    ]
-+    # Validation only: moving fact rows BEFORE the obsolete-source sweep would
-+    # violate its whole-write-set UUID lock order across shared observations.
++    if not await _lock_reuse_write_set(
++        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, plan=plan
++    ):
++        return None
++    # No source writes yet. The complete fact/sweep write union is now held in
++    # UUID order; the normal sweep and relocation can reuse those locks safely.
 +    return StagedChunkReuse(moves=moves)
 +
 +
@@ -523,8 +573,8 @@ index 000000000..426ff376d
 +) -> int:
 +    old_ids = [move.original.chunk_id for move in moves]
 +    temp_ids = [move.temporary_id for move in moves]
-+    # The standard obsolete-source sweep has already acquired its full fact /
-+    # observation / co-source write set in UUID order. Only now lock moving facts.
++    # Staging acquired the entire document/sweep write union in one UUID order.
++    # The normal obsolete sweep has run; these writer locks are already owned.
 +    units = await conn.fetch(
 +        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2 "
 +        "AND chunk_id = ANY($3::text[]) ORDER BY id FOR NO KEY UPDATE",
@@ -1230,7 +1280,7 @@ index 000000000..ad0f7f2ef
 +                        task.cancel()
 +                await asyncio.gather(*tasks, return_exceptions=True)
 diff --git a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
-index 796a65125..1c01ca38b 100644
+index 796a65125..b9fdf31e9 100644
 --- a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 +++ b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
 @@ -15 +15 @@ from collections.abc import Awaitable, Callable
@@ -1305,11 +1355,14 @@ index 796a65125..1c01ca38b 100644
 +                    expected_hashes=recovery_expected_hashes,
 +                    source_context=recovery_context,
 +                    source_strategy=recovery_strategy,
-@@ -2649,2 +2686,23 @@ async def _streaming_retain_batch(
+@@ -2649,2 +2686,26 @@ async def _streaming_retain_batch(
 -    except Exception:
 -        pass  # If we can't load, just process all chunks
 +            if compatible is None and not is_first_batch:
-+                raise RuntimeError("Document layout or extraction contract changed between retain slices; retry")
++                message = "Document layout or extraction contract changed between retain slices; retry"
++                if append_base_hash is not None:
++                    raise ConcurrentAppendConflict(message)
++                raise RuntimeError(message)
 +            recovery_positions = compatible or {}
 +            is_recovery = bool(recovery_positions)
 +    else:
@@ -1331,55 +1384,48 @@ index 796a65125..1c01ca38b 100644
 +            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
 +            "will skip matching positions and preserve existing data"
 +        )
-@@ -2665,2 +2722,0 @@ async def _streaming_retain_batch(
+@@ -2665,2 +2725,0 @@ async def _streaming_retain_batch(
 -    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
 -
-@@ -2896 +2952,5 @@ async def _streaming_retain_batch(
+@@ -2825,0 +2885,20 @@ async def _streaming_retain_batch(
++    async def validate_streaming_write_layout(conn: Any) -> None:
++        """One locked guard for all three SQL streaming write entrances."""
++        if recovery_expected_hashes is None or (not is_recovery and not doc_tracking_done[0] and is_first_batch):
++            return
++        compatible = await recovery_store.compatible_recovery_chunks(
++            conn=conn,
++            fq_table=fq_table,
++            bank_id=bank_id,
++            document_id=effective_doc_id,
++            content_hash=new_content_hash,
++            expected_hashes=recovery_expected_hashes,
++            source_context=recovery_context,
++            source_strategy=recovery_strategy,
++        )
++        if compatible is None:
++            message = "Document layout or extraction contract changed before streaming write; retry"
++            if append_base_hash is not None:
++                raise ConcurrentAppendConflict(message)
++            raise RuntimeError(message)
++
+@@ -2896 +2975,5 @@ async def _streaming_retain_batch(
 -                if chunk_hash in existing_chunk_hashes:
 +                if (
 +                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
 +                    if recovery_positions is not None
 +                    else chunk_hash in existing_chunk_hashes
 +                ):
-@@ -3343,0 +3404,18 @@ async def _streaming_retain_batch(
-+                    if recovery_expected_hashes is not None and (
-+                        is_recovery or doc_tracking_done[0] or not is_first_batch
-+                    ):
-+                        compatible = await recovery_store.compatible_recovery_chunks(
-+                            conn=conn,
-+                            fq_table=fq_table,
-+                            bank_id=bank_id,
-+                            document_id=effective_doc_id,
-+                            content_hash=new_content_hash,
-+                            expected_hashes=recovery_expected_hashes,
-+                            source_context=recovery_context,
-+                            source_strategy=recovery_strategy,
-+                        )
-+                        if compatible is None:
-+                            raise RuntimeError(
-+                                "Document layout or extraction contract changed before recovery write; retry"
-+                            )
+@@ -3140,0 +3224 @@ async def _streaming_retain_batch(
++                        await validate_streaming_write_layout(conn)
+@@ -3343,0 +3428,2 @@ async def _streaming_retain_batch(
++                    await validate_streaming_write_layout(conn)
 +
-@@ -3601,0 +3680,15 @@ async def _streaming_retain_batch(
-+                        if recovery_expected_hashes is not None and (is_recovery or not is_first_batch):
-+                            compatible = await recovery_store.compatible_recovery_chunks(
-+                                conn=conn,
-+                                fq_table=fq_table,
-+                                bank_id=bank_id,
-+                                document_id=effective_doc_id,
-+                                content_hash=new_content_hash,
-+                                expected_hashes=recovery_expected_hashes,
-+                                source_context=recovery_context,
-+                                source_strategy=recovery_strategy,
-+                            )
-+                            if compatible is None:
-+                                raise RuntimeError(
-+                                    "Document layout or extraction contract changed before recovery completion; retry"
-+                                )
-@@ -3809,0 +3903,2 @@ async def _try_delta_retain(
+@@ -3601,0 +3688 @@ async def _streaming_retain_batch(
++                        await validate_streaming_write_layout(conn)
+@@ -3809,0 +3897,2 @@ async def _try_delta_retain(
 +    single_input: bool = False,
 +    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
-@@ -3847,0 +3943,8 @@ async def _try_delta_retain(
+@@ -3847,0 +3937,8 @@ async def _try_delta_retain(
 +    stable_enabled = (
 +        bool(getattr(config, "retain_stable_chunks", False))
 +        and config.store_document_text
@@ -1388,13 +1434,13 @@ index 796a65125..1c01ca38b 100644
 +        and not _store_owned_delta
 +        and _delta_store.supports_stable_chunk_reuse(pool)
 +    )
-@@ -3868 +3971 @@ async def _try_delta_retain(
+@@ -3868 +3965 @@ async def _try_delta_retain(
 -    if document_prefetch is not None and full_document_body is None:
 +    if document_prefetch is not None and full_document_body is None and not stable_enabled:
-@@ -3885 +3988 @@ async def _try_delta_retain(
+@@ -3885 +3982 @@ async def _try_delta_retain(
 -            include_text=full_document_body is not None,
 +            include_text=full_document_body is not None or stable_enabled,
-@@ -3923 +4026,35 @@ async def _try_delta_retain(
+@@ -3923 +4020,35 @@ async def _try_delta_retain(
 -    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
 +    stable_plan: StableChunkPlan | None = None
 +    if stable_enabled:
@@ -1431,7 +1477,7 @@ index 796a65125..1c01ca38b 100644
 +    new_chunks_with_contents = (
 +        stable_plan.texts if stable_plan is not None else _chunk_contents_for_delta(_diff_contents, config)
 +    )
-@@ -3936,6 +4073,14 @@ async def _try_delta_retain(
+@@ -3936,6 +4067,14 @@ async def _try_delta_retain(
 -
 -    log_buffer.append(
 -        f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
@@ -1452,16 +1498,16 @@ index 796a65125..1c01ca38b 100644
 +            f"{len(changed_indices)} changed, {len(new_indices)} new, "
 +            f"{len(removed_indices)} removed"
 +        )
-@@ -3984,0 +4130,2 @@ async def _try_delta_retain(
+@@ -3984,0 +4124,2 @@ async def _try_delta_retain(
 +        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
 +            recovery_plan_callback(stable_plan)
-@@ -4103 +4250,4 @@ async def _try_delta_retain(
+@@ -4103 +4244,4 @@ async def _try_delta_retain(
 -    meta_token = set_call_metadata({"document_id": effective_doc_id})
 +    call_metadata: dict[str, Any] = {"document_id": effective_doc_id}
 +    if stable_plan is not None:
 +        call_metadata["chunk_reuse"] = asdict(stable_plan.stats)
 +    meta_token = set_call_metadata(call_metadata)
-@@ -4203,0 +4354,13 @@ async def _try_delta_retain(
+@@ -4203,0 +4348,13 @@ async def _try_delta_retain(
 +                staged_reuse = None
 +                if stable_plan is not None:
 +                    staged_reuse = await _delta_store.stage_stable_chunk_reuse(
@@ -1475,7 +1521,7 @@ index 796a65125..1c01ca38b 100644
 +                        log_buffer.append("[delta] Chunk snapshot moved before reuse; preserving it and falling back")
 +                        return False
 +
-@@ -4242,5 +4405,9 @@ async def _try_delta_retain(
+@@ -4242,5 +4399,9 @@ async def _try_delta_retain(
 -                chunks_to_delete = [
 -                    existing_by_index[idx].chunk_id
 -                    for idx in changed_indices + removed_indices
@@ -1490,7 +1536,7 @@ index 796a65125..1c01ca38b 100644
 +                        if idx in existing_by_index
 +                    ]
 +                )
-@@ -4252,2 +4419,6 @@ async def _try_delta_retain(
+@@ -4252,2 +4413,6 @@ async def _try_delta_retain(
 -                    f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 -                    f"invalidated {invalidated_obs} observation(s) "
 +                    + (
@@ -1499,7 +1545,7 @@ index 796a65125..1c01ca38b 100644
 +                        else f"({len(changed_indices)} changed + {len(removed_indices)} removed), "
 +                    )
 +                    + f"invalidated {invalidated_obs} observation(s) "
-@@ -4256,0 +4428,21 @@ async def _try_delta_retain(
+@@ -4256,0 +4422,21 @@ async def _try_delta_retain(
 +                if staged_reuse is not None and stable_plan is not None:
 +                    moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
 +                        conn=conn,
@@ -1521,7 +1567,7 @@ index 796a65125..1c01ca38b 100644
 +                            json.dumps(asdict(summary)),
 +                        )
 +
-@@ -4367,0 +4560,6 @@ async def _try_delta_retain(
+@@ -4367,0 +4554,6 @@ async def _try_delta_retain(
 +    if stable_plan is not None:
 +        # Delta content slots address changed chunks, not caller input slots. This
 +        # bounded path accepts ONE original input, including an append's prepend.
