@@ -323,9 +323,14 @@ Source acceptance for this candidate:
   context/strategy under the document lock, including after the flag is disabled.
   A partial stable layout resumes its verified positions through the bounded
   producer/consumer pipeline. Incompatible layouts retire old sources normally;
-  a concurrent layout change fails closed instead of overwriting surviving facts.
-  The standard obsolete-source observation sweep runs before any moving-fact
-  write, preserving its existing cross-document lock order.
+  all three SQL streaming write entrances (including a 0-fact consumer batch)
+  recheck under the lock. Concurrent append conflicts retain their typed retry/
+  defer behavior instead of becoming terminal generic failures.
+  Staging prelocks the union of document facts, retiring observations and their
+  surviving co-sources in one UUID order, revalidating expansions before writes.
+  The standard obsolete-source sweep then runs before moving facts; lock-only
+  moving sources never become retirement inputs. This covers shared-source
+  observations split across more than one observation row.
 - The internal packing comparison is not adopted: mechanical packing tests alone
   cannot establish semantic equivalence. Retain the previous configuration when
   a bounded quality trial is inconclusive; do not rewind memory data.

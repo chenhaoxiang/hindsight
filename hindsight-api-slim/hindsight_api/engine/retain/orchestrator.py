@@ -2710,7 +2710,10 @@ async def _streaming_retain_batch(
                     source_strategy=recovery_strategy,
                 )
             if compatible is None and not is_first_batch:
-                raise RuntimeError("Document layout or extraction contract changed between retain slices; retry")
+                message = "Document layout or extraction contract changed between retain slices; retry"
+                if append_base_hash is not None:
+                    raise ConcurrentAppendConflict(message)
+                raise RuntimeError(message)
             recovery_positions = compatible or {}
             is_recovery = bool(recovery_positions)
     else:
@@ -2904,6 +2907,26 @@ async def _streaming_retain_batch(
         raise ConcurrentAppendConflict(
             f"Document {effective_doc_id} was updated by a concurrent retain while this append was extracting"
         )
+
+    async def validate_streaming_write_layout(conn: Any) -> None:
+        """One locked guard for all three SQL streaming write entrances."""
+        if recovery_expected_hashes is None or (not is_recovery and not doc_tracking_done[0] and is_first_batch):
+            return
+        compatible = await recovery_store.compatible_recovery_chunks(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            document_id=effective_doc_id,
+            content_hash=new_content_hash,
+            expected_hashes=recovery_expected_hashes,
+            source_context=recovery_context,
+            source_strategy=recovery_strategy,
+        )
+        if compatible is None:
+            message = "Document layout or extraction contract changed before streaming write; retry"
+            if append_base_hash is not None:
+                raise ConcurrentAppendConflict(message)
+            raise RuntimeError(message)
 
     # Every chunk task embeds only its own chunk's facts, which makes each embedding
     # call one text wide — and in `chunks` extraction mode, where there is no LLM call
@@ -3224,6 +3247,7 @@ async def _streaming_retain_batch(
                             document_id=effective_doc_id,
                         )
                         _assert_append_base_unchanged(existing_hash)
+                        await validate_streaming_write_layout(conn)
                         if is_recovery:
                             await fact_storage.upsert_document_metadata(
                                 conn,
@@ -3427,23 +3451,7 @@ async def _streaming_retain_batch(
                         document_id=effective_doc_id,
                     )
 
-                    if recovery_expected_hashes is not None and (
-                        is_recovery or doc_tracking_done[0] or not is_first_batch
-                    ):
-                        compatible = await recovery_store.compatible_recovery_chunks(
-                            conn=conn,
-                            fq_table=fq_table,
-                            bank_id=bank_id,
-                            document_id=effective_doc_id,
-                            content_hash=new_content_hash,
-                            expected_hashes=recovery_expected_hashes,
-                            source_context=recovery_context,
-                            source_strategy=recovery_strategy,
-                        )
-                        if compatible is None:
-                            raise RuntimeError(
-                                "Document layout or extraction contract changed before recovery write; retry"
-                            )
+                    await validate_streaming_write_layout(conn)
 
                     if not doc_tracking_done[0]:
                         # Append compare-and-swap, under the row lock and before any write: an
@@ -3703,21 +3711,7 @@ async def _streaming_retain_batch(
                         await _edge_provider.lock_pending_document(
                             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
                         )
-                        if recovery_expected_hashes is not None and (is_recovery or not is_first_batch):
-                            compatible = await recovery_store.compatible_recovery_chunks(
-                                conn=conn,
-                                fq_table=fq_table,
-                                bank_id=bank_id,
-                                document_id=effective_doc_id,
-                                content_hash=new_content_hash,
-                                expected_hashes=recovery_expected_hashes,
-                                source_context=recovery_context,
-                                source_strategy=recovery_strategy,
-                            )
-                            if compatible is None:
-                                raise RuntimeError(
-                                    "Document layout or extraction contract changed before recovery completion; retry"
-                                )
+                        await validate_streaming_write_layout(conn)
                         if is_recovery:
                             await fact_storage.upsert_document_metadata(
                                 conn,
