@@ -20964,10 +20964,12 @@ class MemoryEngine(MemoryEngineInterface):
         exact_tags = tag_filter.clause(3)
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
+            # Like the hybrid arms, slice in Python: SQL_ASCII LEFT counts bytes
+            # and can split a multibyte character before the client decodes it.
             exact_rows = await conn.fetch(
                 f"""
                 SELECT kp.id, kp.name, kp.mental_model_id,
-                       LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at
+                       mm.content, mm.source_query, mm.last_refreshed_at AS updated_at
                 FROM {join}
                 WHERE kp.bank_id = $1 AND kp.kind = 'page' AND LOWER(kp.name) = LOWER($2)
                       {exact_tags.sql}
@@ -20986,7 +20988,7 @@ class MemoryEngine(MemoryEngineInterface):
                     name=r["name"],
                     mental_model_id=r["mental_model_id"],
                     source_query=r["source_query"],
-                    snippet=_page_snippet(r["snippet"]),
+                    snippet=_page_snippet(r["content"]),
                     updated_at=r["updated_at"].isoformat() if r["updated_at"] else None,
                 )
             )

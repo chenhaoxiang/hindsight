@@ -736,7 +736,7 @@ index 823f3373b..b953e2c9d 100644
 +        )
 +
 diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
-index 497114bdd..a7ff2cac5 100644
+index 497114bdd..37b35465e 100644
 --- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 +++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 @@ -29 +29 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, null
@@ -884,14 +884,16 @@ index 497114bdd..a7ff2cac5 100644
 -        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
 -        emb_str = str(emb[0]) if emb and emb[0] else None
 -
-@@ -20871,0 +20964,38 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20871,0 +20964,40 @@ class MemoryEngine(MemoryEngineInterface):
 +        exact_tags = tag_filter.clause(3)
 +        backend = await self._get_backend()
 +        async with acquire_with_retry(backend) as conn:
++            # Like the hybrid arms, slice in Python: SQL_ASCII LEFT counts bytes
++            # and can split a multibyte character before the client decodes it.
 +            exact_rows = await conn.fetch(
 +                f"""
 +                SELECT kp.id, kp.name, kp.mental_model_id,
-+                       LEFT(mm.content, 280) AS snippet, mm.source_query, mm.last_refreshed_at AS updated_at
++                       mm.content, mm.source_query, mm.last_refreshed_at AS updated_at
 +                FROM {join}
 +                WHERE kp.bank_id = $1 AND kp.kind = 'page' AND LOWER(kp.name) = LOWER($2)
 +                      {exact_tags.sql}
@@ -910,7 +912,7 @@ index 497114bdd..a7ff2cac5 100644
 +                    name=r["name"],
 +                    mental_model_id=r["mental_model_id"],
 +                    source_query=r["source_query"],
-+                    snippet=_page_snippet(r["snippet"]),
++                    snippet=_page_snippet(r["content"]),
 +                    updated_at=r["updated_at"].isoformat() if r["updated_at"] else None,
 +                )
 +            )
@@ -923,21 +925,21 @@ index 497114bdd..a7ff2cac5 100644
 +        # not depend on a working embedding service or the text-search index.
 +        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
 +        emb_str = str(emb[0]) if emb and emb[0] else None
-@@ -20888 +21018 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20888 +21020 @@ class MemoryEngine(MemoryEngineInterface):
 -                return []
 +                return exact_results
-@@ -20926 +21056 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20926 +21058 @@ class MemoryEngine(MemoryEngineInterface):
 -            return out[:limit]
 +            return (exact_results + [hit for hit in out if hit["id"] not in exact_ids])[:limit]
-@@ -20950 +21080 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20950 +21082 @@ class MemoryEngine(MemoryEngineInterface):
 -            return []
 +            return exact_results
-@@ -21065 +21195 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -21065 +21197 @@ class MemoryEngine(MemoryEngineInterface):
 -        return [
 +        hybrid_results = [
-@@ -21075,0 +21206 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -21075,0 +21208 @@ class MemoryEngine(MemoryEngineInterface):
 +            if r["id"] not in exact_ids
-@@ -21076,0 +21208 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -21076,0 +21210 @@ class MemoryEngine(MemoryEngineInterface):
 +        return (exact_results + hybrid_results)[:limit]
 diff --git a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
 index 382d7a9a6..20cdb0b77 100644

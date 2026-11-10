@@ -13,9 +13,9 @@ in front of the agent at the moment it starts working, and keeps a curated set o
 (architecture, conventions, in-flight initiatives) that future sessions start from.
 
 The agent reads those pages through the `hindsight_search_knowledge_pages`, `hindsight_list_knowledge_pages` and
-`hindsight_read_knowledge_page` tools. Before the rename they were `hindsight_search_knowledge_pages`,
-`hindsight_list_knowledge_pages` and `hindsight_read_knowledge_page`: a permission rule in your
-agent's own settings that names an old tool needs the new name.
+`hindsight_read_knowledge_page` tools. This maintenance fork keeps these names and the existing ten-tool
+contract despite upstream's Pages rename. Existing permission rules for these tools remain valid;
+no tool-name migration is needed.
 
 <!-- figure: coding-agents -->
 

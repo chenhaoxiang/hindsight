@@ -4,14 +4,18 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
+from sqlalchemy.engine import make_url
 
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.memories.base import KnowledgePageMatch
 from hindsight_api.engine.memory_engine import PageTagFilter
 from hindsight_api.engine.retain import embedding_utils
 from hindsight_api.engine.search.tags import TagGroupLeaf
+from hindsight_api.engine.task_backend import SyncTaskBackend
 from hindsight_api.extensions import BankReadOperation, OperationValidationError
+from tests.conftest import _teardown_memory_engine
 from tests.test_consolidation_stale_batch import cross_encoder, embeddings  # noqa: F401 (fixtures)
 from tests.test_pages import _kb_validator
 from tests.test_tag_scope import _ScopeByApiKey
@@ -54,6 +58,67 @@ async def test_exact_title_works_without_either_hybrid_arm(
         assert await memory.search_pages(bank, title, limit=1, request_context=request_context) == hits
     finally:
         await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_exact_title_snippet_keeps_multibyte_boundary_on_sql_ascii(
+    pg0_db_url: str, embeddings, cross_encoder, query_analyzer, request_context: RequestContext, monkeypatch
+) -> None:
+    # A schema cannot change the database encoding. Create only a disposable test
+    # database so this exercises the real SQL path, not just the Python slicer.
+    database = "hs_exact_ascii_" + uuid.uuid4().hex[:12]
+    admin = await asyncpg.connect(pg0_db_url)
+    memory = MemoryEngine(
+        db_url=make_url(pg0_db_url).set(database=database).render_as_string(hide_password=False),
+        memory_llm_provider="mock",
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=embeddings,
+        cross_encoder=cross_encoder,
+        query_analyzer=query_analyzer,
+        pool_min_size=1,
+        pool_max_size=2,
+        task_backend=SyncTaskBackend(),
+    )
+    try:
+        await admin.execute(
+            f"CREATE DATABASE \"{database}\" TEMPLATE template0 ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'"
+        )
+        try:
+            await memory.initialize()
+            async with (await memory._get_pool()).acquire() as conn:
+                assert await conn.fetchval("SHOW server_encoding") == "SQL_ASCII"
+            bank = "exact-ascii-fixture"
+            await memory.ensure_bank_profile(bank, request_context=request_context)
+            page = await memory.create_page(
+                bank_id=bank,
+                name="SQL_ASCII exact title",
+                source_query="Fixture scope?",
+                content="Fixture body.",
+                request_context=request_context,
+            )
+            # Seed the text column directly: create_page's structured JSON uses
+            # Unicode escapes that SQL_ASCII rejects, independently of this read.
+            async with (await memory._get_pool()).acquire() as conn:
+                await conn.execute(
+                    "UPDATE mental_models SET content = $3 WHERE bank_id = $1 AND id = $2",
+                    bank,
+                    page["mental_model_id"],
+                    "a" * 279 + "作业作业",
+                )
+            embed = AsyncMock(side_effect=AssertionError("exact-only search must not embed"))
+            monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", embed)
+            hits = await memory.search_pages(bank, page["name"], limit=1, request_context=request_context)
+            assert [hit["id"] for hit in hits] == [page["id"]]
+            assert hits[0]["snippet"] == "a" * 279 + "作"
+            assert hits[0]["score"] == 1.0
+            embed.assert_not_awaited()
+        finally:
+            await _teardown_memory_engine(memory)
+            await admin.execute(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        await admin.close()
 
 
 @pytest.mark.asyncio
