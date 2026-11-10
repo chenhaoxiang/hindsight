@@ -3,7 +3,7 @@
  *
  * Every harness adapter and the backfill CLI go through this one client: it configures the bank
  * (missions + git/chat retain strategies), retains memories, reflects, drains async operations, and
- * creates knowledge pages. Nothing here knows about opencode/claude-code/etc.
+ * creates pages. Nothing here knows about opencode/claude-code/etc.
  */
 import {
   type BankOverrides,
@@ -37,8 +37,8 @@ import { uuidV5 } from "./uuid";
 /** Sent on every request so the server can tell which integration is calling. */
 export const USER_AGENT = `hindsight-coding-agents/${PKG_VERSION}`;
 
-/** One node of GET /knowledge-base/tree. Only the fields this client reads. */
-export interface KnowledgeNode {
+/** One node of GET /pages/tree. Only the fields this client reads. */
+export interface PageNode {
   id: string;
   kind: "folder" | "page";
   name: string;
@@ -51,7 +51,7 @@ export interface KnowledgeNode {
   /** The page's EFFECTIVE refresh policy, on servers new enough to report it (#3572). Absent
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
   trigger?: CurrentPageTrigger;
-  children?: KnowledgeNode[];
+  children?: PageNode[];
   tags?: string[];
 }
 
@@ -87,7 +87,7 @@ export type ObservationScopes =
  * gets a scope. Taking all of them, sorted, is the only rule that needs no arbitrary tie-break and
  * does not silently depend on the order the caller assembled its tags in.
  *
- * The empty scope is always first and always present, so the untagged observations that knowledge
+ * The empty scope is always first and always present, so the untagged observations that page
  * pages read (they match with `tags_match: "all"`) keep being written exactly as under `shared`.
  */
 export function resolveRetainScopes(
@@ -129,7 +129,7 @@ export interface ClientOpts {
   maxParallelRetains?: number;
   /** Observation scoping for every retain this client sends. Default `DEFAULT_OBSERVATION_SCOPES`. */
   observationScopes?: ObservationScopes;
-  /** Pages one knowledge-page search returns. Default `DEFAULT_PAGE_SEARCH_LIMIT`. Lives on the
+  /** Pages one page search returns. Default `DEFAULT_PAGE_SEARCH_LIMIT`. Lives on the
    *  client so every caller — the hook's injection and the MCP tool — shares one value. */
   pageSearchLimit?: number;
   /** Recall-body overrides, merged key-by-key over `DEFAULT_RECALL_OPTIONS`. Passed through to
@@ -204,19 +204,19 @@ export function retryAfterMs(header: string | null | undefined): number {
   return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
 }
 
-/** Raised when the target server predates the knowledge-pages API surface. */
-export class KnowledgePagesUnavailableError extends Error {
-  readonly code = "knowledge_pages_unavailable";
+/** Raised when the target server predates the pages API surface. */
+export class PagesUnavailableError extends Error {
+  readonly code = "pages_unavailable";
   constructor() {
-    super("Hindsight server does not support knowledge pages");
-    this.name = "KnowledgePagesUnavailableError";
+    super("Hindsight server does not support pages");
+    this.name = "PagesUnavailableError";
   }
 }
 
 /**
- * Does this 404 mean the server has no knowledge-base API, rather than "that bank does not exist yet"?
+ * Does this 404 mean the server has no pages API, rather than "that bank does not exist yet"?
  *
- * The two are indistinguishable by status, and conflating them latched the knowledge-page capability
+ * The two are indistinguishable by status, and conflating them latched the page capability
  * off for the whole process on the FIRST session in a new bank — the bank is minted by the first
  * retain, so a session-start page read always precedes it (#4607).
  *
@@ -238,11 +238,24 @@ async function isEndpointMissing(r: Response): Promise<boolean> {
   } catch {
     // No JSON body at all (a proxy's HTML/plain-text 404, a bare gateway response). This used to
     // latch, but a reverse proxy answers exactly this while the backend restarts, and the latch
-    // never expires — knowledge pages stayed off for the life of the process (#5071). Only our
+    // never expires — pages stayed off for the life of the process (#5071). Only our
     // API's own JSON 404 is a verdict; anything else leaves the capability unknown, so the next
     // call asks again.
     return false;
   }
+}
+
+/**
+ * A `/pages` sub-path as the URL to request. `legacy` gives its pre-rename `/knowledge-base` twin,
+ * which a server from before the rename serves instead: there the page routes themselves sat
+ * under `/knowledge-base/pages`, while tree/folders/search/export/nodes sat directly below
+ * `/knowledge-base`. Remove in 2.x.
+ */
+function pagesPath(sub: string, legacy = false): string {
+  if (!legacy) return `/pages${sub}`;
+  return /^\/(tree|folders|search|export|nodes)\b/.test(sub)
+    ? `/knowledge-base${sub}`
+    : `/knowledge-base/pages${sub}`;
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "error"]);
@@ -281,7 +294,7 @@ export class ReflectError extends Error {
 }
 
 export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
-/** Knowledge pages returned by one search — the hook's injection and the agent-facing
+/** Pages returned by one search — the hook's injection and the agent-facing
  *  `hindsight_search_knowledge_pages` tool both get this, so tuning it moves both.
  *
  *  Ten, not three. Three was set when the page roster was injected wholesale and search was a
@@ -342,7 +355,7 @@ const RATE_LIMIT_BACKOFF_MS = 1000;
  * a bare "timestamp" beside a page tells the model nothing about whether it is looking at something
  * current.
  *
- * Applied inside `getPage`, not by the read tool: it used to live in knowledge-tools, which left
+ * Applied inside `getPage`, not by the read tool: it used to live in page-tools, which left
  * `getPage` itself returning both copies to any other caller (#4836).
  */
 function shapePage(page: unknown): unknown {
@@ -360,6 +373,8 @@ function shapePage(page: unknown): unknown {
 
 /** Undici's cross-version handle on the dispatcher Node's global `fetch` uses. */
 const GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.1");
+// Node 26 uses Undici's v2 handler API; a v1 dispatcher cannot accept its fetch handlers.
+const GLOBAL_DISPATCHER_V2 = Symbol.for("undici.globalDispatcher.2");
 
 /**
  * The global dispatcher with undici's own header/body timeouts switched off, for a request that
@@ -376,7 +391,8 @@ function signalOnlyDispatcher(): unknown {
   // Node loads undici — which installs the global dispatcher — lazily. Touching the `Headers`
   // global loads it; touching `fetch` does not (it is a wrapper until first called).
   void globalThis.Headers;
-  const d = (globalThis as Record<symbol, unknown>)[GLOBAL_DISPATCHER] as
+  const globals = globalThis as Record<symbol, unknown>;
+  const d = (globals[GLOBAL_DISPATCHER_V2] ?? globals[GLOBAL_DISPATCHER]) as
     | { compose?: (interceptor: unknown) => unknown }
     | undefined;
   if (typeof d?.compose !== "function") return undefined; // Node 18's undici predates compose()
@@ -397,7 +413,7 @@ export class HindsightClient {
   readonly project?: string;
   readonly opIds: string[] = []; // async operation ids collected by retain(), for drain()
   /** Tri-state capability probe: unknown until the first page request, then cached. */
-  knowledgePagesSupported: boolean | undefined;
+  pagesSupported: boolean | undefined;
   /** Tri-state capability probe: unknown until the first append-mode retain, then cached. */
   private idempotentRetain: boolean | undefined;
   private readonly log: (msg: string) => void;
@@ -709,7 +725,7 @@ export class HindsightClient {
   }
 
   /** Configure the bank: POST the coding bank manifest to /import (missions, retain strategies,
-   *  entity labels), then seed knowledge pages when the server supports them. Both halves are
+   *  entity labels), then seed pages when the server supports them. Both halves are
    *  idempotent and ADDITIVE — nothing the bank already says is overwritten (#3927), bar the
    *  extraction mode of the plugin's own strategies, which follows its config (#4560) — so
    *  the deepen engine can re-run this every pass. Creates the bank if missing; legacy servers
@@ -980,47 +996,71 @@ export class HindsightClient {
     return (j.results ?? []).map((x) => (x.text ?? "").trim()).filter(Boolean);
   }
 
+  /** Set once a server answered on the deprecated `/knowledge-base/...` paths: one from before the
+   *  page routes moved to `/pages/...`. Remove in 2.x. */
+  private legacyPagesPaths = false;
+
   /**
-   * Latch `knowledgePagesSupported = false` iff this response really means the endpoint is absent.
-   * Returns whether it latched. A bank-not-found 404 is NOT a capability verdict — it is the
-   * expected answer before the bank's first retain — so it must never cache a negative (#4607).
+   * Request a page endpoint by its `/pages` sub-path (`""`, `/tree`, `/<id>`, `/nodes/<id>`, …).
+   *
+   * Returns `null` — and latches `pagesSupported = false` — iff the endpoint is really absent: an
+   * unrouted 404 on the `/pages` path AND on its pre-rename `/knowledge-base` twin, which a server
+   * older than the rename still serves (tried once, then remembered). A bank-not-found 404 is NOT
+   * a capability verdict — it is the expected answer before the bank's first retain — so it is
+   * returned as-is and never caches a negative (#4607). A 404's body may already be consumed.
    *
    * Only 404 is tested: `req` throws on every other non-ok status it was not told to tolerate, so
    * the 405/501 this used to check for never reach a caller in the first place.
    */
-  private async pagesUnsupported(r: Response): Promise<boolean> {
-    if (r.status !== 404 || !(await isEndpointMissing(r))) return false;
-    this.knowledgePagesSupported = false;
-    return true;
+  private async pagesReq(
+    method: string,
+    sub: string,
+    body?: unknown,
+    tolerate: number[] = [],
+    timeoutMs?: number
+  ): Promise<Response | null> {
+    const send = (legacy: boolean) =>
+      this.req(method, this.bankUrl(pagesPath(sub, legacy)), body, tolerate, timeoutMs);
+    let r = await send(this.legacyPagesPaths);
+    if (r.status !== 404 || !(await isEndpointMissing(r))) return r;
+    if (!this.legacyPagesPaths) {
+      r = await send(true);
+      if (r.status !== 404 || !(await isEndpointMissing(r))) {
+        this.legacyPagesPaths = true;
+        return r;
+      }
+    }
+    this.pagesSupported = false;
+    return null;
   }
 
   /**
-   * The bank's knowledge-base tree (folders + pages, nested). The tree carries names, source
+   * The bank's page tree (folders + pages, nested). The tree carries names, source
    * queries and staleness but NOT synthesized content, so it is cheap enough to poll.
    */
-  async tree(): Promise<KnowledgeNode[]> {
-    if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
-    const r = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
-    if (await this.pagesUnsupported(r)) throw new KnowledgePagesUnavailableError();
+  async tree(): Promise<PageNode[]> {
+    if (this.pagesSupported === false) throw new PagesUnavailableError();
+    const r = await this.pagesReq("GET", "/tree");
+    if (!r) throw new PagesUnavailableError();
     // Bank not created yet: it genuinely has no pages, and the capability stays UNKNOWN so the
     // next call (after the first retain mints the bank) asks again instead of short-circuiting.
     if (r.status === 404) return [];
-    this.knowledgePagesSupported = true;
+    this.pagesSupported = true;
     try {
-      return ((await r.json()) as { roots?: KnowledgeNode[] }).roots ?? [];
+      return ((await r.json()) as { roots?: PageNode[] }).roots ?? [];
     } catch {
       return [];
     }
   }
 
   /**
-   * List knowledge pages (ids + names only — no synthesized content), flattened out of the tree
+   * List pages (ids + names only — no synthesized content), flattened out of the tree
    * and shaped as `{items:[…]}` for `parsePageList`. Folders are dropped: they carry no content
    * to read, and a caller enumerating pages wants leaves, not structure.
    *
-   * NOTE the ids are knowledge-base node ids (`kp-…`), NOT the backing mental-model ids. Every
-   * page read/update in this client goes through the same knowledge-base ids, so a page id from
-   * here, from `searchKnowledgePages`, or from a `[[page:<id>]]` link all resolve identically.
+   * NOTE the ids are page node ids (`kp-…`), NOT the backing mental-model ids. Every
+   * page read/update in this client goes through the same page ids, so a page id from
+   * here, from `searchPages`, or from a `[[page:<id>]]` link all resolve identically.
    */
   async listPages(opts: { includeFreshness?: boolean } = {}): Promise<unknown> {
     const items: {
@@ -1031,8 +1071,8 @@ export class HindsightClient {
       last_updated_at?: string | null;
       freshness?: PageFreshness;
     }[] = [];
-    const nodesById = new Map<string, KnowledgeNode>();
-    const walk = (nodes: KnowledgeNode[], folder?: string): void => {
+    const nodesById = new Map<string, PageNode>();
+    const walk = (nodes: PageNode[], folder?: string): void => {
       for (const n of nodes) {
         if (!n?.id || !n?.name) continue;
         if (n.kind === "page") {
@@ -1060,17 +1100,15 @@ export class HindsightClient {
   }
 
   /**
-   * Read one knowledge page's synthesized content by knowledge-base id, shaped by `shapePage` so
+   * Read one page's synthesized content by page id, shaped by `shapePage` so
    * the body arrives once. The endpoint omits the internal reflect trace that built
    * the page — that is 70-95% of the raw bytes and can blow past an MCP host's per-tool-result
    * token cap.
    */
   async getPage(pageId: string, opts: { includeFreshness?: boolean } = {}): Promise<unknown> {
-    if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
-    const r = await this.req(
-      "GET",
-      this.bankUrl(`/knowledge-base/pages/${encodeURIComponent(pageId)}`)
-    );
+    if (this.pagesSupported === false) throw new PagesUnavailableError();
+    const r = await this.pagesReq("GET", `/${encodeURIComponent(pageId)}`);
+    if (!r) throw new PagesUnavailableError();
     if (r.status === 404) throw new Error(`knowledge page not found: ${pageId}`);
     const page = shapePage(await r.json());
     return opts.includeFreshness
@@ -1078,10 +1116,10 @@ export class HindsightClient {
       : page;
   }
 
-  /** Hybrid (BM25 + vector, RRF-fused) server-side search over the bank's knowledge pages.
+  /** Hybrid (BM25 + vector, RRF-fused) server-side search over the bank's pages.
    *  Returns page-level hits with a relevance snippet — the real search behind
    *  hindsight_search_knowledge_pages. */
-  async searchKnowledgePages(
+  async searchPages(
     query: string,
     opts: { limit?: number; timeoutMs?: number; includeFreshness?: boolean } = {}
   ): Promise<
@@ -1095,19 +1133,13 @@ export class HindsightClient {
       freshness?: PageFreshness;
     }[]
   > {
-    if (this.knowledgePagesSupported === false) throw new KnowledgePagesUnavailableError();
+    if (this.pagesSupported === false) throw new PagesUnavailableError();
     const q = `?q=${encodeURIComponent(query)}&limit=${opts.limit ?? this.pageSearchLimit}`;
-    const r = await this.req(
-      "GET",
-      this.bankUrl(`/knowledge-base/search${q}`),
-      undefined,
-      [],
-      opts.timeoutMs
-    );
+    const r = await this.pagesReq("GET", `/search${q}`, undefined, [], opts.timeoutMs);
     // Routed through the same check as every other page endpoint. Without it a server with no
-    // knowledge-base API parsed its own 404 body into zero hits and reported "nothing matched"
+    // pages API parsed its own 404 body into zero hits and reported "nothing matched"
     // forever, which reads as an empty bank rather than a missing feature.
-    if (await this.pagesUnsupported(r)) throw new KnowledgePagesUnavailableError();
+    if (!r) throw new PagesUnavailableError();
     if (r.status === 404) return []; // bank not created yet — no pages to match
     const j = (await r.json()) as {
       results?: {
@@ -1138,9 +1170,9 @@ export class HindsightClient {
   }
 
   /**
-   * Seed the fixed page taxonomy as knowledge-base pages at the tree root, idempotently.
+   * Seed the fixed page taxonomy as pages at the tree root, idempotently.
    *
-   * Matched by NAME, not id: `/knowledge-base/pages` mints its own `kp-…` id, so a stable
+   * Matched by NAME, not id: `POST /pages` mints its own `kp-…` id, so a stable
    * client-chosen id isn't available to match on (unlike the old mental-model path, which keyed
    * off a slug). Names are unique per folder server-side, which makes them a sound key.
    *
@@ -1156,13 +1188,13 @@ export class HindsightClient {
     // No project = a bank no single repository owns: the shared-bank clause. Pages seeded under the
     // old bank-named clause drift from it and are PATCHed below, which rebuilds them (#4490).
     const pages = pagesFor(this.project, pagesConfig, customPages);
-    const existing = new Map<string, KnowledgeNode>();
-    let roots: KnowledgeNode[];
+    const existing = new Map<string, PageNode>();
+    let roots: PageNode[];
     try {
       roots = await this.tree();
     } catch (e) {
-      if (e instanceof KnowledgePagesUnavailableError) {
-        this.log(`[bank] knowledge pages unavailable on ${this.apiUrl}; continuing without pages`);
+      if (e instanceof PagesUnavailableError) {
+        this.log(`[bank] pages unavailable on ${this.apiUrl}; continuing without them`);
         return;
       }
       throw e;
@@ -1187,11 +1219,9 @@ export class HindsightClient {
       if (!hit) {
         // 409 = another deepen run seeded this name between our tree read and this POST. That is
         // the outcome we wanted anyway, so tolerate it rather than failing the whole run.
-        const r = await this.req("POST", this.bankUrl("/knowledge-base/pages"), body, [409]);
-        if (await this.pagesUnsupported(r)) {
-          this.log(
-            `[bank] knowledge pages unavailable on ${this.apiUrl}; continuing without pages`
-          );
+        const r = await this.pagesReq("POST", "", body, [409]);
+        if (!r) {
+          this.log(`[bank] pages unavailable on ${this.apiUrl}; continuing without them`);
           return;
         }
         if (r.status === 404) {
@@ -1228,15 +1258,9 @@ export class HindsightClient {
         }
         // The page's OWN resolved trigger (a hashed cron differs per page), not the shared one.
         if (triggerDrift) patch.trigger = pageTriggerPatch(body.trigger);
-        const r = await this.req(
-          "PATCH",
-          this.bankUrl(`/knowledge-base/nodes/${encodeURIComponent(hit.id)}`),
-          patch
-        );
-        if (await this.pagesUnsupported(r)) {
-          this.log(
-            `[bank] knowledge pages unavailable on ${this.apiUrl}; continuing without pages`
-          );
+        const r = await this.pagesReq("PATCH", `/nodes/${encodeURIComponent(hit.id)}`, patch);
+        if (!r) {
+          this.log(`[bank] pages unavailable on ${this.apiUrl}; continuing without them`);
           return;
         }
         // The node vanished under us (a concurrent delete). Skip it — the remaining pages are
@@ -1250,7 +1274,7 @@ export class HindsightClient {
     }
     const initiatives = await this.resyncInitiativeTriggers(roots, pageTrigger);
     this.log(
-      `[bank] knowledge pages seeded on ${this.bank} (scoped to ${this.project ?? "the shared bank"}): ` +
+      `[bank] pages seeded on ${this.bank} (scoped to ${this.project ?? "the shared bank"}): ` +
         `${created} created, ${updated} re-synced, ` +
         `${pages.length - created - updated - vanished} unchanged` +
         (vanished ? `, ${vanished} deleted under us` : "") +
@@ -1274,7 +1298,7 @@ export class HindsightClient {
    * reused rather than re-fetched.
    */
   private async resyncInitiativeTriggers(
-    roots: KnowledgeNode[],
+    roots: PageNode[],
     pageTrigger: PageTrigger
   ): Promise<number> {
     const folder = roots.find(
@@ -1299,19 +1323,15 @@ export class HindsightClient {
         if (pageTriggerDrifted(page.trigger, desired)) patch.trigger = pageTriggerPatch(desired);
       }
       if (!patch.trigger && !patch.source_query) continue;
-      const r = await this.req(
-        "PATCH",
-        this.bankUrl(`/knowledge-base/nodes/${encodeURIComponent(page.id)}`),
-        patch
-      );
+      const r = await this.pagesReq("PATCH", `/nodes/${encodeURIComponent(page.id)}`, patch);
       // 404 only: `req` throws on every other non-ok status it was not told to tolerate, so the
-      // 405/501 this used to test for never arrive (see `pagesUnsupported`). No latch here — a
+      // 405/501 this used to test for never arrive (see `pagesReq`). No latch here — a
       // node that has gone missing says nothing about the server's capabilities, and nothing about
       // the pages after it either, so skip it rather than abandoning the rest of the re-sync (this
       // `break`ed while the status still carried a server-wide meaning). If it is the BANK that
       // went rather than one node, this costs one wasted PATCH per initiative page instead of one
       // total — bounded by the folder's size, and the next session re-syncs from scratch anyway.
-      if (r.status === 404) continue;
+      if (!r || r.status === 404) continue;
       updated++;
     }
     return updated;
@@ -1353,11 +1373,8 @@ export class HindsightClient {
     let sourceTag: string | undefined;
     if (pageId) {
       // Read only the requested page. A shared client/cwd is not evidence of its owner.
-      const response = await this.req(
-        "GET",
-        this.bankUrl(`/knowledge-base/pages/${encodeURIComponent(pageId)}`)
-      );
-      if (!response.ok) throw new Error("Initiative page is unavailable; no marker was written");
+      const response = await this.pagesReq("GET", `/${encodeURIComponent(pageId)}`);
+      if (!response?.ok) throw new Error("Initiative page is unavailable; no marker was written");
       const page = (await response.json()) as { tags?: unknown };
       const sourceTags = Array.isArray(page.tags)
         ? page.tags.filter(
@@ -1384,9 +1401,9 @@ export class HindsightClient {
       });
       await this.waitForInitiativeSource(operationId, sourceId);
       const folderId = await this.ensureFolder("Initiatives");
-      const r = await this.req(
+      const r = await this.pagesReq(
         "POST",
-        this.bankUrl("/knowledge-base/pages"),
+        "",
         {
           name: args.title,
           source_query:
@@ -1409,12 +1426,13 @@ export class HindsightClient {
         },
         [409]
       );
+      if (!r) throw new PagesUnavailableError();
       let id: unknown;
       if (r.status === 409) {
         // Retrying a capture after a lost create acknowledgement must not invent an id or
         // attach this plan to an unrelated same-name page. Match its actual source tag too.
-        const tree = await this.req("GET", this.bankUrl("/knowledge-base/tree"));
-        const nodes = ((await tree.json()) as { roots?: KnowledgeNode[] }).roots ?? [];
+        const tree = await this.tree();
+        const nodes = tree;
         const siblings = folderId
           ? (nodes.find((node) => node.id === folderId)?.children ?? [])
           : nodes;
@@ -1514,10 +1532,11 @@ export class HindsightClient {
   /** Find a root folder by name (case-insensitive) or create it; returns its id. Fail-open to undefined. */
   async ensureFolder(name: string): Promise<string | undefined> {
     try {
-      const tree = (await (await this.req("GET", this.bankUrl("/knowledge-base/tree"))).json()) as {
-        roots?: { id?: string; kind?: string; name?: string }[];
-      };
-      const hit = (tree.roots || []).find(
+      const r = await this.pagesReq("GET", "/tree");
+      const tree = (await r?.json()) as
+        | { roots?: { id?: string; kind?: string; name?: string }[] }
+        | undefined;
+      const hit = (tree?.roots || []).find(
         (n) => n.kind === "folder" && (n.name || "").toLowerCase() === name.toLowerCase()
       );
       if (hit?.id) return hit.id;
@@ -1525,8 +1544,8 @@ export class HindsightClient {
       /* fall through to create */
     }
     try {
-      const r = await this.req("POST", this.bankUrl("/knowledge-base/folders"), { name });
-      return ((await r.json()) as { id?: string }).id;
+      const r = await this.pagesReq("POST", "/folders", { name });
+      return ((await r?.json()) as { id?: string } | undefined)?.id;
     } catch {
       return undefined;
     }

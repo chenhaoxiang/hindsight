@@ -11,12 +11,15 @@ import json
 import logging
 import os
 import re
+import signal
+import threading
 import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import FrameType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote, unquote
 
@@ -65,6 +68,8 @@ from typing import Callable, Union, get_args, get_origin
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
+    from hindsight_api.worker import WorkerPoller
+
 from fastapi.routing import APIRoute
 from pydantic import (
     BaseModel,
@@ -78,6 +83,7 @@ from pydantic import (
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config_resolver import BankConfigPersistenceConflictError
+from hindsight_api.engine.retain.embedding_utils import EmbeddingsUnavailableError
 from hindsight_api.engine.retain.entity_labels import LabelGroup, migrate_entity_labels_input
 
 
@@ -189,10 +195,11 @@ from hindsight_api.engine.bank_templates import (
     apply_bank_template_manifest,
     validate_bank_template,
 )
+from hindsight_api.engine.embeddings import is_embedding_model_mismatch
 from hindsight_api.engine.memories.base import StoreWriteUnavailable
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
-    KnowledgeTagFilter,
+    PageTagFilter,
     RetainOperationConflictError,
     VisionNotSupportedError,
 )
@@ -375,6 +382,9 @@ def _store_unavailable(exc: BaseException) -> HTTPException | None:
                 detail=str(cur),
                 headers={"Retry-After": str(cur.retry_after)},
             )
+        # This server is still on the embedding model a `hindsight-admin reembed` just replaced.
+        if is_embedding_model_mismatch(cur):
+            return HTTPException(status_code=503, detail=str(cur), headers={"Retry-After": "30"})
     return None
 
 
@@ -2127,7 +2137,7 @@ class CreateBankRequest(BaseModel):
         description=(
             "Toggle the keyword (BM25) retrieval arm during recall. Disabling leaves pure vector "
             "search: the arm is left out of the query entirely rather than filtered to nothing, so "
-            "none of its cost is paid. Also drops the keyword arm from knowledge-page search."
+            "none of its cost is paid. Also drops the keyword arm from page search."
         ),
     )
     enable_temporal_retrieval: bool | None = Field(
@@ -2240,6 +2250,20 @@ class BankConfigResponse(BaseModel):
         description="Fully resolved configuration with all hierarchical overrides applied (Python field names)"
     )
     overrides: dict[str, Any] = Field(description="Bank-specific configuration overrides only (Python field names)")
+
+    @model_validator(mode="after")
+    def _add_deprecated_page_trigger_key(self) -> "BankConfigResponse":
+        # Clients written before the rename read knowledge_page_default_trigger.
+        # Deprecated alias, remove in 2.x.
+        # Copies, so a cached resolved config is never mutated.
+        if "page_default_trigger" in self.config:
+            self.config = {**self.config, "knowledge_page_default_trigger": self.config["page_default_trigger"]}
+        if "page_default_trigger" in self.overrides:
+            self.overrides = {
+                **self.overrides,
+                "knowledge_page_default_trigger": self.overrides["page_default_trigger"],
+            }
+        return self
 
 
 class MemoryGraphNodeData(OpenRowModel):
@@ -2829,7 +2853,18 @@ class UpdateDocumentRequest(BaseModel):
         default=None,
         description="The complete new set of tags for the document and its memory units — this "
         "REPLACES the existing tags rather than adding to them, so omitting a tag drops it and "
-        "`[]` clears them all. Triggers observation invalidation and re-consolidation.",
+        "`[]` clears them all. Triggers observation invalidation and re-consolidation. "
+        "To change only some tags, use `add_tags` / `remove_tags` instead.",
+    )
+    add_tags: list[str] | None = Field(
+        default=None,
+        description="Tags to add to the document, keeping the ones it has. Cannot be combined with `tags`.",
+    )
+    remove_tags: list[str] | None = Field(
+        default=None,
+        description="Tags to remove from the document, keeping the rest (applied before `add_tags`). "
+        "Cannot be combined with `tags`. Tags a memory carries from an entity label group with "
+        "`tag: true` stay on that memory.",
     )
     observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]] | None = Field(
         default=None,
@@ -3099,6 +3134,7 @@ class BankStatsResponse(BaseModel):
                 "pending_consolidation": 0,
                 "failed_consolidation": 0,
                 "total_observations": 45,
+                "paused_mental_models": 0,
             }
         }
     )
@@ -3141,6 +3177,15 @@ class BankStatsResponse(BaseModel):
         description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
     )
     total_observations: int = Field(default=0, description="Total number of observations")
+    paused_mental_models: int = Field(
+        default=0,
+        description=(
+            "Number of mental models whose last refresh failed, so the automatic triggers "
+            "(`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip them until an "
+            "explicit refresh succeeds. Their content stops updating, so alert on this being above 0. "
+            "Each model's `last_refresh_failed_at` says which ones, and its history says why."
+        ),
+    )
 
 
 class LlmOperationHealth(BaseModel):
@@ -3350,13 +3395,15 @@ class MentalModelResponse(BaseModel):
         ),
     )
     created_at: str | None = None
-    is_knowledge_page: bool | None = Field(
+    is_page: bool | None = Field(
         default=None,
         description=(
-            "True when this model holds a knowledge page's content rather than being a standalone "
+            "True when this model holds a page's content rather than being a standalone "
             "mental model. Set by the list and get endpoints."
         ),
     )
+    # deprecated-name: old spelling of is_page, always equal to it. Remove in 2.x.
+    is_knowledge_page: bool | None = Field(default=None, deprecated=True, description="Deprecated: use is_page.")
     reflect_response: dict | None = Field(
         default=None,
         description=(
@@ -3387,15 +3434,15 @@ class MentalModelListResponse(BaseModel):
 
 
 # =========================================================================
-# KNOWLEDGE BASE (folders + pages over mental models, rendered as markdown)
+# PAGES (folders + pages over mental models, rendered as markdown)
 # =========================================================================
 
 
-class KnowledgeNode(BaseModel):
-    """A node in the knowledge-base tree — a folder or a page.
+class PageNode(BaseModel):
+    """A node in the page tree — a folder or a page.
 
     Pages carry ``description``/``tags`` from their backing mental model. The
-    knowledge base is client-managed (CRUD); ``managed`` lets a client tag a node
+    pages is client-managed (CRUD); ``managed`` lets a client tag a node
     as system-owned vs. hand-authored.
     """
 
@@ -3432,13 +3479,13 @@ class KnowledgeNode(BaseModel):
         "sent. Absent on folders, which have no backing mental model, and on a page with no "
         "trigger stored.",
     )
-    children: list["KnowledgeNode"] = FieldWithDefault(list)
+    children: list["PageNode"] = FieldWithDefault(list)
 
 
-class KnowledgeTreeResponse(BaseModel):
-    """The knowledge base as a nested folder/page tree."""
+class PageTreeResponse(BaseModel):
+    """The pages as a nested folder/page tree."""
 
-    roots: list[KnowledgeNode]
+    roots: list[PageNode]
 
 
 class CreateFolderRequest(BaseModel):
@@ -3502,7 +3549,7 @@ class UpdateNodeRequest(BaseModel):
     )
 
 
-class CreateKnowledgePageResponse(BaseModel):
+class CreatePageResponse(BaseModel):
     """Result of creating a page: the node id, its mental model, and the refresh op."""
 
     page_id: str
@@ -3510,12 +3557,12 @@ class CreateKnowledgePageResponse(BaseModel):
     operation_id: str | None = None
 
 
-class KnowledgePageResponse(BaseModel):
-    """A knowledge page rendered as a markdown document."""
+class PageResponse(BaseModel):
+    """A page rendered as a markdown document."""
 
     id: str
     name: str
-    type: str = Field(description="Page type — from a `type:<x>` tag, else 'knowledge-page'.")
+    type: str = Field(description="Page type — from a `type:<x>` tag, else 'page'.")
     description: str | None = Field(default=None, description="The source query that rebuilds the page.")
     tags: list[str] = FieldWithDefault(list)
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
@@ -3537,21 +3584,21 @@ class KnowledgePageResponse(BaseModel):
     )
 
 
-class KnowledgePageBundleFile(BaseModel):
+class PageBundleFile(BaseModel):
     """One file in a portable markdown bundle."""
 
     path: str
     content: str
 
 
-class KnowledgePageBundleResponse(BaseModel):
+class PageBundleResponse(BaseModel):
     """A portable markdown bundle — a flat set of markdown files (index + pages + logs)."""
 
-    files: list[KnowledgePageBundleFile]
+    files: list[PageBundleFile]
 
 
-class KnowledgePageSearchResult(BaseModel):
-    """One hybrid-search hit: a knowledge page and its fused relevance score."""
+class PageSearchResult(BaseModel):
+    """One hybrid-search hit: a page and its fused relevance score."""
 
     id: str
     name: str
@@ -3575,17 +3622,17 @@ class KnowledgePageSearchResult(BaseModel):
     updated_at: str | None = None
 
 
-class KnowledgePageSearchResponse(BaseModel):
-    """Ranked knowledge-page search results (BM25 + vector, RRF-fused)."""
+class PageSearchResponse(BaseModel):
+    """Ranked page search results (BM25 + vector, RRF-fused)."""
 
-    results: list[KnowledgePageSearchResult]
+    results: list[PageSearchResult]
     total: int
 
 
-def _knowledge_node_model(node: dict[str, Any]) -> KnowledgeNode:
-    """Project an engine node dict into a (childless) KnowledgeNode."""
+def _page_node_model(node: dict[str, Any]) -> PageNode:
+    """Project an engine node dict into a (childless) PageNode."""
     is_page = node.get("kind") == "page"
-    return KnowledgeNode(
+    return PageNode(
         id=node["id"],
         kind=node["kind"],
         name=node["name"],
@@ -3601,7 +3648,7 @@ def _knowledge_node_model(node: dict[str, Any]) -> KnowledgeNode:
     )
 
 
-def _knowledge_tag_filter(
+def _page_tag_filter(
     tags: list[str] | None = Query(
         None,
         description="Only return pages carrying these tags (matched per `tags_match`, like recall).",
@@ -3617,17 +3664,17 @@ def _knowledge_tag_filter(
         '`[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. '
         "Top-level groups are AND-ed, and AND-ed with `tags`.",
     ),
-) -> KnowledgeTagFilter:
-    """Query-string tag filter shared by the knowledge-base tree and search. Unlike the
+) -> PageTagFilter:
+    """Query-string tag filter shared by the page tree and search. Unlike the
     entity routes, ``tags`` and ``tag_groups`` may be combined here (AND-ed)."""
     groups = _decode_tag_groups_query(tag_groups)
-    return KnowledgeTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
+    return PageTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
 
 
-def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
+def _build_page_tree(nodes: list[dict[str, Any]]) -> list[PageNode]:
     """Assemble the flat node list into a nested tree of roots."""
-    models = {n["id"]: _knowledge_node_model(n) for n in nodes}
-    roots: list[KnowledgeNode] = []
+    models = {n["id"]: _page_node_model(n) for n in nodes}
+    roots: list[PageNode] = []
     for node in nodes:
         model = models[node["id"]]
         parent_id = node.get("parent_id")
@@ -3638,10 +3685,10 @@ def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
     return roots
 
 
-def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
+def _page_response(node: dict[str, Any]) -> PageResponse:
     """Project a page node (with merged mental-model content) into a markdown document."""
     page = page_markdown.page_type(node.get("tags"))
-    return KnowledgePageResponse(
+    return PageResponse(
         id=node["id"],
         name=node["name"],
         type=page.type,
@@ -4276,6 +4323,28 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
     return audited
 
 
+def _stop_claiming_on_sigterm(poller: "WorkerPoller", loop: asyncio.AbstractEventLoop) -> None:
+    """Have SIGTERM stop the embedded poller's intake at once, then run the server's handler.
+
+    uvicorn reaches the lifespan teardown, where the poller is shut down, only after
+    its own HTTP drain. Until then the poller would keep claiming new work that must
+    fit into what is left of the grace period, and its drain would start late (#6021).
+    uvicorn installs its handler before the lifespan starts, so this one wraps it.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return  # signal handlers can only be set from the main thread (e.g. not under a test client)
+    server_handler = signal.getsignal(signal.SIGTERM)
+    if not callable(server_handler):
+        return  # no server handling SIGTERM: the default kills the process, there is no drain to start early
+
+    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
+        # call_soon_threadsafe is the signal-safe way into the loop.
+        loop.call_soon_threadsafe(poller.begin_shutdown)
+        server_handler(signum, frame)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def create_app(
     memory: MemoryEngine,
     initialize_memory: bool = True,
@@ -4413,6 +4482,7 @@ def create_app(
                 on_wall_timeout=memory.on_task_wall_timeout,
             )
             poller_task = asyncio.create_task(poller.run())
+            _stop_claiming_on_sigterm(poller, asyncio.get_running_loop())
             logging.info(f"Worker poller started (worker_id={worker_id})")
         elif config.worker_enabled and not memory._backend.supports_worker_poller:
             logging.warning(
@@ -4439,7 +4509,7 @@ def create_app(
 
         # Shutdown worker poller if running
         if poller is not None:
-            await poller.shutdown_graceful(timeout=30.0)
+            await poller.shutdown_graceful(timeout=config.worker_shutdown_drain_seconds)
             if poller_task is not None:
                 poller_task.cancel()
                 try:
@@ -5903,6 +5973,8 @@ def _register_routes(app: FastAPI):
                 pending_consolidation=stats["pending_consolidation"],
                 failed_consolidation=stats.get("failed_consolidation", 0),
                 total_observations=stats["total_observations"],
+                # .get(): a row cached by an older build has no paused count.
+                paused_mental_models=stats.get("paused_mental_models", 0),
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -6176,10 +6248,12 @@ def _register_routes(app: FastAPI):
         ),
         limit: int = Query(100, ge=1, le=1000),
         offset: int = Query(0, ge=0),
-        exclude_knowledge_pages: bool = Query(
+        exclude_pages: bool = Query(
             False,
-            description="Leave out the mental models that hold knowledge page content (list standalone models only).",
+            description="Leave out the mental models that hold page content (list standalone models only).",
         ),
+        # deprecated-name: old spelling of exclude_pages, kept for existing callers. Remove in 2.x.
+        exclude_knowledge_pages: bool = Query(False, deprecated=True, description="Deprecated: use exclude_pages."),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List mental models for a bank.
@@ -6205,7 +6279,7 @@ def _register_routes(app: FastAPI):
                 limit=limit,
                 offset=offset,
                 with_staleness=True,
-                exclude_knowledge_pages=exclude_knowledge_pages,
+                exclude_pages=exclude_pages or exclude_knowledge_pages,
                 request_context=request_context,
             )
             return MentalModelListResponse(
@@ -6512,7 +6586,7 @@ def _register_routes(app: FastAPI):
                 # the model's current trigger. A full dump would carry this model's own
                 # defaults (mode="full", exclude_mental_models=False, no cron) into every
                 # update, so changing one setting silently reset the rest — which for a
-                # knowledge page meant losing delta mode and its observation-only scope.
+                # page meant losing delta mode and its observation-only scope.
                 # Same fix as #3506, which corrected only the page routes.
                 trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
                 request_context=request_context,
@@ -6560,7 +6634,7 @@ def _register_routes(app: FastAPI):
             raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/mental-models/{mental_model_id}")
 
     # =========================================================================
-    # KNOWLEDGE BASE ENDPOINTS (folders + pages, markdown)
+    # PAGES ENDPOINTS (folders + pages, markdown)
     # =========================================================================
     # A hierarchy of folders and pages over mental models. Pages render to markdown
     # documents (markdown body + YAML frontmatter); see engine/page_markdown.py. The static
@@ -6568,55 +6642,79 @@ def _register_routes(app: FastAPI):
     # the /pages/{id} and /nodes/{id} path-parameter routes so they win.
 
     @app.get(
-        "/v1/default/banks/{bank_id}/knowledge-base/tree",
-        response_model=KnowledgeTreeResponse,
-        summary="Get the knowledge-base tree",
-        description="Return the knowledge base as a nested tree of folders and pages.",
-        operation_id="get_knowledge_base_tree",
-        tags=["Knowledge Base"],
+        "/v1/default/banks/{bank_id}/pages/tree",
+        response_model=PageTreeResponse,
+        summary="Get the page tree",
+        description="Return a bank's pages as a nested tree of folders and pages.",
+        operation_id="get_page_tree",
+        tags=["Pages"],
         responses=_BANK_NOT_FOUND_RESPONSES,
     )
-    async def api_knowledge_base_tree(
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/tree",
+        summary="Get the page tree (deprecated path)",
+        description="Deprecated alias of `GET /v1/default/banks/{bank_id}/pages/tree`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageTreeResponse,
+        operation_id="get_knowledge_base_tree",
+        tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_page_tree(
         bank_id: str,
-        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
+        tag_filter: PageTagFilter = Depends(_page_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Return the folder/page tree for a bank."""
         try:
-            nodes = await app.state.memory.list_knowledge_nodes(
+            nodes = await app.state.memory.list_page_nodes(
                 bank_id=bank_id, with_staleness=True, tag_filter=tag_filter, request_context=request_context
             )
-            return KnowledgeTreeResponse(roots=_build_knowledge_tree(nodes))
+            return PageTreeResponse(roots=_build_page_tree(nodes))
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/tree")
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/pages/tree")
 
     @app.post(
-        "/v1/default/banks/{bank_id}/knowledge-base/folders",
-        response_model=KnowledgeNode,
+        "/v1/default/banks/{bank_id}/pages/folders",
+        response_model=PageNode,
         status_code=201,
-        summary="Create a knowledge-base folder",
+        summary="Create a folder",
         description="Create a folder, optionally nested under a parent folder.",
+        operation_id="create_page_folder",
+        tags=["Pages"],
+    )
+    @app.post(
+        "/v1/default/banks/{bank_id}/knowledge-base/folders",
+        summary="Create a folder (deprecated path)",
+        description="Deprecated alias of `POST /v1/default/banks/{bank_id}/pages/folders`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageNode,
+        status_code=201,
         operation_id="create_knowledge_folder",
         tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
     )
-    async def api_create_knowledge_folder(
+    async def api_create_page_folder(
         bank_id: str,
         body: CreateFolderRequest,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Create a folder node."""
         try:
-            node = await app.state.memory.create_knowledge_folder(
+            node = await app.state.memory.create_page_folder(
                 bank_id=bank_id,
                 name=body.name,
                 parent_id=body.parent_id,
                 request_context=request_context,
             )
-            return _knowledge_node_model(node)
+            return _page_node_model(node)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except OperationValidationError as e:
@@ -6624,26 +6722,38 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/knowledge-base/folders")
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/pages/folders")
 
     @app.post(
-        "/v1/default/banks/{bank_id}/knowledge-base/pages",
-        response_model=CreateKnowledgePageResponse,
+        "/v1/default/banks/{bank_id}/pages",
+        response_model=CreatePageResponse,
         status_code=201,
-        summary="Create a knowledge-base page",
+        summary="Create a page",
         description="Create a page (a mental model + tree node). Content is generated asynchronously; "
         "use the returned operation_id to track completion.",
+        operation_id="create_page",
+        tags=["Pages"],
+    )
+    @app.post(
+        "/v1/default/banks/{bank_id}/knowledge-base/pages",
+        summary="Create a page (deprecated path)",
+        description="Deprecated alias of `POST /v1/default/banks/{bank_id}/pages`; same request and response. "
+        "Removed in 2.x.",
+        response_model=CreatePageResponse,
+        status_code=201,
         operation_id="create_knowledge_page",
         tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
     )
-    async def api_create_knowledge_page(
+    async def api_create_page(
         bank_id: str,
         body: CreatePageRequest,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Create a page node (async content generation)."""
         try:
-            node = await app.state.memory.create_knowledge_page(
+            node = await app.state.memory.create_page(
                 bank_id=bank_id,
                 name=body.name,
                 source_query=body.source_query,
@@ -6652,7 +6762,7 @@ def _register_routes(app: FastAPI):
                 tags=body.tags if body.tags else None,
                 max_tokens=body.max_tokens,
                 # Only what the client actually set: the engine merges these over the
-                # knowledge-page defaults, and a full dump would drown them in this model's
+                # page defaults, and a full dump would drown them in this model's
                 # own field defaults (mode="full", exclude_mental_models=False) — which is
                 # how every page created with a trigger lost its delta refresh (#3506).
                 trigger=body.trigger.model_dump(exclude_unset=True) if body.trigger else None,
@@ -6665,7 +6775,7 @@ def _register_routes(app: FastAPI):
                 mental_model_id=node["mental_model_id"],
                 request_context=request_context,
             )
-            return CreateKnowledgePageResponse(
+            return CreatePageResponse(
                 page_id=node["id"],
                 mental_model_id=node["mental_model_id"],
                 operation_id=result["operation_id"],
@@ -6677,77 +6787,99 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/knowledge-base/pages")
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/pages")
 
     @app.get(
-        "/v1/default/banks/{bank_id}/knowledge-base/export",
-        response_model=KnowledgePageBundleResponse,
-        summary="Export the knowledge base as a markdown bundle",
+        "/v1/default/banks/{bank_id}/pages/export",
+        response_model=PageBundleResponse,
+        summary="Export the pages as a markdown bundle",
         description="Return a portable markdown bundle: a nested index.md, one <id>.md per page, and history logs.",
-        operation_id="export_knowledge_base",
-        tags=["Knowledge Base"],
+        operation_id="export_pages",
+        tags=["Pages"],
         responses=_BANK_NOT_FOUND_RESPONSES,
     )
-    async def api_export_knowledge_base(
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/export",
+        summary="Export the pages as a markdown bundle (deprecated path)",
+        description="Deprecated alias of `GET /v1/default/banks/{bank_id}/pages/export`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageBundleResponse,
+        operation_id="export_knowledge_base",
+        tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_export_pages(
         bank_id: str,
         request_context: RequestContext = Depends(get_request_context),
     ):
-        """Export a bank's knowledge base as a flat markdown bundle."""
+        """Export a bank's pages as a flat markdown bundle."""
         try:
-            export = await app.state.memory.export_knowledge_base(bank_id=bank_id, request_context=request_context)
+            export = await app.state.memory.export_pages(bank_id=bank_id, request_context=request_context)
             files = [
-                KnowledgePageBundleFile(
-                    path=page_markdown.INDEX_FILENAME, content=page_markdown.render_index(export.nodes)
-                )
+                PageBundleFile(path=page_markdown.INDEX_FILENAME, content=page_markdown.render_index(export.nodes))
             ]
             for page in export.pages:
                 files.append(
-                    KnowledgePageBundleFile(
+                    PageBundleFile(
                         path=page_markdown.page_filename(page.node_id),
                         content=page_markdown.render_document(page.page),
                     )
                 )
                 if page.history:
                     files.append(
-                        KnowledgePageBundleFile(
+                        PageBundleFile(
                             path=page_markdown.log_filename(page.node_id),
                             content=page_markdown.render_log(page.page, page.history),
                         )
                     )
-            return KnowledgePageBundleResponse(files=files)
+            return PageBundleResponse(files=files)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/export")
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/pages/export")
 
     @app.get(
-        "/v1/default/banks/{bank_id}/knowledge-base/search",
-        response_model=KnowledgePageSearchResponse,
-        summary="Hybrid search over knowledge pages (BM25 + vector)",
+        "/v1/default/banks/{bank_id}/pages/search",
+        response_model=PageSearchResponse,
+        summary="Hybrid search over pages (BM25 + vector)",
         description=(
-            "Doc-level hybrid search across a bank's knowledge pages: a full-text (BM25) match "
+            "Doc-level hybrid search across a bank's pages: a full-text (BM25) match "
             "and a vector-similarity match, Reciprocal-Rank-Fusion fused. No reranker — tuned for latency."
         ),
-        operation_id="search_knowledge_base",
-        tags=["Knowledge Base"],
+        operation_id="search_pages",
+        tags=["Pages"],
         responses=_BANK_NOT_FOUND_RESPONSES,
     )
-    async def api_search_knowledge_base(
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/search",
+        summary="Hybrid search over pages (BM25 + vector) (deprecated path)",
+        description="Deprecated alias of `GET /v1/default/banks/{bank_id}/pages/search`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageSearchResponse,
+        operation_id="search_knowledge_base",
+        tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_search_pages(
         bank_id: str,
         q: str = Query(..., description="Search query", min_length=1),
         limit: int = Query(10, ge=1, le=50, description="Maximum results to return"),
-        tag_filter: KnowledgeTagFilter = Depends(_knowledge_tag_filter),
+        tag_filter: PageTagFilter = Depends(_page_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
-        """Return knowledge pages ranked by fused BM25 + vector relevance."""
+        """Return pages ranked by fused BM25 + vector relevance."""
         try:
-            results = await app.state.memory.search_knowledge_pages(
+            results = await app.state.memory.search_pages(
                 bank_id=bank_id, query=q, limit=limit, tag_filter=tag_filter, request_context=request_context
             )
-            return KnowledgePageSearchResponse(
-                results=[KnowledgePageSearchResult(**r) for r in results],
+            return PageSearchResponse(
+                results=[PageSearchResult(**r) for r in results],
                 total=len(results),
             )
         except OperationValidationError as e:
@@ -6755,49 +6887,69 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
-            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/search")
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/pages/search")
 
     @app.get(
-        "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
-        response_model=KnowledgePageResponse,
-        summary="Get a knowledge-base page",
+        "/v1/default/banks/{bank_id}/pages/{page_id}",
+        response_model=PageResponse,
+        summary="Get a page",
         description="Return a single page as a markdown document (frontmatter + markdown body).",
+        operation_id="get_page",
+        tags=["Pages"],
+    )
+    @app.get(
+        "/v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}",
+        summary="Get a page (deprecated path)",
+        description="Deprecated alias of `GET /v1/default/banks/{bank_id}/pages/{page_id}`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageResponse,
         operation_id="get_knowledge_page",
         tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
     )
-    async def api_get_knowledge_page(
+    async def api_get_page(
         bank_id: str,
         page_id: str,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get a single page as a markdown document."""
         try:
-            node = await app.state.memory.get_knowledge_page(
-                bank_id=bank_id, page_id=page_id, request_context=request_context
-            )
+            node = await app.state.memory.get_page(bank_id=bank_id, page_id=page_id, request_context=request_context)
             if node is None:
-                raise HTTPException(status_code=404, detail=f"Knowledge page '{page_id}' not found")
-            return _knowledge_page_response(node)
+                raise HTTPException(status_code=404, detail=f"Page '{page_id}' not found")
+            return _page_response(node)
         except (AuthenticationError, HTTPException):
             raise
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except Exception as e:
-            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/knowledge-base/pages/{page_id}")
+            raise _internal_error(e, f"GET /v1/default/banks/{bank_id}/pages/{page_id}")
 
     @app.patch(
-        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
-        response_model=KnowledgeNode,
-        summary="Rename/move a knowledge-base node or update a page's options",
+        "/v1/default/banks/{bank_id}/pages/nodes/{node_id}",
+        response_model=PageNode,
+        summary="Rename/move a page node or update a page's options",
         description="Rename a node (set `name`), move it under another folder (set `parent_id`, null "
         "for the root), and/or update a page's options (`source_query`, `tags`, `max_tokens`, `trigger`). "
         "Changing `source_query` schedules an async refresh so the page rebuilds against the new question. "
         "`trigger` is applied as a patch: the fields you send are updated and the rest keep the page's "
         "current values.",
+        operation_id="update_page_node",
+        tags=["Pages"],
+    )
+    @app.patch(
+        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+        summary="Rename/move a page node or update a page's options (deprecated path)",
+        description="Deprecated alias of `PATCH /v1/default/banks/{bank_id}/pages/nodes/{node_id}`; same request and response. "
+        "Removed in 2.x.",
+        response_model=PageNode,
         operation_id="update_knowledge_node",
         tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
     )
-    async def api_update_knowledge_node(
+    async def api_update_page_node(
         bank_id: str,
         node_id: str,
         body: UpdateNodeRequest,
@@ -6817,7 +6969,7 @@ def _register_routes(app: FastAPI):
             # One call, one transaction: a rename must not survive the move that
             # fails after it, which is what left clients retrying against a tree
             # they never asked for.
-            updated = await app.state.memory.update_knowledge_node(
+            updated = await app.state.memory.update_page_node(
                 bank_id=bank_id,
                 node_id=node_id,
                 name=body.name,
@@ -6834,7 +6986,7 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
             )
             if updated is None:
-                raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
+                raise HTTPException(status_code=404, detail=f"Page node '{node_id}' not found")
             # A new source query means the content is stale — rebuild it. Scheduled
             # only once the patch has committed, so a refresh is never queued for a
             # change that rolled back.
@@ -6844,7 +6996,7 @@ def _register_routes(app: FastAPI):
                     mental_model_id=updated["mental_model_id"],
                     request_context=request_context,
                 )
-            return _knowledge_node_model(updated)
+            return _page_node_model(updated)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
@@ -6852,34 +7004,44 @@ def _register_routes(app: FastAPI):
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except Exception as e:
-            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}")
+            raise _internal_error(e, f"PATCH /v1/default/banks/{bank_id}/pages/nodes/{node_id}")
 
     @app.delete(
-        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
-        summary="Delete a knowledge-base node",
+        "/v1/default/banks/{bank_id}/pages/nodes/{node_id}",
+        summary="Delete a page node",
         description="Delete a folder or page and its whole subtree (pages' mental models are removed too).",
+        operation_id="delete_page_node",
+        tags=["Pages"],
+    )
+    @app.delete(
+        "/v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}",
+        summary="Delete a page node (deprecated path)",
+        description="Deprecated alias of `DELETE /v1/default/banks/{bank_id}/pages/nodes/{node_id}`; same request and response. "
+        "Removed in 2.x.",
         operation_id="delete_knowledge_node",
         tags=["Knowledge Base"],
+        # Old path, kept for existing callers. Remove in 2.x.
+        deprecated=True,
     )
-    async def api_delete_knowledge_node(
+    async def api_delete_page_node(
         bank_id: str,
         node_id: str,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Delete a node and its subtree."""
         try:
-            deleted = await app.state.memory.delete_knowledge_node(
+            deleted = await app.state.memory.delete_page_node(
                 bank_id=bank_id, node_id=node_id, request_context=request_context
             )
             if not deleted:
-                raise HTTPException(status_code=404, detail=f"Knowledge node '{node_id}' not found")
+                raise HTTPException(status_code=404, detail=f"Page node '{node_id}' not found")
             return {"status": "deleted"}
         except (AuthenticationError, HTTPException):
             raise
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except Exception as e:
-            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/knowledge-base/nodes/{node_id}")
+            raise _internal_error(e, f"DELETE /v1/default/banks/{bank_id}/pages/nodes/{node_id}")
 
     # =========================================================================
     # DIRECTIVES ENDPOINTS
@@ -7441,8 +7603,11 @@ def _register_routes(app: FastAPI):
         description="Update mutable fields on a document without re-processing its content.\n\n"
         "**Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — "
         "send the complete set you want the document to end up with, and any tag you leave out is "
-        "dropped. An empty array (`[]`) therefore clears every tag; only omitting the field "
-        "entirely is rejected (422).\n\n"
+        "dropped. An empty array (`[]`) therefore clears every tag.\n\n"
+        "**Partial tag change** (`add_tags`, `remove_tags`): adds or removes only the listed tags and "
+        'keeps the rest, e.g. `{"add_tags": ["team-c"], "remove_tags": ["team-a"]}`. '
+        "Removals apply first. Cannot be combined with `tags` (422). A request with none of `tags`, "
+        "`add_tags`, `remove_tags` or `observation_scopes` is rejected (422).\n\n"
         "The new tags are propagated to all associated memory units.\n\n"
         "**Observation scopes** (`observation_scopes`): Replaces how the document's memories are "
         "scoped during consolidation, with the same values retain accepts. Use it to move a bank "
@@ -7452,8 +7617,7 @@ def _register_routes(app: FastAPI):
         "to: its observations are deleted and it is queued again, along with co-source memories from "
         "other documents that shared those observations. A change that resolves to the same scopes "
         "(a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the "
-        "current values) keeps every observation and queues nothing.\n\n"
-        "At least one field must be provided.",
+        "current values) keeps every observation and queues nothing.",
         operation_id="update_document",
         tags=["Documents"],
     )
@@ -7470,17 +7634,20 @@ def _register_routes(app: FastAPI):
         Args:
             bank_id: Memory Bank ID (from path)
             document_id: Document ID (from path)
-            body: Fields to update (tags, observation_scopes)
+            body: Fields to update (tags, add_tags, remove_tags, observation_scopes)
         """
-        if body.tags is None and body.observation_scopes is None:
+        if body.tags is None and body.add_tags is None and body.remove_tags is None and body.observation_scopes is None:
             raise HTTPException(
-                status_code=422, detail="At least one field (tags, observation_scopes) must be provided"
+                status_code=422,
+                detail="At least one field (tags, add_tags, remove_tags, observation_scopes) must be provided",
             )
         try:
             result = await app.state.memory.update_document(
                 document_id,
                 bank_id,
                 tags=body.tags,
+                add_tags=body.add_tags,
+                remove_tags=body.remove_tags,
                 observation_scopes=body.observation_scopes,
                 request_context=request_context,
             )
@@ -8173,13 +8340,13 @@ def _register_routes(app: FastAPI):
             # tags, max_tokens and trigger and nothing else. Asking for content
             # would pull every model's synthesized body across the wire, and
             # report a read of it, for a field this endpoint discards.
-            # Knowledge pages are left out: a template carries no pages, and their
+            # Pages are left out: a template carries no pages, and their
             # models would come back on import as standalone mental models.
             mental_models_raw = await app.state.memory.list_mental_models(
                 bank_id=bank_id,
                 limit=None,
                 detail="config",
-                exclude_knowledge_pages=True,
+                exclude_pages=True,
                 request_context=request_context,
             )
             template_mental_models: list[BankTemplateMentalModel] = []
@@ -8273,7 +8440,7 @@ def _register_routes(app: FastAPI):
         "carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, "
         "and filename. Pass document_id query params to export specific documents, or omit to export the whole "
         "bank; include_observations=true carries consolidated observations and include_knowledge_base=true carries "
-        "Mental Models plus Knowledge Pages (all whole-bank export only).",
+        "Mental Models plus Pages (all whole-bank export only).",
         operation_id="export_documents",
         tags=["Document Transfer"],
         # Superseded by POST /v1/default/banks/{bank_id}/transfer/export, which
@@ -8289,7 +8456,7 @@ def _register_routes(app: FastAPI):
         ),
         include_knowledge_base: bool = Query(
             default=False,
-            description="Also export Mental Models and Knowledge Pages (restored on import; whole-bank only)",
+            description="Also export Mental Models and Pages (restored on import; whole-bank only)",
         ),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -8388,11 +8555,11 @@ def _register_routes(app: FastAPI):
     #                       attachments (bytes included), the curation archive,
     #                       the operations log, the maintenance queues, and what
     #                       the bank synthesized from all of it: mental models,
-    #                       their refresh history and the knowledge-page tree
+    #                       their refresh history and the page tree
     #   include_bank_config the bank row (per-bank config), directives, webhooks
     #   include_history     audit_log and llm_requests
     #
-    # Mental models and knowledge pages are data, not configuration: their
+    # Mental models and pages are data, not configuration: their
     # evidence cites memory units by id, so they are only coherent alongside the
     # facts they were derived from.
     #
@@ -8406,7 +8573,7 @@ def _register_routes(app: FastAPI):
         description="Submit an async export of a bank as a transfer ZIP archive. Three flags choose what the "
         "archive carries: include_data (documents, facts, observations, attachments and their bytes, the "
         "curation archive, the operations log and the maintenance queues), include_bank_config (bank config, "
-        "mental models and their history, knowledge pages), include_bank_config (the bank's config "
+        "mental models and their history, pages), include_bank_config (the bank's config "
         "overrides, directives and webhooks) and include_history "
         "(audit_log, llm_requests). Embeddings and database ids are never carried — importing re-embeds with "
         "the target bank's model and re-resolves entities, so an archive moves between instances configured "
@@ -8600,7 +8767,7 @@ def _register_routes(app: FastAPI):
         "This is the export and import above run back to back on this instance, so nothing is re-extracted "
         "and no LLM is called — facts are re-embedded and entities re-resolved, exactly as a restore does. "
         "The same three flags choose what the clone inherits: include_data (documents, facts, observations, "
-        "attachments, the curation archive, the operations log, and the mental models and knowledge pages "
+        "attachments, the curation archive, the operations log, and the mental models and pages "
         "synthesized from them), include_bank_config (the bank's config overrides, directives and "
         "**webhooks**) and include_history (audit_log, llm_requests).\n\n"
         "Note the webhooks: they travel with the bank's configuration, so a clone made with the default "
@@ -8619,8 +8786,7 @@ def _register_routes(app: FastAPI):
         target_bank_id: str = Query(..., description="Bank to create; must not already exist"),
         include_data: bool = Query(
             default=True,
-            description="Copy the memories, what backs them, and the mental models and knowledge pages "
-            "synthesized from them",
+            description="Copy the memories, what backs them, and the mental models and pages synthesized from them",
         ),
         include_bank_config: bool = Query(
             default=True, description="Copy the bank's config overrides, directives and webhooks"
@@ -9646,6 +9812,10 @@ def _register_routes(app: FastAPI):
             # The request is well-formed; the server's retain LLM cannot read the
             # images it carries. 422 rather than 400 for that distinction.
             raise HTTPException(status_code=422, detail=str(e))
+        except EmbeddingsUnavailableError as e:
+            # Stopped before extraction because the embeddings backend is down (#5999):
+            # retryable, not a server fault in the request.
+            raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "60"})
         except (AuthenticationError, HTTPException):
             raise
         except ValueError as e:

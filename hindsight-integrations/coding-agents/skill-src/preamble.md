@@ -1,6 +1,6 @@
 ---
 name: hindsight-coding-agent
-description: How this machine's Hindsight coding-agent memory works — the plugin behind the 🧠 banner. Use when the user says "store/remember this in hindsight", asks what the memory/knowledge pages are, wants to configure per-repo memory (disable, rename banks, git depth), or something memory-related looks broken.
+description: How this machine's Hindsight coding-agent memory works — the plugin behind the 🧠 banner. Use when the user says "store/remember this in hindsight", asks what the memory/pages are, wants to configure per-repo memory (disable, rename banks, git depth), or something memory-related looks broken.
 ---
 
 # Hindsight Coding-Agent Memory
@@ -15,7 +15,7 @@ explains what happens automatically, which tools you have, and how to configure 
   `↳ memory bank “coding-agent::<repo>”`). Worktrees share the main repo's bank.
 - **Ingestion builds itself**: on first open, the bank is seeded from recent commit messages and a
   read-only codebase survey; every session start, a background engine tops it up (new commits, new
-  conversations) and keeps 5 knowledge pages current. There is NO ingest command to run.
+  conversations) and keeps 5 pages current. There is NO ingest command to run.
 - **Session synthesis**: by default, the first prompt of a session triggers one deep memory
   synthesis (`reflect`) injected into context. `autoInject` switches the source: `pages` (knowledge
   page search hits), `recall` (recalled observations), or `none` (nothing injected; the agent

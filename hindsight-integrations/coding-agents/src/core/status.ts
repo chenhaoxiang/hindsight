@@ -4,7 +4,7 @@
  * Ingestion is automatic and background (core/seed.ts spawns the deepen engine at session start),
  * so "is my memory ready?" needs an inspectable answer instead of a command exit code. `syncStatus`
  * compares the LIVE bank against the repo: gitlog seed present, how much of the recent history has
- * been deepened (per-commit diffs), chats ingested, knowledge pages present, extractions still
+ * been deepened (per-commit diffs), chats ingested, pages present, extractions still
  * running. Agents get it as the `hindsight_sync_status` tool; harnesses (e.g. the benchmark) poll
  * the same via `dist/status.js`.
  *
@@ -16,7 +16,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { commitsSince, repoNameOf } from "./git";
-import { parsePageList } from "./knowledge-injection";
+import { parsePageList } from "./page-injection";
 import { SURVEY_DOC_IDS } from "./survey";
 import type { ConsolidationStatus } from "./hindsight";
 
@@ -24,7 +24,7 @@ import type { ConsolidationStatus } from "./hindsight";
 export interface StatusClient {
   listDocumentIds(tag: string, tagsMatch?: "all" | "all_strict"): Promise<Set<string>>;
   listPages(opts?: { includeFreshness?: boolean }): Promise<unknown>;
-  knowledgePagesSupported?: boolean;
+  pagesSupported?: boolean;
   activeOperations(): Promise<number>;
   consolidationStatus?(): Promise<ConsolidationStatus>;
 }
@@ -124,7 +124,7 @@ export async function syncStatus(
   const commits = repoDir ? commitCount(repoDir) : null;
   const gitDiffTarget = commits === null ? null : Math.min(DEEPEN_DIFF_TARGET, commits);
 
-  const seedReady = gitlogPresent && (client.knowledgePagesSupported === false || pages.length > 0);
+  const seedReady = gitlogPresent && (client.pagesSupported === false || pages.length > 0);
   return {
     bank,
     gitlogPresent,

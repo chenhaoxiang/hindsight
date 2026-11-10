@@ -77,7 +77,10 @@ async def _teardown_memory_engine(mem: MemoryEngine) -> None:
     unconditionally; it's a no-op when close() already did it.
     """
     try:
-        if mem._pool and not mem._pool._closing:
+        # getattr: only asyncpg's pool has `_closing`. On Oracle the attribute read raised,
+        # the except below swallowed it, and every test leaked its pool's sessions until
+        # the Oracle listener refused new connections (ORA-12516, #5786).
+        if mem._pool and not getattr(mem._pool, "_closing", False):
             await mem.close()
     except Exception:
         pass
@@ -206,6 +209,19 @@ DEFAULT_PG0_PORT = int(os.environ.get("HINDSIGHT_TEST_PG_PORT", "5556"))
 os.environ.setdefault("HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS", "0")
 os.environ.setdefault("HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS", "0")
 os.environ.setdefault("HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS", "-1")
+# The attachment sweep only deletes day-old rows, so it could not race a test's own
+# fresh attachments — but left on it alone would start the loop for the suite.
+os.environ.setdefault("HINDSIGHT_API_ATTACHMENT_SWEEP_INTERVAL_SECONDS", "0")
+
+# Same reason, for the worker poller the API lifespan starts by default. Any test
+# that runs ``app.router.lifespan_context`` (the MCP routing tests, for one) would
+# otherwise start a real poller that claims *every* pending operation in the shared
+# public schema and runs it — including rows other tests deliberately leave queued
+# behind a stalled task backend. One such claim turned a queued mental-model refresh
+# into 'completed' mid-test, so the next submit no longer had a pending row to fold
+# into and queued a second one (#6395). Tests that exercise claiming build their own
+# WorkerPoller against a private schema (see test_worker.py).
+os.environ.setdefault("HINDSIGHT_API_WORKER_ENABLED", "false")
 
 
 # Load environment variables from .env at the start of test session

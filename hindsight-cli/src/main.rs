@@ -104,9 +104,10 @@ enum Commands {
     #[command(subcommand)]
     MentalModel(MentalModelCommands),
 
-    /// Manage the knowledge base (folder/page tree, search, export)
-    #[command(subcommand)]
-    KnowledgeBase(KnowledgeBaseCommands),
+    /// Manage the bank's pages (folder/page tree, search, export)
+    // `knowledge-base` is the old name, kept so existing scripts work. Remove in 2.x.
+    #[command(subcommand, alias = "knowledge-base")]
+    Pages(PagesCommands),
 
     /// Manage directives (behavioral rules)
     #[command(subcommand)]
@@ -120,7 +121,7 @@ enum Commands {
     #[command(subcommand)]
     Audit(AuditCommands),
 
-    /// Mirror a bank's knowledge base as a live local folder of markdown files
+    /// Mirror a bank's pages as a live local folder of markdown files
     #[command(subcommand)]
     Fs(commands::fs::FsCommands),
 
@@ -809,8 +810,16 @@ enum DocumentCommands {
 
         /// New tag list (comma-separated); `--tags ""` removes every tag. Triggers observation
         /// invalidation + re-consolidation.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["add_tags", "remove_tags"])]
         tags: Option<Vec<String>>,
+
+        /// Tags to add, keeping the others (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        add_tags: Option<Vec<String>>,
+
+        /// Tags to remove, keeping the others (comma-separated; applied before --add-tags)
+        #[arg(long, value_delimiter = ',')]
+        remove_tags: Option<Vec<String>>,
 
         /// New observation scopes: per_tag, combined, all_combinations, shared, or a JSON list
         /// of tag lists (e.g. '[["user:alice"]]'). Memories whose scopes move are re-consolidated.
@@ -1239,7 +1248,7 @@ enum MentalModelCommands {
 }
 
 #[derive(Subcommand)]
-enum KnowledgeBaseCommands {
+enum PagesCommands {
     /// Show the folder/page tree for a bank
     Tree {
         /// Bank ID
@@ -1383,7 +1392,7 @@ enum KnowledgeBaseCommands {
         yes: bool,
     },
 
-    /// Export the knowledge base as a markdown bundle
+    /// Export all pages as a markdown bundle
     Export {
         /// Bank ID
         bank_id: String,
@@ -1917,16 +1926,24 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
                 tags,
+                add_tags,
+                remove_tags,
                 observation_scopes,
             } => {
                 // `--tags ""` parses as one empty tag; drop blanks so it clears the set
                 // instead of storing "".
-                let tags = tags.map(|t| t.into_iter().filter(|tag| !tag.is_empty()).collect());
+                let non_blank = |t: Option<Vec<String>>| {
+                    t.map(|t| t.into_iter().filter(|tag| !tag.is_empty()).collect())
+                };
                 commands::document::update(
                     &client,
                     &bank_id,
                     &document_id,
-                    tags,
+                    api::TagChange {
+                        tags: non_blank(tags),
+                        add_tags: non_blank(add_tags),
+                        remove_tags: non_blank(remove_tags),
+                    },
                     observation_scopes,
                     verbose,
                     output_format,
@@ -2132,25 +2149,25 @@ fn run() -> Result<()> {
             ),
         },
 
-        // Knowledge base commands
-        Commands::KnowledgeBase(kb_cmd) => match kb_cmd {
-            KnowledgeBaseCommands::Tree {
+        // Pages commands
+        Commands::Pages(kb_cmd) => match kb_cmd {
+            PagesCommands::Tree {
                 bank_id,
                 tags,
                 tags_match,
                 tag_groups,
-            } => commands::knowledge_base::tree(
+            } => commands::pages::tree(
                 &client,
                 &bank_id,
-                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
+                &commands::pages::tag_filter(tags, tags_match, tag_groups)?,
                 verbose,
                 output_format,
             ),
-            KnowledgeBaseCommands::CreateFolder {
+            PagesCommands::CreateFolder {
                 bank_id,
                 name,
                 parent_id,
-            } => commands::knowledge_base::create_folder(
+            } => commands::pages::create_folder(
                 &client,
                 &bank_id,
                 &name,
@@ -2158,7 +2175,7 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
-            KnowledgeBaseCommands::CreatePage {
+            PagesCommands::CreatePage {
                 bank_id,
                 name,
                 source_query,
@@ -2167,7 +2184,7 @@ fn run() -> Result<()> {
                 max_tokens,
                 mode,
                 fact_types,
-            } => commands::knowledge_base::create_page(
+            } => commands::pages::create_page(
                 &client,
                 &bank_id,
                 &name,
@@ -2180,32 +2197,26 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
-            KnowledgeBaseCommands::GetPage { bank_id, page_id } => {
-                commands::knowledge_base::get_page(
-                    &client,
-                    &bank_id,
-                    &page_id,
-                    verbose,
-                    output_format,
-                )
+            PagesCommands::GetPage { bank_id, page_id } => {
+                commands::pages::get_page(&client, &bank_id, &page_id, verbose, output_format)
             }
-            KnowledgeBaseCommands::Search {
+            PagesCommands::Search {
                 bank_id,
                 query,
                 limit,
                 tags,
                 tags_match,
                 tag_groups,
-            } => commands::knowledge_base::search(
+            } => commands::pages::search(
                 &client,
                 &bank_id,
                 &query,
                 limit,
-                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
+                &commands::pages::tag_filter(tags, tags_match, tag_groups)?,
                 verbose,
                 output_format,
             ),
-            KnowledgeBaseCommands::Update {
+            PagesCommands::Update {
                 bank_id,
                 node_id,
                 name,
@@ -2213,7 +2224,7 @@ fn run() -> Result<()> {
                 source_query,
                 tags,
                 max_tokens,
-            } => commands::knowledge_base::update(
+            } => commands::pages::update(
                 &client,
                 &bank_id,
                 &node_id,
@@ -2225,20 +2236,13 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
-            KnowledgeBaseCommands::Delete {
+            PagesCommands::Delete {
                 bank_id,
                 node_id,
                 yes,
-            } => commands::knowledge_base::delete(
-                &client,
-                &bank_id,
-                &node_id,
-                yes,
-                verbose,
-                output_format,
-            ),
-            KnowledgeBaseCommands::Export { bank_id } => {
-                commands::knowledge_base::export(&client, &bank_id, verbose, output_format)
+            } => commands::pages::delete(&client, &bank_id, &node_id, yes, verbose, output_format),
+            PagesCommands::Export { bank_id } => {
+                commands::pages::export(&client, &bank_id, verbose, output_format)
             }
         },
 

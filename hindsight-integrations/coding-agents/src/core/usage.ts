@@ -32,7 +32,7 @@ export function usageFilePath(): string {
  *  Each segment needs a letter, so `hindsight__hindsight_reflect` cannot match from the first one. */
 const HINDSIGHT_TOOL_RE = /hindsight_(?:[a-z]+_)*[a-z]+$/;
 
-/** The credit line the injected tool guide prescribes (core/knowledge-injection.ts). */
+/** The credit line the injected tool guide prescribes (core/page-injection.ts). */
 const CREDIT_RE = /from hindsight memory/i;
 
 /**

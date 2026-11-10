@@ -9,7 +9,7 @@ import { resolveConfig } from "./core/config";
 import type { HindsightClient } from "./core/hindsight";
 
 // Plain stub — no SDK, no network. selectTools only needs a client reference to hand to
-// buildKnowledgeTools when enabled; it never calls any client method itself.
+// buildPageTools when enabled; it never calls any client method itself.
 const stubClient = {} as HindsightClient;
 
 describe("selectTools", () => {
@@ -202,7 +202,7 @@ describe("buildMcpServer", () => {
   /**
    * Dcode computes an "is this tool coherently read-only" verdict from the MCP annotations and,
    * in headless mode, REJECTS every call that fails it; Codex Auto-review reads the same metadata
-   * to tell a safe knowledge read from a write. So the annotations are a functional requirement,
+   * to tell a safe page read from a write. So the annotations are a functional requirement,
    * not documentation. Assert them over the wire (what a client actually sees), not on the specs.
    */
   it("publishes explicit safety annotations for every enabled tool", async () => {
