@@ -40,7 +40,7 @@ async def test_scoped_initiative_does_not_promote_a_plan_to_delivery(
             request_context=request_context,
         )
         await memory.wait_for_background_tasks()
-        page = await memory.create_knowledge_page(
+        page = await memory.create_page(
             bank_id=bank,
             name="Atlas cache repair",
             source_query=(

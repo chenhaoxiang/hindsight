@@ -450,3 +450,32 @@ async def test_concurrent_append_replans_on_the_committed_source_without_losing_
     assert stored["original_text"] == body + "\n" + tail_b + "\n" + tail_a
     chunks = await _chunks(memory, bank, document, request_context)
     assert "\n".join(x["chunk_text"] for x in chunks) == stored["original_text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_stable_relocation_does_not_split_into_upstream_delta_commits(memory, request_context, bank, monkeypatch):
+    """A small ordinary batch limit cannot split the stable relocation write set."""
+    from hindsight_api.engine.retain import orchestrator
+
+    lines = _lines(60)
+    await memory.retain_async(
+        bank_id=bank, document_id="atomic-layout", content="\n".join(lines), request_context=request_context
+    )
+    before = await _facts(memory, bank, "atomic-layout", request_context)
+    appended = [json.dumps({"role": "user", "content": "new evidence " * 60 + str(i)}) for i in range(12)]
+    # Insert at a complete old-chunk boundary: bisecting a chunk would correctly
+    # invalidate that chunk's facts, rather than exercising pure relocation.
+    chunks = await _chunks(memory, bank, "atomic-layout", request_context)
+    body = "\n".join(
+        [*(chunk["chunk_text"] for chunk in chunks[:6]), *appended, *(chunk["chunk_text"] for chunk in chunks[6:])]
+    )
+
+    def refuse_split(*_args):
+        raise AssertionError("stable relocation must not use ordinary batched commits")
+
+    monkeypatch.setattr(orchestrator, "_delta_batches", refuse_split)
+    await memory.retain_async(bank_id=bank, document_id="atomic-layout", content=body, request_context=request_context)
+    after = await _facts(memory, bank, "atomic-layout", request_context)
+    assert before.keys() <= after.keys()
+    assert len(after) > len(before)

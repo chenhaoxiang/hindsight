@@ -92,6 +92,7 @@ import { InlineAttachmentText, countMatches } from "@/components/ui/inline-attac
 import { documentHarness, resolveHarnessLogo } from "@/lib/harness-logo";
 import { pendingUploadsFromOperations, type PendingUpload } from "@/lib/pending-uploads";
 import { editedRetainItem } from "@/lib/edited-retain-item";
+import { tagChange } from "@/lib/tag-change";
 
 const ITEMS_PER_PAGE = 50;
 
@@ -754,7 +755,7 @@ export function DocumentsView() {
   const [importing, setImporting] = useState(false);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportIncludeObservations, setExportIncludeObservations] = useState(false);
-  const [exportIncludeKnowledgeBase, setExportIncludeKnowledgeBase] = useState(false);
+  const [exportIncludePages, setExportIncludePages] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importOnConflict, setImportOnConflict] = useState<"skip" | "replace" | "new-id">("skip");
@@ -1175,11 +1176,19 @@ export function DocumentsView() {
 
     setSavingTags(true);
     try {
-      await client.updateDocument(selectedDocument.id, currentBank, { tags: newTags });
-      setSelectedDocument({ ...selectedDocument, tags: newTags });
+      const change = tagChange(selectedDocument.tags ?? [], newTags);
+      if (change.add_tags.length || change.remove_tags.length) {
+        await client.updateDocument(selectedDocument.id, currentBank, change);
+      }
+      // Read the result back: a tag added elsewhere meanwhile is kept, so it may differ from
+      // newTags. The save already succeeded, so a failed read-back falls back to newTags.
+      const doc: any = await client
+        .getDocument(selectedDocument.id, currentBank)
+        .catch(() => ({ ...selectedDocument, tags: newTags }));
+      setSelectedDocument(doc);
       // Update tags in the documents list too
       setDocuments((prev) =>
-        prev.map((d) => (d.id === selectedDocument.id ? { ...d, tags: newTags } : d))
+        prev.map((d) => (d.id === selectedDocument.id ? { ...d, tags: doc.tags } : d))
       );
       setEditingTags(false);
       setTagInput("");
@@ -1266,7 +1275,7 @@ export function DocumentsView() {
   const exportDocuments = async (
     documentIds?: string[],
     includeObservations = false,
-    includeKnowledgeBase = false
+    includePages = false
   ) => {
     if (!currentBank || exporting) return;
     setExporting(true);
@@ -1275,7 +1284,7 @@ export function DocumentsView() {
         currentBank,
         documentIds,
         includeObservations,
-        includeKnowledgeBase
+        includePages
       );
       const suffix = documentIds && documentIds.length === 1 ? `-${documentIds[0]}` : "-documents";
       triggerDownload(blob, `${currentBank}${suffix}.zip`);
@@ -1401,15 +1410,13 @@ export function DocumentsView() {
           </div>
           <div className="flex items-start gap-2 py-2">
             <Checkbox
-              id="export-include-knowledge-base"
-              checked={exportIncludeKnowledgeBase}
-              onCheckedChange={(v) => setExportIncludeKnowledgeBase(v === true)}
+              id="export-include-pages"
+              checked={exportIncludePages}
+              onCheckedChange={(v) => setExportIncludePages(v === true)}
             />
             <div className="grid gap-1 leading-none">
-              <Label htmlFor="export-include-knowledge-base">
-                {t("exportIncludeKnowledgeBaseLabel")}
-              </Label>
-              <p className="text-xs text-muted-foreground">{t("exportIncludeKnowledgeBaseHint")}</p>
+              <Label htmlFor="export-include-pages">{t("exportIncludePagesLabel")}</Label>
+              <p className="text-xs text-muted-foreground">{t("exportIncludePagesHint")}</p>
             </div>
           </div>
           <DialogFooter>
@@ -1424,7 +1431,7 @@ export function DocumentsView() {
             <Button
               size="sm"
               onClick={() =>
-                exportDocuments(undefined, exportIncludeObservations, exportIncludeKnowledgeBase)
+                exportDocuments(undefined, exportIncludeObservations, exportIncludePages)
               }
               disabled={exporting}
             >

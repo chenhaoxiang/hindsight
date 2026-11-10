@@ -23,6 +23,7 @@ import typer
 from ..config import DEFAULT_DATABASE_SCHEMA, HindsightConfig, load_dotenv_for_entrypoint
 from ..db_url import is_oracle_url
 from ..engine.memories import get_memories, sql_memories
+from ..engine.retain.attachment_store import ATTACHMENT_SWEEP_GRACE, reclaim_unreferenced_attachments
 from ..engine.retain.bank_utils import _vector_index_clause, bank_indexes_are_store_owned
 from ..engine.schema import fq_table_explicit as _fq_table
 from ..engine.storage import bank_storage_prefix, create_file_storage
@@ -36,6 +37,7 @@ from ..engine.vector_index_health import (
 from ..extensions import TenantExtension, load_extension
 from ..pg0 import parse_pg0_url, resolve_database_url
 from ..schema_context import _current_schema
+from .reembed import SchemaReembed, finish_schema, reembed_schema
 
 # Setup logging
 logging.basicConfig(
@@ -720,6 +722,9 @@ class RepairSweep:
     rebuilt_search_vectors: int = 0
     # Counted apart from ``banks``, which stays empty on a backend without per-bank indexes.
     banks_scanned: int = 0
+    # Attachments their document does not reference, left by retains that failed
+    # (#6350), with --attachments; in a dry run, how many would be removed.
+    unreferenced_attachments: int = 0
 
 
 async def _run_repair_bank(
@@ -729,6 +734,7 @@ async def _run_repair_bank(
     schema: str | None,
     bank_id: str | None,
     dry_run: bool,
+    attachments: bool = False,
 ) -> RepairSweep:
     """Reconcile per-(bank, fact_type) vector index coverage, and remove orphan observations.
 
@@ -751,6 +757,12 @@ async def _run_repair_bank(
     orphan_observations = 0
     rebuilt_search_vectors = 0
     banks_scanned = 0
+    unreferenced_attachments = 0
+    # The daily sweep's rule with no lower bound, so it collects what leaked before
+    # the sweep existed. get_memories(), not the SQL store: whether an attachment is
+    # referenced is a question about the document, which a custom store may own.
+    attachments_before = datetime.now(timezone.utc) - ATTACHMENT_SWEEP_GRACE
+    attachments_after = datetime(1970, 1, 1, tzinfo=timezone.utc)
     try:
         for target_schema in schemas:
             # The whole schema is inside the guard, not just list_bank_ids. Planning a
@@ -769,7 +781,9 @@ async def _run_repair_bank(
             schema_results: list[BankIndexResult] = []
             schema_orphans = 0
             schema_rebuilt = 0
+            schema_attachments = 0
             schema_banks_done = 0
+            schema_file_storage = _admin_file_storage(conn, target_schema) if attachments else None
             try:
                 bank_ids = [bank_id] if bank_id else await list_bank_ids(conn, target_schema)
                 for bid in bank_ids:
@@ -784,11 +798,27 @@ async def _run_repair_bank(
                     schema_rebuilt += await pg_store.admin_rebuild_observation_search_vectors(
                         conn=conn, schema=target_schema, bank_id=bid, dry_run=dry_run
                     )
+                    if schema_file_storage is not None:
+                        # The shared rule resolves tables through fq_table.
+                        token = _current_schema.set(target_schema)
+                        try:
+                            schema_attachments += await reclaim_unreferenced_attachments(
+                                conn,
+                                schema_file_storage,
+                                get_memories(),
+                                bid,
+                                created_after=attachments_after,
+                                created_before=attachments_before,
+                                dry_run=dry_run,
+                            )
+                        finally:
+                            _current_schema.reset(token)
                     schema_banks_done += 1
             except Exception as exc:  # noqa: BLE001 — one bad schema must not abort the sweep
                 results.extend(schema_results)
                 orphan_observations += schema_orphans
                 rebuilt_search_vectors += schema_rebuilt
+                unreferenced_attachments += schema_attachments
                 banks_scanned += schema_banks_done
                 done = f", {schema_banks_done} of {len(bank_ids)} bank(s) done" if schema_banks_done else ""
                 typer.echo(f"  schema '{target_schema}': skipped ({exc}){done}", err=True)
@@ -813,6 +843,7 @@ async def _run_repair_bank(
             results.extend(schema_results)
             orphan_observations += schema_orphans
             rebuilt_search_vectors += schema_rebuilt
+            unreferenced_attachments += schema_attachments
             banks_scanned += schema_banks_done
             # Only in --all mode: an index whose bank row is gone is unreachable
             # from every bank-scoped path, so this is the one place that can collect
@@ -848,6 +879,11 @@ async def _run_repair_bank(
                 f"{sum(r.failed for r in schema_results)} failed, "
                 f"{schema_orphans} orphan observation(s) {'to remove (dry-run)' if dry_run else 'removed'}, "
                 f"{schema_rebuilt} observation keyword index(es) {'to rebuild (dry-run)' if dry_run else 'rebuilt'}"
+                + (
+                    f", {schema_attachments} unreferenced attachment(s) {'to remove (dry-run)' if dry_run else 'removed'}"
+                    if attachments
+                    else ""
+                )
             )
         return RepairSweep(
             banks=results,
@@ -855,6 +891,7 @@ async def _run_repair_bank(
             orphan_observations=orphan_observations,
             rebuilt_search_vectors=rebuilt_search_vectors,
             banks_scanned=banks_scanned,
+            unreferenced_attachments=unreferenced_attachments,
         )
     finally:
         await conn.close()
@@ -883,6 +920,12 @@ def repair_bank(
         False,
         "--dry-run",
         help="Report what would be repaired without creating, dropping or deleting anything.",
+    ),
+    attachments: bool = typer.Option(
+        False,
+        "--attachments",
+        help="Also delete attachments their document does not reference (left by retains that failed), "
+        "however old. Reads each document that has attachments.",
     ),
 ):
     """Repair a bank's derived state: vector index coverage, orphan observations, and (under
@@ -924,6 +967,15 @@ def repair_bank(
     Reach for the command when you want convergence without waiting for a write:
     after a restore or upgrade, after a backend switch, or to shed indexes in
     bulk on a deployment recovering from lock-table exhaustion (#3485).
+
+    With --attachments, also deletes the images and files of retains that failed
+    after the API stored them: attachments, a day or more old, that their
+    document's text does not reference — the document was never created, or the
+    update that brought them failed. The daily maintenance sweep applies the same
+    rule to the past week only; this covers everything before it (#6350). It reads
+    every document that has an attachment, through the memories store, so it is
+    opt-in rather than part of every repair.
+
     Idempotent and safe to re-run.
     """
     if bool(bank_id) == all_banks:
@@ -958,6 +1010,7 @@ def repair_bank(
             schema=schema,
             bank_id=bank_id,
             dry_run=dry_run,
+            attachments=attachments,
         )
     )
     results = sweep.banks
@@ -977,6 +1030,12 @@ def repair_bank(
         f"{sweep.orphan_observations} orphan observation(s) {'to remove (dry-run)' if dry_run else 'removed'}, "
         f"{sweep.rebuilt_search_vectors} observation keyword index(es) "
         f"{'to rebuild (dry-run)' if dry_run else 'rebuilt'}"
+        + (
+            f", {sweep.unreferenced_attachments} unreferenced attachment(s) "
+            f"{'to remove (dry-run)' if dry_run else 'removed'}"
+            if attachments
+            else ""
+        )
     )
     # Both are reported before either exits. They are independent — a sweep can have
     # failed builds in one schema and be unable to look at another — and raising on
@@ -1516,7 +1575,7 @@ def import_bank_command(
         f"{result.facts_imported} fact(s), {result.observations_imported} observation(s), "
         f"{result.mental_models_imported} mental model(s), "
         f"{result.mental_model_history_imported} mm-history row(s), "
-        f"{result.knowledge_pages_imported} knowledge page(s), {result.directives_imported} directive(s), "
+        f"{result.knowledge_pages_imported} page(s), {result.directives_imported} directive(s), "
         f"{result.webhooks_imported} webhook(s), {result.history_rows_imported} history row(s)"
     )
 
@@ -1715,6 +1774,105 @@ def worker_status(
                 f"  running={running_for}  last_update={last_update} ago"
             )
         typer.echo("")
+
+
+async def _run_reembed(
+    db_url: str, schemas: list[str], *, finish: bool, batch_size: int, concurrency: int, sleep_s: float
+) -> list[SchemaReembed]:
+    from ..engine.embeddings import create_embeddings_from_env, embedding_model_id
+
+    resolved_url = await resolve_database_url(db_url)
+    embeddings = None
+    if not finish:
+        embeddings = create_embeddings_from_env()
+        await embeddings.initialize()
+        typer.echo(f"New embedding model: {embedding_model_id(embeddings)}")
+    conn = await _admin_connect(db_url)
+    results: list[SchemaReembed] = []
+    try:
+        for target_schema in schemas:
+            if finish:
+                results.append(await finish_schema(conn, target_schema))
+            else:
+                assert embeddings is not None
+                typer.echo(f"Re-embedding schema '{target_schema}'...")
+                results.append(
+                    await reembed_schema(
+                        conn,
+                        resolved_url,
+                        target_schema,
+                        embeddings,
+                        batch_size=batch_size,
+                        concurrency=concurrency,
+                        sleep_s=sleep_s,
+                    )
+                )
+    finally:
+        await conn.close()
+    return results
+
+
+@app.command(name="reembed")
+def reembed(
+    schema: str | None = typer.Option(
+        None, "--schema", "-s", help="Schema to re-embed. Mutually exclusive with --all-schemas."
+    ),
+    all_schemas: bool = typer.Option(
+        False, "--all-schemas", help="Re-embed the base schema and every discovered tenant schema, one at a time."
+    ),
+    finish: bool = typer.Option(
+        False, "--finish", help="Remove the write guard, once every server runs the new embedding model."
+    ),
+    batch_size: int = typer.Option(256, "--batch-size", help="Rows embedded and written per transaction."),
+    concurrency: int = typer.Option(
+        4,
+        "--concurrency",
+        min=1,
+        help="Batches sent to the embedding model at once. Postgres still sees one connection.",
+    ),
+    sleep_s: float = typer.Option(0.0, "--sleep", help="Seconds to pause between batches, to go easy on Postgres."),
+):
+    """Re-embed every stored vector with the embedding model configured in the environment.
+
+    Run it with the NEW model's HINDSIGHT_API_EMBEDDINGS_* settings; servers keep running on the
+    old one. Recall keeps working on the old vectors (without their index) while the new ones are
+    written to a side column in small batches; then a short write lock swaps the columns. From
+    then on Postgres refuses vector writes from servers still on the old model (workers retry
+    them later, HTTP answers 503): restart every server with the new model, then run
+    `reembed --finish`. Until a server restarts its recall embeds queries with the old model.
+
+    PostgreSQL only. Resumable: re-run after an interruption and it continues.
+    """
+    if bool(schema) == all_schemas:
+        typer.echo("Error: pass exactly one of --schema <name> or --all-schemas.", err=True)
+        raise typer.Exit(2)
+    config = HindsightConfig.from_env()
+    if not config.database_url:
+        typer.echo("Error: Database URL not configured.", err=True)
+        raise typer.Exit(1)
+    if is_oracle_url(config.database_url):
+        typer.echo("Error: reembed is PostgreSQL-only.", err=True)
+        raise typer.Exit(1)
+    if get_memories().store_owned:
+        typer.echo("Error: a custom memories store owns the vectors; it must re-embed them itself.", err=True)
+        raise typer.Exit(1)
+
+    schemas = [schema] if schema else asyncio.run(_resolve_schemas(config.database_schema))
+    results = asyncio.run(
+        _run_reembed(
+            config.database_url,
+            schemas,
+            finish=finish,
+            batch_size=batch_size,
+            concurrency=concurrency,
+            sleep_s=sleep_s,
+        )
+    )
+    for r in results:
+        rows = f", {r.rows_embedded} rows embedded" if r.rows_embedded else ""
+        typer.echo(f"  {r.schema}: {r.status}{rows}")
+    if not finish:
+        typer.echo("Next: restart every server with the new model, then run `hindsight-admin reembed --finish`.")
 
 
 @app.command(

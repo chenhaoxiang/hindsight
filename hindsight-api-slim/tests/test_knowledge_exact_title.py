@@ -4,16 +4,20 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
+from sqlalchemy.engine import make_url
 
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.memories.base import KnowledgePageMatch
-from hindsight_api.engine.memory_engine import KnowledgeTagFilter
+from hindsight_api.engine.memory_engine import PageTagFilter
 from hindsight_api.engine.retain import embedding_utils
 from hindsight_api.engine.search.tags import TagGroupLeaf
+from hindsight_api.engine.task_backend import SyncTaskBackend
 from hindsight_api.extensions import BankReadOperation, OperationValidationError
+from tests.conftest import _teardown_memory_engine
 from tests.test_consolidation_stale_batch import cross_encoder, embeddings  # noqa: F401 (fixtures)
-from tests.test_knowledge_base import _kb_validator
+from tests.test_pages import _kb_validator
 from tests.test_tag_scope import _ScopeByApiKey
 
 
@@ -25,7 +29,7 @@ async def test_exact_title_works_without_either_hybrid_arm(
     bank = "title-exact-" + uuid.uuid4().hex[:10]
     try:
         await memory.ensure_bank_profile(bank, request_context=request_context)
-        page = await memory.create_knowledge_page(
+        page = await memory.create_page(
             bank_id=bank,
             name=title,
             source_query="Fixture scope?",
@@ -41,7 +45,7 @@ async def test_exact_title_works_without_either_hybrid_arm(
         monkeypatch.setattr(memory._config_resolver, "get_bank_config", no_text_search)
         embed = AsyncMock(return_value=[None])
         monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", embed)
-        hits = await memory.search_knowledge_pages(bank, f"  {title.upper()}  ", request_context=request_context)
+        hits = await memory.search_pages(bank, f"  {title.upper()}  ", request_context=request_context)
         assert len(hits) == 1
         assert hits[0]["id"] == page["id"]
         assert hits[0]["name"] == title
@@ -51,9 +55,70 @@ async def test_exact_title_works_without_either_hybrid_arm(
         assert hits[0]["score"] == 1.0
         # With a one-result budget an identity hit does not call embeddings at all.
         embed.side_effect = AssertionError("exact-only search must not embed")
-        assert await memory.search_knowledge_pages(bank, title, limit=1, request_context=request_context) == hits
+        assert await memory.search_pages(bank, title, limit=1, request_context=request_context) == hits
     finally:
         await memory.delete_bank(bank, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_exact_title_snippet_keeps_multibyte_boundary_on_sql_ascii(
+    pg0_db_url: str, embeddings, cross_encoder, query_analyzer, request_context: RequestContext, monkeypatch
+) -> None:
+    # A schema cannot change the database encoding. Create only a disposable test
+    # database so this exercises the real SQL path, not just the Python slicer.
+    database = "hs_exact_ascii_" + uuid.uuid4().hex[:12]
+    admin = await asyncpg.connect(pg0_db_url)
+    memory = MemoryEngine(
+        db_url=make_url(pg0_db_url).set(database=database).render_as_string(hide_password=False),
+        memory_llm_provider="mock",
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=embeddings,
+        cross_encoder=cross_encoder,
+        query_analyzer=query_analyzer,
+        pool_min_size=1,
+        pool_max_size=2,
+        task_backend=SyncTaskBackend(),
+    )
+    try:
+        await admin.execute(
+            f"CREATE DATABASE \"{database}\" TEMPLATE template0 ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'"
+        )
+        try:
+            await memory.initialize()
+            async with (await memory._get_pool()).acquire() as conn:
+                assert await conn.fetchval("SHOW server_encoding") == "SQL_ASCII"
+            bank = "exact-ascii-fixture"
+            await memory.ensure_bank_profile(bank, request_context=request_context)
+            page = await memory.create_page(
+                bank_id=bank,
+                name="SQL_ASCII exact title",
+                source_query="Fixture scope?",
+                content="Fixture body.",
+                request_context=request_context,
+            )
+            # Seed the text column directly: create_page's structured JSON uses
+            # Unicode escapes that SQL_ASCII rejects, independently of this read.
+            async with (await memory._get_pool()).acquire() as conn:
+                await conn.execute(
+                    "UPDATE mental_models SET content = $3 WHERE bank_id = $1 AND id = $2",
+                    bank,
+                    page["mental_model_id"],
+                    "a" * 279 + "作业作业",
+                )
+            embed = AsyncMock(side_effect=AssertionError("exact-only search must not embed"))
+            monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", embed)
+            hits = await memory.search_pages(bank, page["name"], limit=1, request_context=request_context)
+            assert [hit["id"] for hit in hits] == [page["id"]]
+            assert hits[0]["snippet"] == "a" * 279 + "作"
+            assert hits[0]["score"] == 1.0
+            embed.assert_not_awaited()
+        finally:
+            await _teardown_memory_engine(memory)
+            await admin.execute(f'DROP DATABASE "{database}" WITH (FORCE)')
+    finally:
+        await admin.close()
 
 
 @pytest.mark.asyncio
@@ -66,10 +131,10 @@ async def test_exact_candidates_obey_bank_tag_filter_forced_scope_and_denial(
     try:
         for bank in banks:
             await memory.ensure_bank_profile(bank, request_context=request_context)
-        allowed_folder = await memory.create_knowledge_folder(banks[0], name="Allowed", request_context=request_context)
-        hidden_folder = await memory.create_knowledge_folder(banks[0], name="Hidden", request_context=request_context)
-        await memory.create_knowledge_folder(banks[0], name=title, request_context=request_context)
-        allowed = await memory.create_knowledge_page(
+        allowed_folder = await memory.create_page_folder(banks[0], name="Allowed", request_context=request_context)
+        hidden_folder = await memory.create_page_folder(banks[0], name="Hidden", request_context=request_context)
+        await memory.create_page_folder(banks[0], name=title, request_context=request_context)
+        allowed = await memory.create_page(
             bank_id=banks[0],
             name=title,
             parent_id=allowed_folder["id"],
@@ -78,7 +143,7 @@ async def test_exact_candidates_obey_bank_tag_filter_forced_scope_and_denial(
             tags=["reader:allowed"],
             request_context=request_context,
         )
-        hidden = await memory.create_knowledge_page(
+        hidden = await memory.create_page(
             bank_id=banks[0],
             name=title,
             parent_id=hidden_folder["id"],
@@ -87,7 +152,7 @@ async def test_exact_candidates_obey_bank_tag_filter_forced_scope_and_denial(
             tags=["reader:hidden"],
             request_context=request_context,
         )
-        foreign = await memory.create_knowledge_page(
+        foreign = await memory.create_page(
             bank_id=banks[1],
             name=title,
             source_query="Foreign?",
@@ -97,10 +162,10 @@ async def test_exact_candidates_obey_bank_tag_filter_forced_scope_and_denial(
         )
         embed = AsyncMock(return_value=[None])
         monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", embed)
-        filtered = await memory.search_knowledge_pages(
+        filtered = await memory.search_pages(
             banks[0],
             title,
-            tag_filter=KnowledgeTagFilter(tags=["reader:allowed"], tags_match="all_strict"),
+            tag_filter=PageTagFilter(tags=["reader:allowed"], tags_match="all_strict"),
             request_context=request_context,
         )
         assert [hit["id"] for hit in filtered] == [allowed["id"]]
@@ -109,12 +174,12 @@ async def test_exact_candidates_obey_bank_tag_filter_forced_scope_and_denial(
         memory._operation_validator = _ScopeByApiKey(
             {"reader": [TagGroupLeaf(tags=["reader:allowed"], match="all_strict")]}
         )
-        scoped = await memory.search_knowledge_pages(banks[0], title, request_context=RequestContext(api_key="reader"))
+        scoped = await memory.search_pages(banks[0], title, request_context=RequestContext(api_key="reader"))
         assert [hit["id"] for hit in scoped] == [allowed["id"]]
         denied = _kb_validator(reject_read=BankReadOperation.SEARCH_KNOWLEDGE_BASE)
         memory._operation_validator = denied
         with pytest.raises(OperationValidationError):
-            await memory.search_knowledge_pages(banks[0], title, limit=1, request_context=request_context)
+            await memory.search_pages(banks[0], title, limit=1, request_context=request_context)
         assert denied.read_ops == [BankReadOperation.SEARCH_KNOWLEDGE_BASE]
     finally:
         memory._operation_validator = original_validator
@@ -130,14 +195,14 @@ async def test_store_owned_candidate_cut_cannot_hide_an_exact_title(
     bank = "exact-store-" + uuid.uuid4().hex[:8]
     try:
         await memory.ensure_bank_profile(bank, request_context=request_context)
-        exact = await memory.create_knowledge_page(
+        exact = await memory.create_page(
             bank_id=bank,
             name="Exact store title",
             source_query="Exact?",
             content="Fixture identity.",
             request_context=request_context,
         )
-        other = await memory.create_knowledge_page(
+        other = await memory.create_page(
             bank_id=bank,
             name="Other",
             source_query="Other?",
@@ -146,13 +211,11 @@ async def test_store_owned_candidate_cut_cannot_hide_an_exact_title(
         )
         ranked = [] if empty_index else [KnowledgePageMatch(page_id=other["mental_model_id"], score=0.9)]
         store = SimpleNamespace(
-            store_owned_for=lambda bank_id: bank_id == bank, search_knowledge_pages=AsyncMock(return_value=ranked)
+            store_owned_for=lambda bank_id: bank_id == bank, search_pages=AsyncMock(return_value=ranked)
         )
         with monkeypatch.context() as scoped:
             scoped.setattr("hindsight_api.engine.memories.get_memories", lambda: store)
-            hits = await memory.search_knowledge_pages(
-                bank, "Exact store title", limit=2, request_context=request_context
-            )
+            hits = await memory.search_pages(bank, "Exact store title", limit=2, request_context=request_context)
         assert [hit["id"] for hit in hits] == ([exact["id"]] if empty_index else [exact["id"], other["id"]])
         assert hits[0]["score"] == 1.0
     finally:
@@ -166,21 +229,21 @@ async def test_exact_hits_are_deduplicated_before_unchanged_hybrid_order(
     bank = "exact-order-" + uuid.uuid4().hex[:8]
     try:
         await memory.ensure_bank_profile(bank, request_context=request_context)
-        exact = await memory.create_knowledge_page(
+        exact = await memory.create_page(
             bank_id=bank,
             name="Fixture title",
             source_query="Exact?",
             content="Unrelated text.",
             request_context=request_context,
         )
-        other = await memory.create_knowledge_page(
+        other = await memory.create_page(
             bank_id=bank,
             name="Notes",
             source_query="Notes?",
             content="Fixture title details.",
             request_context=request_context,
         )
-        hits = await memory.search_knowledge_pages(bank, "Fixture title", limit=2, request_context=request_context)
+        hits = await memory.search_pages(bank, "Fixture title", limit=2, request_context=request_context)
         assert [hit["id"] for hit in hits] == [exact["id"], other["id"]]
         assert len({hit["id"] for hit in hits}) == 2
         assert hits[0]["score"] == 1.0

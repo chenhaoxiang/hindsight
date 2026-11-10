@@ -20,8 +20,10 @@ runtime acceptance claim.
 - Maintain the API reliability changes separately from the Coding Agents package.
   The initial component baselines are API `1.2.0` and Coding Agents `0.8.5`.
   A monorepo branch tip is not a substitute for either published component baseline.
-- Do not change the database schema, embedding model/dimensions/prefixes, configured
-  inference model, or reasoning level as part of this plan.
+- Do not add fork-specific database migrations or change embedding models/dimensions/prefixes,
+  the configured inference model or reasoning level. A published stable API upgrade can
+  include upstream migrations; compare and document them before a separate, backed-up
+  installation step. Source synchronization does not activate migrations.
 - Preserve default search behavior and `autoInject=none` where explicitly selected.
   No mandatory per-turn reflection, new judgment model or always-on controller.
 - Do not split existing banks, relabel historical memories, clear page content,
@@ -174,7 +176,64 @@ are separately identifiable. A rejected or interrupted validation is retained as
 
 ### Fixed component build inputs
 
-- API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
+Current stable update candidate (source/PR acceptance only, not installation):
+
+- API `1.2.1-fork.1` / Python `1.2.1+fork.1`: exact upstream `v1.2.1`,
+  `0eb02d8c418eac6b489bc63883c993b2257dfac4`, plus
+  [.github/patches/api-1.2.1-fork.1.patch](patches/api-1.2.1-fork.1.patch).
+  The maintenance API production tree equals this export plus overlay. The full
+  official wrapper keeps its `==1.2.1` dependency, satisfied by the local version.
+- Coding Agents `0.8.7-fork.1`: npm `0.8.7` source
+  `329f8a5ac9baa5567f4516a24dc9fd0f753a75ae` plus the maintained adapter,
+  layered retrieval, source-scoped initiative and update-guard changes.
+  The integration subtree of the pinned API release equals that published component
+  source; this was checked independently, not inferred from the API tag.
+  Package, lockfile and plugin versions agree. Native tool names remain the existing
+  ten, including the three `*_knowledge_page*` names, without renamed duplicates.
+- Control Plane uses official `1.2.1`; no fork installation or UI runtime is changed
+  by this candidate. Do not use an unpublished monorepo tip for any component.
+
+Upstream's Pages rename keeps the underlying `knowledge_pages` table, page IDs and
+content. Its deprecated `/knowledge-base` HTTP routes, old MCP names, config/env aliases,
+SDK wrappers and old custom-store hooks remain supported until 2.x. The integration
+uses `/pages` with the published legacy-path fallback, retaining the host-facing ten-tool
+contract and strict raw-source initiative capture. No existing page is relabeled or rebuilt
+just to resolve a name conflict.
+
+The previous invalid-request classification, transport retry budget, refresh admission,
+transient wait/budget handling, fair consolidation and stale-source/CAS fixes remain.
+Upstream's equivalent local-permit timeout fix is not duplicated. The delta editor uses
+upstream's shared reply serialization with the fork's stage deadline. Ordinary deltas use
+upstream's new bounded commits; stable-chunk relocation remains one bounded atomic write
+set, with all position/context, cancellation, rollback and ordered source-lock checks.
+Stable chunks stay off by default; an existing deployment's selection and verified
+relocated layouts must be preserved, including recovery when the flag is later disabled.
+The integration also supports Node 26's native Undici v2 dispatcher without weakening
+request deadlines or replacing a host's dispatcher with an unrelated client.
+
+#### Upstream schema changes to plan before installation
+
+Compared with the previous pinned stable API `v1.2.0` (head `c7e2f9a4d1b8`),
+`v1.2.1` adds these revisions in order:
+
+1. `d3f8a1c6e9b2`: Oracle-only composite foreign-key indexes; PostgreSQL no-op.
+2. `d3e8a1f5c7b2`: nullable `graph_maintenance_queue.claimed_at`, PostgreSQL and
+   Oracle. The relink claim protocol uses short transactions and clears the stamp
+   on re-queue; the new runtime requires the new column.
+3. `05867433a58c`: PostgreSQL `banks_with_attachments_in_window` discovery routine
+   for the attachment sweep; Oracle no-op. No new table or page-content conversion.
+
+The existing bank-alias migration has only an identifier-comment correction.
+The fork overlay adds no schema revision. API startup normally applies upstream
+migrations: installation must therefore include the normal backup/migration/rollback
+planning rather than calling this source change schema-free. This lane activates none
+against an existing store; deterministic tests migrate disposable synthetic stores only.
+Do not blindly downgrade a store with relocated chunks or undo its schema to reuse an
+older executable. A runtime/data rollback is a separate verified operation.
+
+Preserve all previous overlays and Releases byte-for-byte:
+
+- Historical API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
   plus [.github/patches/api-1.2.0-fork.3.patch](patches/api-1.2.0-fork.3.patch)
   for the incremental-retain candidate. Preserve the previously released
   [fork.1 overlay](patches/api-1.2.0-fork.1.patch) and
@@ -193,16 +252,17 @@ are separately identifiable. A rejected or interrupted validation is retained as
   distinct metadata stay separate and JSON-array merging remains unchanged.
   No newer API schema, migration or unrelated main-branch feature is included. Keep regression tests
   bound to the public reliability-fix source as well as the stable API export.
-- Coding Agents: `0.8.5` component tree at
+- Historical Coding Agents: `0.8.5` component tree at
   `02e498b1537f6aec14c5a799f5a0c193b8394869` equals its maintenance-start tree;
   the focused maintenance PRs and version/update guard produce `0.8.5-fork.1`.
   Package/lock/plugin versions must agree. Upstream automatic updating must not
   query/install over this maintenance identity, even when staged through npx.
 
 Build only from committed public source into ignored temporary directories. A
-fresh API export can be prepared with `git archive` at the exact API base. From
+fresh API export can be prepared with `git archive` at the exact API base (`v1.2.1`
+for the current candidate). From
 the maintenance repository root, apply the committed zero-context overlay with
-`git apply --unidiff-zero --directory=tmp/api-1.2.0-src .github/patches/api-1.2.0-fork.3.patch`.
+`git apply --unidiff-zero --directory=tmp/api-1.2.1-src .github/patches/api-1.2.1-fork.1.patch`.
 Use a fresh export and verify the resulting source bytes; this avoids patch-tool
 backup files entering the package. Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.

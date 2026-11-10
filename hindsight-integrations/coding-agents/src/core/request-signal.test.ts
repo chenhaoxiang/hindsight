@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HindsightClient, ReflectError } from "./hindsight";
-import { buildKnowledgeTools } from "./knowledge-tools";
+import { buildPageTools } from "./page-tools";
 import { toPiTool } from "../harness/pi-extension";
 import { currentRequestSignal, withRequestSignal } from "./request-signal";
 
@@ -40,7 +40,7 @@ describe("per-tool cancellation", () => {
       });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const spec = buildKnowledgeTools(client, "bound-bank").find(
+    const spec = buildPageTools(client, "bound-bank").find(
       (t) => t.name === "hindsight_read_knowledge_page"
     )!;
     const tool = toPiTool(spec);
@@ -64,9 +64,7 @@ describe("per-tool cancellation", () => {
     expect(await background).toMatchObject({ id: "background", body: "synthetic page" });
     expect(currentRequestSignal()).toBeUndefined();
     expect((await tool.execute("third", { page_id: "ok" })).isError).toBeUndefined();
-    expect(
-      fetchMock.mock.calls.filter(([url]) => String(url).includes("/knowledge-base/pages/"))
-    ).toHaveLength(4);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/pages/"))).toHaveLength(4);
     expect(
       fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/knowledge-base/tree"))
     ).toHaveLength(2);

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HindsightClient } from "./hindsight";
-import { buildKnowledgeTools } from "./knowledge-tools";
+import { buildPageTools } from "./page-tools";
 import { shapeFreshness } from "./page-freshness";
 import { toPiTool } from "../harness/pi-extension";
 
@@ -8,13 +8,13 @@ const json = (data: unknown, status = 200) => new Response(JSON.stringify(data),
 const makeClient = () =>
   new HindsightClient({ apiUrl: "https://fixture.invalid", bank: "synthetic-bank" });
 const tool = (client: HindsightClient, name: string) =>
-  buildKnowledgeTools(client, client.bank).find((t) => t.name === name)!;
+  buildPageTools(client, client.bank).find((t) => t.name === name)!;
 afterEach(() => vi.unstubAllGlobals());
 
 describe("agent-facing page freshness", () => {
   it("preserves stale/failure/watermark metadata with one bounded metadata batch, without trace or body duplication", async () => {
     const fetchMock = vi.fn(async (url: unknown) =>
-      String(url).includes("/knowledge-base/search")
+      String(url).includes("/pages/search")
         ? json({
             results: [
               {
@@ -66,7 +66,7 @@ describe("agent-facing page freshness", () => {
     const fetchMock = vi.fn(async (url: unknown) => {
       const value = String(url);
       expect(value).toContain("/banks/synthetic-bank/");
-      if (value.includes("/knowledge-base/search"))
+      if (value.includes("/pages/search"))
         return json({
           results: [{ id: "p", name: "Older page", mental_model_id: "m", snippet: "old decision" }],
         });
@@ -122,7 +122,7 @@ describe("agent-facing page freshness", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url) =>
-        String(url).includes("/knowledge-base/search")
+        String(url).includes("/pages/search")
           ? json({
               results: [
                 {
@@ -186,7 +186,7 @@ describe("agent-facing page freshness", () => {
       "fetch",
       vi.fn(async (url) => {
         const u = String(url);
-        if (u.includes("/knowledge-base/pages/"))
+        if (u.includes("/pages/"))
           return json({
             id: "p",
             name: "Page",
@@ -242,7 +242,7 @@ describe("agent-facing page freshness", () => {
           })
     );
     vi.stubGlobal("fetch", fetchMock);
-    const result = await makeClient().searchKnowledgePages("q", { includeFreshness: true });
+    const result = await makeClient().searchPages("q", { includeFreshness: true });
     expect(result[0].freshness?.state).toBe("unknown");
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HindsightClient } from "./hindsight";
-import { buildKnowledgeTools } from "./knowledge-tools";
+import { buildPageTools } from "./page-tools";
 import { recallFacts, recentFacts } from "./memory-retrieval";
 import { toPiTool } from "../harness/pi-extension";
 
@@ -23,7 +23,7 @@ const fact = (extra = {}) => ({
 });
 const window = { since: "2025-01-01T00:00:00Z", until: "2025-02-01T00:00:00Z" };
 const tool = (c: HindsightClient, name: string) =>
-  buildKnowledgeTools(c, c.bank).find((t) => t.name === name)!;
+  buildPageTools(c, c.bank).find((t) => t.name === name)!;
 afterEach(() => vi.unstubAllGlobals());
 
 describe("structured raw recall", () => {

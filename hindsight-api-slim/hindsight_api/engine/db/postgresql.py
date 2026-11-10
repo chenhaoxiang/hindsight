@@ -7,6 +7,7 @@ avoiding Python-level wrapping overhead (~570K __getitem__ calls per
 20-query benchmark → measurable regression when wrapped).
 """
 
+import importlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -100,12 +101,23 @@ class PostgresConnection(DatabaseConnection):
     __slots__ = ("_conn",)
 
     def __init__(self, conn: asyncpg.Connection) -> None:
+        super().__init__()
         self._conn = conn
+
+    def _commit_is_ahead(self) -> bool:
+        return self._conn.is_in_transaction()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator["PostgresConnection"]:
-        async with self._conn.transaction():
-            yield self
+        outermost = not self._conn.is_in_transaction()
+        try:
+            async with self._conn.transaction():
+                yield self
+                if outermost:
+                    await self._run_before_commit()
+        finally:
+            if outermost:
+                self._before_commit.clear()
 
     async def execute(self, query: str, *args: Any, timeout: float | None = None) -> str:
         # asyncpg's stubs declare `timeout: float`; None is its documented "no timeout", and
@@ -220,6 +232,40 @@ class _NoResetConnection(asyncpg.Connection):
         return ""
 
 
+ConnectFn = Callable[..., Awaitable[asyncpg.Connection]]
+
+
+def resolve_connect_hook() -> ConnectFn | None:
+    """The HINDSIGHT_API_DATABASE_CONNECT_HOOK callable, or None when unset.
+
+    asyncpg reuses the pool's DSN for every new physical connection, so a
+    rotated or short-lived password breaks pool growth and reconnects. The hook
+    (``module.path:function``, same signature as ``asyncpg.connect``) runs on
+    every new connection instead, and can fetch the current credential (#6163).
+    """
+    from ...config import ENV_DATABASE_CONNECT_HOOK, get_config
+
+    path = get_config().database_connect_hook
+    if not path:
+        return None
+    module_path, sep, attr = path.rpartition(":")
+    if not sep or not module_path or not attr:
+        raise ValueError(f"{ENV_DATABASE_CONNECT_HOOK}='{path}' must be 'module.path:function'")
+    try:
+        hook = getattr(importlib.import_module(module_path), attr)
+    except (ImportError, AttributeError) as e:
+        raise ValueError(f"{ENV_DATABASE_CONNECT_HOOK}='{path}' could not be loaded: {e}") from e
+    if not callable(hook):
+        raise ValueError(f"{ENV_DATABASE_CONNECT_HOOK}='{path}' is not callable")
+    return cast(ConnectFn, hook)
+
+
+async def connect_direct(dsn: str, **kwargs: Any) -> asyncpg.Connection:
+    """Open a standalone connection, through the connect hook when one is set."""
+    hook = resolve_connect_hook()
+    return await (hook or asyncpg.connect)(dsn, **kwargs)
+
+
 class PostgreSQLBackend(DatabaseBackend):
     """DatabaseBackend implementation wrapping an asyncpg connection pool."""
 
@@ -314,6 +360,7 @@ class PostgreSQLBackend(DatabaseBackend):
             init=pool_init,
             setup=pool_setup,
             connection_class=_NoResetConnection,
+            connect=resolve_connect_hook(),
         )
         logger.info(
             f"PostgreSQL pool created (min={min_size}, max={max_size}, "
@@ -361,8 +408,8 @@ class PostgreSQLBackend(DatabaseBackend):
             pool_stats=self._pool_stats,
             warn_threshold_s=self._acquire_warn_threshold_s,
         ) as conn:
-            async with conn.transaction():
-                yield PostgresConnection(conn)
+            async with PostgresConnection(conn).transaction() as tx:
+                yield tx
 
     def get_pool(self) -> asyncpg.Pool:
         return self._ensure_pool()

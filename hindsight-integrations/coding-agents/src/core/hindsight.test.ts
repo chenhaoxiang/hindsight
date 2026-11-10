@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Agent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MAX_PARALLEL_RETAINS,
@@ -688,6 +689,29 @@ describe("HindsightClient.reflect failures", () => {
     expect(timeout.fallbackEligible).toBe(true);
   });
 
+  it("uses the native v2 dispatcher instead of the incompatible v1 handle", async () => {
+    void globalThis.Headers;
+    const globals = globalThis as Record<symbol, unknown>;
+    const key = Symbol.for("undici.globalDispatcher.2");
+    const previous = globals[key];
+    const dispatch = vi.fn(() => true);
+    const compose = vi.fn((interceptor) => ({ dispatch: interceptor(dispatch) }));
+    globals[key] = { compose };
+    const fetchMock = vi.fn(async (_url: unknown, init: any) => {
+      init.dispatcher.dispatch({ headersTimeout: 100, bodyTimeout: 100 }, {});
+      return jsonResponse(200, {});
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new HindsightClient({ apiUrl: "http://fixture.invalid", bank: "b" });
+      await client.req("GET", client.bankUrl("/stats"));
+      expect(compose).toHaveBeenCalledOnce();
+      expect(dispatch).toHaveBeenCalledWith({ headersTimeout: 0, bodyTimeout: 0 }, {});
+    } finally {
+      globals[key] = previous;
+    }
+  });
+
   it("is bounded by its own deadline, not undici's headersTimeout (#5504)", async () => {
     // Node's fetch cuts a request whose headers take longer than 300s, under any signal. Shrink
     // that default to 100ms on a real server that answers after 2s (undici's timers tick at
@@ -697,17 +721,21 @@ describe("HindsightClient.reflect failures", () => {
     );
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
-    void globalThis.Headers; // loads Node's undici, which installs the global dispatcher
-    const key = Symbol.for("undici.globalDispatcher.1");
-    const g = globalThis as Record<symbol, unknown>;
-    const original = g[key] as object;
-    const Agent = original.constructor as new (opts: object) => object;
-    g[key] = new Agent({ headersTimeout: 100 });
+    vi.stubGlobal("fetch", undiciFetch);
+    const nativeV2 = (globalThis as Record<symbol, unknown>)[
+      Symbol.for("undici.globalDispatcher.2")
+    ];
+    (globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.2")] = undefined;
+    const original = getGlobalDispatcher();
+    const shortHeadersTimeout = new Agent({ headersTimeout: 100 });
+    setGlobalDispatcher(shortHeadersTimeout);
     try {
       const client = new HindsightClient({ apiUrl: `http://127.0.0.1:${port}`, bank: "b" });
       expect(await client.reflect("why?", { timeoutMs: 10_000 })).toBe("late answer");
     } finally {
-      g[key] = original;
+      setGlobalDispatcher(original);
+      (globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.2")] = nativeV2;
+      await shortHeadersTimeout.close();
       server.close();
     }
   });

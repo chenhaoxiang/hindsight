@@ -12,7 +12,7 @@ import re
 import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Literal, Union, cast
+from typing import Any, Literal, Protocol, Union, cast, overload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import find_dotenv, load_dotenv
@@ -112,6 +112,12 @@ def static(default_value):
     return field(default=default_value, metadata={"hierarchical": False})
 
 
+# Config keys that were renamed: old name -> new name. Old names keep working
+# everywhere a key is read (env-style overrides, tenant overrides, stored bank
+# config, config PATCH bodies), so no stored row needs migrating. Remove in 2.x.
+_RENAMED_CONFIG_KEYS = {"knowledge_page_default_trigger": "page_default_trigger"}
+
+
 # Configuration key normalization utilities
 def normalize_config_key(key: str) -> str:
     """
@@ -130,7 +136,8 @@ def normalize_config_key(key: str) -> str:
     """
     if key.startswith("HINDSIGHT_API_"):
         key = key[len("HINDSIGHT_API_") :]
-    return key.lower()
+    key = key.lower()
+    return _RENAMED_CONFIG_KEYS.get(key, key)
 
 
 def normalize_config_dict(config: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +164,7 @@ ENV_READ_DATABASE_URL = "HINDSIGHT_API_READ_DATABASE_URL"
 ENV_READ_DB_POOL_MIN_SIZE = "HINDSIGHT_API_READ_DB_POOL_MIN_SIZE"
 ENV_READ_DB_POOL_MAX_SIZE = "HINDSIGHT_API_READ_DB_POOL_MAX_SIZE"
 ENV_MIGRATION_DATABASE_URL = "HINDSIGHT_API_MIGRATION_DATABASE_URL"
+ENV_DATABASE_CONNECT_HOOK = "HINDSIGHT_API_DATABASE_CONNECT_HOOK"
 ENV_DATABASE_SCHEMA = "HINDSIGHT_API_DATABASE_SCHEMA"
 ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
 ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
@@ -532,6 +540,17 @@ ENV_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LL
 ENV_MENTAL_MODEL_REFRESH_LLM_CACHE_AFFINITY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_CACHE_AFFINITY"
 
 ENV_EMBEDDINGS_PROVIDER = "HINDSIGHT_API_EMBEDDINGS_PROVIDER"
+
+# Per-side embeddings (optional). Recall queries embed through the QUERY side, everything
+# that is stored (retain, consolidation, imports, pages) through the PASSAGE side
+# (facts, observations and mental models).
+# A side is "the main embeddings config, with any HINDSIGHT_API_<SIDE>_EMBEDDINGS_<X> laid
+# over HINDSIGHT_API_EMBEDDINGS_<X>" — the same inherit-then-specialize shape as the
+# per-operation LLM settings (HINDSIGHT_API_RETAIN_LLM_*), but over every embeddings
+# variable, so either side can switch provider (local on one side, remote on the other).
+EMBEDDINGS_SIDE_QUERY = "QUERY"
+EMBEDDINGS_SIDE_PASSAGE = "PASSAGE"
+_ENV_EMBEDDINGS_PREFIX = "HINDSIGHT_API_EMBEDDINGS_"
 # Provider-agnostic asymmetric prefixes: applied client-side by every provider that
 # is plain text-in/vector-out (tei, litellm, litellm-sdk, openai-compatible). Providers
 # with a native asymmetry mechanism (local, zeroentropy) ignore them; onnx has its own
@@ -763,6 +782,7 @@ ENV_DECISION_MODEL_MAX_REQUEST_TOKENS = "HINDSIGHT_API_DECISION_MODEL_MAX_REQUES
 ENV_DECISION_MODEL_TOKENIZER = "HINDSIGHT_API_DECISION_MODEL_TOKENIZER"
 ENV_RECALL_DECISION_MODEL_PRUNE = "HINDSIGHT_API_RECALL_DECISION_MODEL_PRUNE"
 ENV_RECALL_DECISION_MODEL_DEDUP = "HINDSIGHT_API_RECALL_DECISION_MODEL_DEDUP"
+ENV_RECALL_DECISION_MODEL_FALLBACK = "HINDSIGHT_API_RECALL_DECISION_MODEL_FALLBACK"
 
 ENV_VECTOR_EXTENSION = "HINDSIGHT_API_VECTOR_EXTENSION"
 ENV_ANN_ITERATIVE_SCAN = "HINDSIGHT_API_ANN_ITERATIVE_SCAN"
@@ -986,7 +1006,9 @@ ENV_OBSERVATION_HISTORY_MAX_ENTRIES = "HINDSIGHT_API_OBSERVATION_HISTORY_MAX_ENT
 ENV_ENABLE_MENTAL_MODEL_HISTORY = "HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY"
 ENV_MENTAL_MODEL_HISTORY_MAX_ENTRIES = "HINDSIGHT_API_MENTAL_MODEL_HISTORY_MAX_ENTRIES"
 ENV_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS"
-ENV_KNOWLEDGE_PAGE_DEFAULT_TRIGGER = "HINDSIGHT_API_KNOWLEDGE_PAGE_DEFAULT_TRIGGER"
+ENV_PAGE_DEFAULT_TRIGGER = "HINDSIGHT_API_PAGE_DEFAULT_TRIGGER"
+# Deprecated name of ENV_PAGE_DEFAULT_TRIGGER, still read as a fallback. Remove in 2.x.
+ENV_PAGE_DEFAULT_TRIGGER_DEPRECATED = "HINDSIGHT_API_KNOWLEDGE_PAGE_DEFAULT_TRIGGER"
 ENV_REFLECT_DEFAULT_OPTIONS = "HINDSIGHT_API_REFLECT_DEFAULT_OPTIONS"
 
 # Webhook configuration (global, static - server-level only)
@@ -1047,6 +1069,7 @@ ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_TASK_RETRY_BACKOFF_SECONDS = "HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
+ENV_WORKER_SHUTDOWN_DRAIN_SECONDS = "HINDSIGHT_API_WORKER_SHUTDOWN_DRAIN_SECONDS"
 # How long a task shed for store backpressure is held before it is retried.
 ENV_BACKPRESSURE_DEFER_SECONDS = "HINDSIGHT_API_BACKPRESSURE_DEFER_SECONDS"
 ENV_OPERATION_RETENTION_DAYS = "HINDSIGHT_API_OPERATION_RETENTION_DAYS"
@@ -1202,6 +1225,7 @@ ENV_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS = "HINDSIGHT_API_CONSOLIDATION_RECO
 ENV_MENTAL_MODEL_REFRESH_TICK_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS"
 ENV_RETENTION_SWEEP_INTERVAL_SECONDS = "HINDSIGHT_API_RETENTION_SWEEP_INTERVAL_SECONDS"
 ENV_OPERATION_CLEANUP_INTERVAL_SECONDS = "HINDSIGHT_API_OPERATION_CLEANUP_INTERVAL_SECONDS"
+ENV_ATTACHMENT_SWEEP_INTERVAL_SECONDS = "HINDSIGHT_API_ATTACHMENT_SWEEP_INTERVAL_SECONDS"
 ENV_MAINTENANCE_START_JITTER_SECONDS = "HINDSIGHT_API_MAINTENANCE_START_JITTER_SECONDS"
 ENV_VECTOR_INDEX_MIN_ROWS = "HINDSIGHT_API_VECTOR_INDEX_MIN_ROWS"
 ENV_VECTOR_INDEX_MAINTENANCE_MIN_INTERVAL_SECONDS = "HINDSIGHT_API_VECTOR_INDEX_MAINTENANCE_MIN_INTERVAL_SECONDS"
@@ -1614,16 +1638,26 @@ class _DecisionProviderDefaults:
     #: Most tokens one request may carry, sized for the model's window; None takes
     #: DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS.
     max_request_tokens: int | None = None
+    #: ``base_url`` fits each request to the window of the model serving it, so on that URL the
+    #: client does not split by tokens. Any other URL (the model served on your own vLLM) does not.
+    default_url_fits_requests: bool = False
 
 
 # "none": no decision model; operations that could use one keep their LLM-only path.
 # hindsight, typesafe and cloudflare speak the System One API; openai has its own Decisions API.
 # hindsight is Hindsight Inference: its key comes from HINDSIGHT_API_DECISION_MODEL_API_KEY or,
-# when unset, from `hindsight-admin cloud login`. hs-decide-1-flash has a 64k window; the margin is
-# for counting it with o200k_base, not its own vocabulary.
+# when unset, from `hindsight-admin cloud login`. Hindsight Inference fits each request to the
+# window of the model that serves it and merges the answers, so the whole pool goes in one request.
+# It used to split at 54k tokens there too, counted on the whole JSON body: about twice the text the
+# model reads, so pools that fit were sent as 2+ calls (#6489). The 54k still applies on a custom URL,
+# where nothing fits the request: hs-decide-1-flash has a 64k window, and the margin is for counting
+# it with o200k_base, not its own vocabulary.
 DECISION_MODEL_PROVIDER_DEFAULTS = {
     "hindsight": _DecisionProviderDefaults(
-        model="hs-decide-1-flash", base_url=HINDSIGHT_INFERENCE_URL, max_request_tokens=54_000
+        model="hs-decide-1-flash",
+        base_url=HINDSIGHT_INFERENCE_URL,
+        max_request_tokens=54_000,
+        default_url_fits_requests=True,
     ),
     "typesafe": _DecisionProviderDefaults(model="jev-latest", base_url="https://api.typesafe.ai", tokenizer="jev"),
     "cloudflare": _DecisionProviderDefaults(model="clef", base_url=None),
@@ -1648,6 +1682,9 @@ MIN_DECISION_MODEL_MAX_REQUEST_TOKENS = 1_000
 DEFAULT_RECALL_DECISION_MODEL_PRUNE = False
 # Off by default: it costs one more decision-model request per recall.
 DEFAULT_RECALL_DECISION_MODEL_DEDUP = False
+# Off by default: a recall ranked by the cross-encoder instead is a quieter, worse answer, so a
+# failing decision model fails the recall unless the operator chose the fallback.
+DEFAULT_RECALL_DECISION_MODEL_FALLBACK = False
 
 
 def _decision_model_env(operation: str, setting: str) -> str:
@@ -1949,13 +1986,13 @@ DEFAULT_ENABLE_MENTAL_MODEL_HISTORY = True  # Mental model history tracking enab
 # (API/MCP/control plane) ignore it entirely. Per-model
 # `trigger.min_refresh_interval_seconds` overrides this.
 DEFAULT_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS = 0
-# Trigger fields layered over the engine's built-in knowledge-page default
-# (MemoryEngine.KNOWLEDGE_PAGE_DEFAULT_TRIGGER) when a page is created; a request's
+# Trigger fields layered over the engine's built-in page default
+# (MemoryEngine.PAGE_DEFAULT_TRIGGER) when a page is created; a request's
 # own trigger still wins. JSON object, e.g. {"refresh_cron": "0 * * * *"}.
-DEFAULT_KNOWLEDGE_PAGE_DEFAULT_TRIGGER: dict | None = None
-# Reflect options applied whenever a reflect request -- or a mental model's trigger --
-# leaves them unset, e.g. {"reflect_search_observations_max_tokens": 3000}. Fields are those of
-# ReflectDefaultOptions; an explicit request/trigger value always wins.
+DEFAULT_PAGE_DEFAULT_TRIGGER: dict | None = None
+# Reflect options applied whenever a reflect request leaves them unset, e.g.
+# {"reflect_search_observations_max_tokens": 3000}. Fields are those of ReflectDefaultOptions;
+# an explicit request value always wins. Mental-model refreshes do not read it (they use their trigger).
 DEFAULT_REFLECT_DEFAULT_OPTIONS: dict | None = None
 # History (mental-model refresh snapshots and observation update snapshots) lives in
 # the dedicated mental_model_history / observation_history tables, one row per change.
@@ -2096,6 +2133,10 @@ DEFAULT_WORKER_MAX_RETRIES = 3  # Max retries before marking task failed
 DEFAULT_WORKER_TASK_RETRY_BACKOFF_SECONDS = 60  # Seconds between retries on transient task failure
 DEFAULT_WORKER_HTTP_PORT = 8889  # HTTP port for worker metrics/health
 DEFAULT_WORKER_MAX_SLOTS = 10  # Total concurrent tasks per worker
+# How long shutdown waits for in-flight tasks before cancelling them and handing their
+# rows back to 'pending'. Counted from SIGTERM. Drain + ~5s cancel + ~2s release must fit
+# the platform's grace period; 20s fits Kubernetes' default 30s (#6021).
+DEFAULT_WORKER_SHUTDOWN_DRAIN_SECONDS = 20.0
 # Terminal rows keep their payload and metadata for one coherent debug/retry TTL.
 # Zero retention days disables automatic pruning entirely, and is the default:
 # operation history is a user-visible audit trail, so bounding it is an opt-in
@@ -2130,7 +2171,7 @@ DEFAULT_CONSOLIDATION_WALL_TIMEOUT = 7200  # seconds (2 hours)
 
 # Reflect agent settings
 DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing response
-# Whether reflect (and, separately, a knowledge-page refresh) is decision-orchestrated when a
+# Whether reflect (and, separately, a page refresh) is decision-orchestrated when a
 # reflect decision model is set up: the retrieval layers run in parallel rounds and the decision
 # model prunes the evidence and judges when it is enough, in place of the LLM's per-layer turns.
 # On by default, so setting up a decision model is what turns it on; a bank can opt out.
@@ -2251,6 +2292,12 @@ DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS = 3600
 # retention sweeps it deletes rows whose retention is counted in days, so a slow
 # cadence costs nothing but avoids a per-tick cross-tenant probe. 0 disables it.
 DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS = 900
+
+# How often attachments their document does not reference are deleted — the images
+# and files of a retain that failed after the API stored them. It looks only at the
+# attachments stored in the past week, so a daily run touches each one a handful of
+# times. 0 disables it.
+DEFAULT_ATTACHMENT_SWEEP_INTERVAL_SECONDS = 86400
 
 # Upper bound on the random delay applied before a process runs its first
 # maintenance tick. Every job is due on the first tick, so without this a fleet
@@ -3293,10 +3340,56 @@ class DecisionModelConfig:
     base_url: str
     timeout: float
     max_concurrent: int
-    max_request_tokens: int
+    #: None: the endpoint fits requests itself, so they are split only to stay under its body-size limit.
+    max_request_tokens: int | None
     #: The vocabulary ``max_request_tokens`` and the reranker's caps are counted in; None
     #: counts with HINDSIGHT_API_TOKENIZER_ENCODING.
     tokenizer: str | None = None
+
+
+# Every embeddings variable a side may override, so a misspelt override fails loudly.
+_EMBEDDINGS_ENV_NAMES = frozenset(
+    value
+    for name, value in dict(globals()).items()
+    if name.startswith("ENV_EMBEDDINGS_") and isinstance(value, str) and value.startswith(_ENV_EMBEDDINGS_PREFIX)
+)
+
+
+class _Getenv(Protocol):
+    """``os.getenv``'s shape: a default makes the result non-None."""
+
+    @overload
+    def __call__(self, name: str, /) -> str | None: ...
+    @overload
+    def __call__(self, name: str, default: str, /) -> str: ...
+
+
+def _embeddings_side_env_prefix(side: str) -> str:
+    """``HINDSIGHT_API_QUERY_EMBEDDINGS_`` / ``HINDSIGHT_API_PASSAGE_EMBEDDINGS_``."""
+    return f"HINDSIGHT_API_{side}_EMBEDDINGS_"
+
+
+def _scoped_embeddings_getenv(side: str) -> _Getenv:
+    """An ``os.getenv`` that prefers a side's own variable over the main embeddings one.
+
+    Only ``HINDSIGHT_API_EMBEDDINGS_*`` names are scoped. The shared-key fallbacks the
+    embeddings fields also consult (``HINDSIGHT_API_LLM_API_KEY``, ``COHERE_API_KEY``, ...)
+    stay process-wide, so a side inherits them exactly like the main config does.
+    """
+    prefix = _embeddings_side_env_prefix(side)
+
+    @overload
+    def getenv(name: str, /) -> str | None: ...
+    @overload
+    def getenv(name: str, default: str, /) -> str: ...
+    def getenv(name: str, default: str | None = None, /) -> str | None:
+        if name.startswith(_ENV_EMBEDDINGS_PREFIX):
+            scoped = os.environ.get(prefix + name.removeprefix(_ENV_EMBEDDINGS_PREFIX))
+            if scoped is not None:
+                return scoped
+        return os.getenv(name, default)
+
+    return getenv
 
 
 @dataclass
@@ -3312,6 +3405,11 @@ class HindsightConfig:
     read_db_pool_min_size: int
     read_db_pool_max_size: int
     migration_database_url: str | None
+    # ``module.path:function`` naming an async callable with asyncpg.connect's
+    # signature. Every new physical connection goes through it, so rotated or
+    # short-lived credentials (RDS IAM, Secrets Manager rotation) are picked up
+    # without a restart (#6163).
+    database_connect_hook: str | None
     database_schema: str
     vector_extension: str  # "pgvector", "vchord", "pgvectorscale", or "scann"
     ann_iterative_scan: bool
@@ -3796,7 +3894,7 @@ class HindsightConfig:
     enable_mental_model_history: bool
     mental_model_history_max_entries: int
     mental_model_min_refresh_interval_seconds: int
-    knowledge_page_default_trigger: dict | None
+    page_default_trigger: dict | None
     consolidation_batch_size: int
     consolidation_dedup_threshold: float
     consolidation_max_memories_per_round: int
@@ -3903,6 +4001,7 @@ class HindsightConfig:
     worker_task_retry_backoff_seconds: int
     worker_http_port: int
     worker_max_slots: int
+    worker_shutdown_drain_seconds: float
     worker_slot_reservations: dict[str, int]
     worker_consolidation_bank_priority: dict[str, int]
     operation_retention_days: int
@@ -4002,6 +4101,10 @@ class HindsightConfig:
     embeddings_zeroentropy_latency: str | None = DEFAULT_EMBEDDINGS_ZEROENTROPY_LATENCY
     # hindsight: None falls back to the key `hindsight-admin cloud login` saved.
     embeddings_hindsight_api_key: str | None = None
+    # Per-side embeddings configs (see EMBEDDINGS_SIDE_QUERY). None means the side uses the
+    # main embeddings config above. Static: a vector space is a deployment-wide choice.
+    query_embeddings: "HindsightConfig | None" = None
+    passage_embeddings: "HindsightConfig | None" = None
     reranker_hindsight_api_key: str | None = None
     embeddings_nvidia_api_key: str | None = None
     embeddings_nvidia_model: str = DEFAULT_EMBEDDINGS_NVIDIA_MODEL
@@ -4057,6 +4160,7 @@ class HindsightConfig:
     # the lever a large deployment tunes. 0 disables the job.
     retention_sweep_interval_seconds: int = DEFAULT_RETENTION_SWEEP_INTERVAL_SECONDS
     operation_cleanup_interval_seconds: int = DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS
+    attachment_sweep_interval_seconds: int = DEFAULT_ATTACHMENT_SWEEP_INTERVAL_SECONDS
     maintenance_start_jitter_seconds: int = DEFAULT_MAINTENANCE_START_JITTER_SECONDS
 
     # Retry/backoff applied to remote embedding API calls (see engine/remote_retry.py's RetryPolicy).
@@ -4090,6 +4194,9 @@ class HindsightConfig:
     # candidates it judges no help (prune), and the ones repeating a better-ranked one (dedup).
     recall_decision_model_prune: bool = DEFAULT_RECALL_DECISION_MODEL_PRUNE
     recall_decision_model_dedup: bool = DEFAULT_RECALL_DECISION_MODEL_DEDUP
+    # Server-wide (one reranker serves every bank): when the decision model fails a recall's
+    # ranking, rank it with the configured HINDSIGHT_API_RERANKER_* chain instead.
+    recall_decision_model_fallback: bool = DEFAULT_RECALL_DECISION_MODEL_FALLBACK
     reflect_decision_model_provider: str | None = None
     reflect_decision_model_api_key: str | None = None
     reflect_decision_model_model: str | None = None
@@ -4236,7 +4343,7 @@ class HindsightConfig:
         "consolidation_strategies",
         # Mental model settings
         "mental_model_min_refresh_interval_seconds",
-        "knowledge_page_default_trigger",
+        "page_default_trigger",
         # Reflect settings
         "reflect_mission",
         "reflect_use_decision_model",
@@ -4572,12 +4679,16 @@ class HindsightConfig:
         # Warn if local ML dependencies are missing when configured.
         # Don't hard-fail here — the actual ImportError fires at model init time
         # with a clear message. This early warning catches it before startup proceeds.
-        if self.embeddings_provider == "local" or self.reranker_provider == "local":
+        # The main embeddings provider builds nothing when both sides replace it.
+        main_embeddings = self.embeddings_provider
+        if self.query_embeddings is not None and self.passage_embeddings is not None:
+            main_embeddings = ""
+        if main_embeddings == "local" or self.reranker_provider == "local":
             # find_spec, not import: importing sentence_transformers pulls in torch and costs
             # ~15 s, which every process (even `--help`) would pay just to run this check.
             if importlib.util.find_spec("sentence_transformers") is None:
                 missing = []
-                if self.embeddings_provider == "local":
+                if main_embeddings == "local":
                     missing.append("embeddings")
                 if self.reranker_provider == "local":
                     missing.append("reranker")
@@ -4591,7 +4702,7 @@ class HindsightConfig:
                     " and ".join(missing),
                 )
 
-        if self.embeddings_provider == "onnx":
+        if main_embeddings == "onnx":
             if importlib.util.find_spec("onnxruntime") is None or importlib.util.find_spec("transformers") is None:
                 logger.warning(
                     "ONNX embeddings provider configured, but 'onnxruntime' and/or "
@@ -4621,6 +4732,53 @@ class HindsightConfig:
     @classmethod
     def from_env(cls) -> "HindsightConfig":
         """Create configuration from environment variables."""
+        config = cls._read_env(os.getenv)
+        # Sides first: when both replace the main embeddings config, its provider never
+        # embeds anything, and validate() skips its dependency checks.
+        config.query_embeddings = cls._embeddings_side_from_env(EMBEDDINGS_SIDE_QUERY)
+        config.passage_embeddings = cls._embeddings_side_from_env(EMBEDDINGS_SIDE_PASSAGE)
+        config.validate()
+        return config
+
+    @classmethod
+    def _embeddings_side_from_env(cls, side: str) -> "HindsightConfig | None":
+        """The config one embeddings side builds its backend from, or None when the side is unset.
+
+        The whole config is read again with the side's scoped lookup. Only the embeddings
+        fields read through ``getenv`` (see ``_read_env``), so everything else matches the
+        main config, and a side goes through the same parsers, validation and legacy-key
+        fallbacks as the main embeddings config — it cannot drift from it. Validated too, so
+        a side switched to `local` or `onnx` gets the missing-dependency check the main
+        config would (a shared condition, like a local reranker, may then warn twice).
+
+        A side is on as soon as any of its variables is set, even to an empty string: once
+        on, an empty value overrides (clears) the main one, e.g. a prefix for one side only.
+        A variable that names no embeddings setting is refused rather than ignored, so a
+        typo cannot quietly build a second copy of the main backend.
+        """
+        prefix = _embeddings_side_env_prefix(side)
+        names = [name for name in os.environ if name.startswith(prefix)]
+        if not names:
+            return None
+        unknown = sorted(
+            n for n in names if _ENV_EMBEDDINGS_PREFIX + n.removeprefix(prefix) not in _EMBEDDINGS_ENV_NAMES
+        )
+        if unknown:
+            raise ValueError(
+                f"Unknown {side.lower()} embeddings variable(s) {', '.join(unknown)}: each must be "
+                f"{prefix}<X> for an existing {_ENV_EMBEDDINGS_PREFIX}<X>"
+            )
+        try:
+            side_config = cls._read_env(_scoped_embeddings_getenv(side))
+            side_config.validate()
+        except ValueError as e:
+            # The parsers name the main variable; say which side's override it came from.
+            raise ValueError(f"{e} (read for the {side.lower()} embeddings side, {prefix}*)") from e
+        return side_config
+
+    @classmethod
+    def _read_env(cls, getenv: _Getenv) -> "HindsightConfig":
+        """Build the config from the environment; the ``embeddings_*`` fields read through ``getenv``."""
         # Get provider first to determine default model
         llm_provider = os.getenv(ENV_LLM_PROVIDER, DEFAULT_LLM_PROVIDER)
         llm_model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(llm_provider)
@@ -4646,6 +4804,7 @@ class HindsightConfig:
             read_db_pool_min_size=int(os.getenv(ENV_READ_DB_POOL_MIN_SIZE, str(DEFAULT_DB_POOL_MIN_SIZE))),
             read_db_pool_max_size=int(os.getenv(ENV_READ_DB_POOL_MAX_SIZE, str(DEFAULT_DB_POOL_MAX_SIZE))),
             migration_database_url=os.getenv(ENV_MIGRATION_DATABASE_URL) or None,
+            database_connect_hook=os.getenv(ENV_DATABASE_CONNECT_HOOK) or None,
             database_schema=os.getenv(ENV_DATABASE_SCHEMA, DEFAULT_DATABASE_SCHEMA),
             vector_extension=os.getenv(ENV_VECTOR_EXTENSION, DEFAULT_VECTOR_EXTENSION).lower(),
             ann_iterative_scan=_parse_boolean_env(ENV_ANN_ITERATIVE_SCAN, DEFAULT_ANN_ITERATIVE_SCAN),
@@ -4841,124 +5000,119 @@ class HindsightConfig:
             mental_model_refresh_llm_members=_parse_llm_members("MENTAL_MODEL_REFRESH_"),
             mental_model_refresh_llm_strategy=_parse_llm_strategy(os.getenv(ENV_MENTAL_MODEL_REFRESH_LLM_STRATEGY)),
             # Embeddings
-            embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
+            embeddings_provider=getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             # Generic name, falling back to the deprecated LiteLLM-SDK-specific alias.
             # 0 (or any non-positive value) means "no cap" — the only way to opt out
             # now that the default is a real limit rather than None.
             embeddings_max_input_tokens=(int(v) if int(v) > 0 else None)
-            if (
-                v := os.getenv(ENV_EMBEDDINGS_MAX_INPUT_TOKENS)
-                or os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_MAX_INPUT_TOKENS)
-            )
+            if (v := getenv(ENV_EMBEDDINGS_MAX_INPUT_TOKENS) or getenv(ENV_EMBEDDINGS_LITELLM_SDK_MAX_INPUT_TOKENS))
             else DEFAULT_EMBEDDINGS_MAX_INPUT_TOKENS,
-            embeddings_local_model=os.getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
-            embeddings_local_force_cpu=os.getenv(
+            embeddings_local_model=getenv(ENV_EMBEDDINGS_LOCAL_MODEL, DEFAULT_EMBEDDINGS_LOCAL_MODEL),
+            embeddings_local_force_cpu=getenv(
                 ENV_EMBEDDINGS_LOCAL_FORCE_CPU, str(DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU)
             ).lower()
             in ("true", "1"),
-            embeddings_local_trust_remote_code=os.getenv(
+            embeddings_local_trust_remote_code=getenv(
                 ENV_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE, str(DEFAULT_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE)
             ).lower()
             in ("true", "1"),
             embeddings_local_max_concurrent=int(
-                os.getenv(ENV_EMBEDDINGS_LOCAL_MAX_CONCURRENT, str(DEFAULT_EMBEDDINGS_LOCAL_MAX_CONCURRENT))
+                getenv(ENV_EMBEDDINGS_LOCAL_MAX_CONCURRENT, str(DEFAULT_EMBEDDINGS_LOCAL_MAX_CONCURRENT))
             ),
-            embeddings_onnx_model_id=os.getenv(ENV_EMBEDDINGS_ONNX_MODEL_ID, DEFAULT_EMBEDDINGS_ONNX_MODEL_ID),
-            embeddings_onnx_model_path=os.getenv(ENV_EMBEDDINGS_ONNX_MODEL_PATH) or None,
-            embeddings_onnx_tokenizer_name_or_path=os.getenv(ENV_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH) or None,
-            embeddings_onnx_file=os.getenv(ENV_EMBEDDINGS_ONNX_FILE, DEFAULT_EMBEDDINGS_ONNX_FILE),
+            embeddings_onnx_model_id=getenv(ENV_EMBEDDINGS_ONNX_MODEL_ID, DEFAULT_EMBEDDINGS_ONNX_MODEL_ID),
+            embeddings_onnx_model_path=getenv(ENV_EMBEDDINGS_ONNX_MODEL_PATH) or None,
+            embeddings_onnx_tokenizer_name_or_path=getenv(ENV_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH) or None,
+            embeddings_onnx_file=getenv(ENV_EMBEDDINGS_ONNX_FILE, DEFAULT_EMBEDDINGS_ONNX_FILE),
             embeddings_onnx_dimensions=_parse_optional_positive_int(
                 ENV_EMBEDDINGS_ONNX_DIMENSIONS,
-                os.getenv(ENV_EMBEDDINGS_ONNX_DIMENSIONS),
+                getenv(ENV_EMBEDDINGS_ONNX_DIMENSIONS),
             ),
             embeddings_onnx_max_tokens=_parse_positive_int(
                 ENV_EMBEDDINGS_ONNX_MAX_TOKENS,
-                os.getenv(ENV_EMBEDDINGS_ONNX_MAX_TOKENS),
+                getenv(ENV_EMBEDDINGS_ONNX_MAX_TOKENS),
                 DEFAULT_EMBEDDINGS_ONNX_MAX_TOKENS,
             ),
             embeddings_onnx_pooling=_parse_optional_choice(
                 ENV_EMBEDDINGS_ONNX_POOLING,
-                os.getenv(ENV_EMBEDDINGS_ONNX_POOLING),
+                getenv(ENV_EMBEDDINGS_ONNX_POOLING),
                 frozenset({"mean", "cls"}),
             )
             or DEFAULT_EMBEDDINGS_ONNX_POOLING,
-            embeddings_onnx_normalize=os.getenv(
+            embeddings_onnx_normalize=getenv(
                 ENV_EMBEDDINGS_ONNX_NORMALIZE, str(DEFAULT_EMBEDDINGS_ONNX_NORMALIZE)
             ).lower()
             in ("true", "1"),
-            embeddings_onnx_query_prefix=os.getenv(
-                ENV_EMBEDDINGS_ONNX_QUERY_PREFIX, DEFAULT_EMBEDDINGS_ONNX_QUERY_PREFIX
-            ),
-            embeddings_onnx_passage_prefix=os.getenv(
+            embeddings_onnx_query_prefix=getenv(ENV_EMBEDDINGS_ONNX_QUERY_PREFIX, DEFAULT_EMBEDDINGS_ONNX_QUERY_PREFIX),
+            embeddings_onnx_passage_prefix=getenv(
                 ENV_EMBEDDINGS_ONNX_PASSAGE_PREFIX, DEFAULT_EMBEDDINGS_ONNX_PASSAGE_PREFIX
             ),
-            embeddings_onnx_output_name=os.getenv(ENV_EMBEDDINGS_ONNX_OUTPUT_NAME) or None,
+            embeddings_onnx_output_name=getenv(ENV_EMBEDDINGS_ONNX_OUTPUT_NAME) or None,
             embeddings_onnx_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_ONNX_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_ONNX_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_ONNX_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE,
             ),
-            embeddings_onnx_cpu_mem_arena=os.getenv(
+            embeddings_onnx_cpu_mem_arena=getenv(
                 ENV_EMBEDDINGS_ONNX_CPU_MEM_ARENA, str(DEFAULT_EMBEDDINGS_ONNX_CPU_MEM_ARENA)
             ).lower()
             == "true",
             embeddings_onnx_device=_parse_optional_choice(
                 ENV_EMBEDDINGS_ONNX_DEVICE,
-                os.getenv(ENV_EMBEDDINGS_ONNX_DEVICE),
+                getenv(ENV_EMBEDDINGS_ONNX_DEVICE),
                 frozenset({"cpu", "cuda"}),
             )
             or DEFAULT_EMBEDDINGS_ONNX_DEVICE,
             embeddings_onnx_cuda_device_id=_parse_non_negative_int(
                 ENV_EMBEDDINGS_ONNX_CUDA_DEVICE_ID,
-                os.getenv(ENV_EMBEDDINGS_ONNX_CUDA_DEVICE_ID),
+                getenv(ENV_EMBEDDINGS_ONNX_CUDA_DEVICE_ID),
                 DEFAULT_EMBEDDINGS_ONNX_CUDA_DEVICE_ID,
             ),
-            embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
+            embeddings_tei_url=getenv(ENV_EMBEDDINGS_TEI_URL),
             # Falls back to the shared LLM key, the way every other OpenAI-compatible
             # embeddings provider here does: one key configured once covers both.
-            embeddings_openai_api_key=(os.getenv(ENV_EMBEDDINGS_OPENAI_API_KEY) or os.getenv(ENV_LLM_API_KEY)),
-            embeddings_openai_model=os.getenv(ENV_EMBEDDINGS_OPENAI_MODEL, DEFAULT_EMBEDDINGS_OPENAI_MODEL),
-            embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
+            embeddings_openai_api_key=(getenv(ENV_EMBEDDINGS_OPENAI_API_KEY) or getenv(ENV_LLM_API_KEY)),
+            embeddings_openai_model=getenv(ENV_EMBEDDINGS_OPENAI_MODEL, DEFAULT_EMBEDDINGS_OPENAI_MODEL),
+            embeddings_openai_base_url=getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_OPENAI_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_OPENAI_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE,
             ),
             embeddings_tei_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_TEI_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_TEI_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_TEI_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE,
             ),
             embeddings_max_concurrent_requests=_parse_positive_int(
                 ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS,
-                os.getenv(ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS),
+                getenv(ENV_EMBEDDINGS_MAX_CONCURRENT_REQUESTS),
                 DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS,
             ),
             embeddings_openai_dimensions=_parse_optional_positive_int(
                 ENV_EMBEDDINGS_OPENAI_DIMENSIONS,
-                os.getenv(ENV_EMBEDDINGS_OPENAI_DIMENSIONS),
+                getenv(ENV_EMBEDDINGS_OPENAI_DIMENSIONS),
             ),
-            embeddings_openai_extra_body=json.loads(os.getenv(ENV_EMBEDDINGS_OPENAI_EXTRA_BODY, "null")),
-            embeddings_query_prefix=os.getenv(ENV_EMBEDDINGS_QUERY_PREFIX, DEFAULT_EMBEDDINGS_QUERY_PREFIX),
-            embeddings_passage_prefix=os.getenv(ENV_EMBEDDINGS_PASSAGE_PREFIX, DEFAULT_EMBEDDINGS_PASSAGE_PREFIX),
+            embeddings_openai_extra_body=json.loads(getenv(ENV_EMBEDDINGS_OPENAI_EXTRA_BODY, "null")),
+            embeddings_query_prefix=getenv(ENV_EMBEDDINGS_QUERY_PREFIX, DEFAULT_EMBEDDINGS_QUERY_PREFIX),
+            embeddings_passage_prefix=getenv(ENV_EMBEDDINGS_PASSAGE_PREFIX, DEFAULT_EMBEDDINGS_PASSAGE_PREFIX),
             embeddings_max_retries=_parse_non_negative_int(
                 ENV_EMBEDDINGS_MAX_RETRIES,
-                os.getenv(ENV_EMBEDDINGS_MAX_RETRIES),
+                getenv(ENV_EMBEDDINGS_MAX_RETRIES),
                 DEFAULT_EMBEDDINGS_MAX_RETRIES,
             ),
             embeddings_initial_backoff=_parse_non_negative_float(
                 ENV_EMBEDDINGS_INITIAL_BACKOFF,
-                os.getenv(ENV_EMBEDDINGS_INITIAL_BACKOFF),
+                getenv(ENV_EMBEDDINGS_INITIAL_BACKOFF),
                 DEFAULT_EMBEDDINGS_INITIAL_BACKOFF,
             ),
             embeddings_max_backoff=_parse_non_negative_float(
                 ENV_EMBEDDINGS_MAX_BACKOFF,
-                os.getenv(ENV_EMBEDDINGS_MAX_BACKOFF),
+                getenv(ENV_EMBEDDINGS_MAX_BACKOFF),
                 DEFAULT_EMBEDDINGS_MAX_BACKOFF,
             ),
             embeddings_retry_budget=_parse_non_negative_float(
                 ENV_EMBEDDINGS_RETRY_BUDGET,
-                os.getenv(ENV_EMBEDDINGS_RETRY_BUDGET),
+                getenv(ENV_EMBEDDINGS_RETRY_BUDGET),
                 DEFAULT_EMBEDDINGS_RETRY_BUDGET,
             ),
             reranker_max_retries=_parse_non_negative_int(
@@ -4982,112 +5136,105 @@ class HindsightConfig:
                 DEFAULT_RERANKER_RETRY_BUDGET,
             ),
             # Cohere embeddings (with backward-compatible fallback to shared API key)
-            embeddings_cohere_api_key=os.getenv(ENV_EMBEDDINGS_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
-            embeddings_cohere_model=os.getenv(ENV_EMBEDDINGS_COHERE_MODEL, DEFAULT_EMBEDDINGS_COHERE_MODEL),
-            embeddings_cohere_base_url=os.getenv(ENV_EMBEDDINGS_COHERE_BASE_URL) or None,
+            embeddings_cohere_api_key=getenv(ENV_EMBEDDINGS_COHERE_API_KEY) or getenv(ENV_COHERE_API_KEY),
+            embeddings_cohere_model=getenv(ENV_EMBEDDINGS_COHERE_MODEL, DEFAULT_EMBEDDINGS_COHERE_MODEL),
+            embeddings_cohere_base_url=getenv(ENV_EMBEDDINGS_COHERE_BASE_URL) or None,
             embeddings_cohere_output_dimensions=int(v)
-            if (v := os.getenv(ENV_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS))
+            if (v := getenv(ENV_EMBEDDINGS_COHERE_OUTPUT_DIMENSIONS))
             else None,
             # OpenRouter embeddings (with fallback to shared OpenRouter key, then LLM key)
-            embeddings_openrouter_api_key=os.getenv(ENV_EMBEDDINGS_OPENROUTER_API_KEY)
-            or os.getenv(ENV_OPENROUTER_API_KEY)
-            or os.getenv(ENV_LLM_API_KEY),
-            embeddings_openrouter_model=os.getenv(ENV_EMBEDDINGS_OPENROUTER_MODEL, DEFAULT_EMBEDDINGS_OPENROUTER_MODEL),
+            embeddings_openrouter_api_key=getenv(ENV_EMBEDDINGS_OPENROUTER_API_KEY)
+            or getenv(ENV_OPENROUTER_API_KEY)
+            or getenv(ENV_LLM_API_KEY),
+            embeddings_openrouter_model=getenv(ENV_EMBEDDINGS_OPENROUTER_MODEL, DEFAULT_EMBEDDINGS_OPENROUTER_MODEL),
             # Requesty embeddings (with fallback to shared Requesty key, then LLM key)
-            embeddings_requesty_api_key=os.getenv(ENV_EMBEDDINGS_REQUESTY_API_KEY)
-            or os.getenv(ENV_REQUESTY_API_KEY)
-            or os.getenv(ENV_LLM_API_KEY),
-            embeddings_requesty_model=os.getenv(ENV_EMBEDDINGS_REQUESTY_MODEL, DEFAULT_EMBEDDINGS_REQUESTY_MODEL),
+            embeddings_requesty_api_key=getenv(ENV_EMBEDDINGS_REQUESTY_API_KEY)
+            or getenv(ENV_REQUESTY_API_KEY)
+            or getenv(ENV_LLM_API_KEY),
+            embeddings_requesty_model=getenv(ENV_EMBEDDINGS_REQUESTY_MODEL, DEFAULT_EMBEDDINGS_REQUESTY_MODEL),
             # ZeroEntropy embeddings
-            embeddings_zeroentropy_api_key=os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_API_KEY)
-            or os.getenv("ZEROENTROPY_API_KEY"),
-            embeddings_zeroentropy_model=os.getenv(
-                ENV_EMBEDDINGS_ZEROENTROPY_MODEL, DEFAULT_EMBEDDINGS_ZEROENTROPY_MODEL
-            ),
-            embeddings_zeroentropy_base_url=os.getenv(
-                ENV_EMBEDDINGS_ZEROENTROPY_BASE_URL, DEFAULT_ZEROENTROPY_BASE_URL
-            ),
+            embeddings_zeroentropy_api_key=getenv(ENV_EMBEDDINGS_ZEROENTROPY_API_KEY) or getenv("ZEROENTROPY_API_KEY"),
+            embeddings_zeroentropy_model=getenv(ENV_EMBEDDINGS_ZEROENTROPY_MODEL, DEFAULT_EMBEDDINGS_ZEROENTROPY_MODEL),
+            embeddings_zeroentropy_base_url=getenv(ENV_EMBEDDINGS_ZEROENTROPY_BASE_URL, DEFAULT_ZEROENTROPY_BASE_URL),
             embeddings_zeroentropy_dimensions=_parse_positive_int(
                 ENV_EMBEDDINGS_ZEROENTROPY_DIMENSIONS,
-                os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_DIMENSIONS),
+                getenv(ENV_EMBEDDINGS_ZEROENTROPY_DIMENSIONS),
                 DEFAULT_EMBEDDINGS_ZEROENTROPY_DIMENSIONS,
             ),
             embeddings_zeroentropy_encoding_format=_parse_optional_choice(
                 ENV_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT,
-                os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT),
+                getenv(ENV_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT),
                 frozenset({"float", "base64"}),
             )
             or DEFAULT_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT,
             embeddings_zeroentropy_latency=_parse_optional_choice(
                 ENV_EMBEDDINGS_ZEROENTROPY_LATENCY,
-                os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_LATENCY),
+                getenv(ENV_EMBEDDINGS_ZEROENTROPY_LATENCY),
                 frozenset({"fast", "slow"}),
             ),
             embeddings_zeroentropy_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE,
             ),
             # NVIDIA NIM embeddings
-            embeddings_nvidia_api_key=os.getenv(ENV_EMBEDDINGS_NVIDIA_API_KEY),
-            embeddings_nvidia_model=os.getenv(ENV_EMBEDDINGS_NVIDIA_MODEL, DEFAULT_EMBEDDINGS_NVIDIA_MODEL),
-            embeddings_nvidia_base_url=os.getenv(ENV_EMBEDDINGS_NVIDIA_BASE_URL, DEFAULT_EMBEDDINGS_NVIDIA_BASE_URL),
+            embeddings_nvidia_api_key=getenv(ENV_EMBEDDINGS_NVIDIA_API_KEY),
+            embeddings_nvidia_model=getenv(ENV_EMBEDDINGS_NVIDIA_MODEL, DEFAULT_EMBEDDINGS_NVIDIA_MODEL),
+            embeddings_nvidia_base_url=getenv(ENV_EMBEDDINGS_NVIDIA_BASE_URL, DEFAULT_EMBEDDINGS_NVIDIA_BASE_URL),
             embeddings_nvidia_dimensions=_parse_positive_int(
                 ENV_EMBEDDINGS_NVIDIA_DIMENSIONS,
-                os.getenv(ENV_EMBEDDINGS_NVIDIA_DIMENSIONS),
+                getenv(ENV_EMBEDDINGS_NVIDIA_DIMENSIONS),
                 DEFAULT_EMBEDDINGS_NVIDIA_DIMENSIONS,
             ),
             embeddings_nvidia_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_NVIDIA_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_NVIDIA_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_NVIDIA_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_NVIDIA_BATCH_SIZE,
             ),
             # LiteLLM embeddings (with backward-compatible fallback to shared config)
-            embeddings_litellm_api_base=os.getenv(ENV_EMBEDDINGS_LITELLM_API_BASE)
-            or os.getenv(ENV_LITELLM_API_BASE, DEFAULT_LITELLM_API_BASE),
-            embeddings_litellm_api_key=os.getenv(ENV_EMBEDDINGS_LITELLM_API_KEY) or os.getenv(ENV_LITELLM_API_KEY),
-            embeddings_litellm_model=os.getenv(ENV_EMBEDDINGS_LITELLM_MODEL, DEFAULT_EMBEDDINGS_LITELLM_MODEL),
+            embeddings_litellm_api_base=getenv(ENV_EMBEDDINGS_LITELLM_API_BASE)
+            or getenv(ENV_LITELLM_API_BASE, DEFAULT_LITELLM_API_BASE),
+            embeddings_litellm_api_key=getenv(ENV_EMBEDDINGS_LITELLM_API_KEY) or getenv(ENV_LITELLM_API_KEY),
+            embeddings_litellm_model=getenv(ENV_EMBEDDINGS_LITELLM_MODEL, DEFAULT_EMBEDDINGS_LITELLM_MODEL),
             embeddings_litellm_dimensions=_parse_optional_positive_int(
                 ENV_EMBEDDINGS_LITELLM_DIMENSIONS,
-                os.getenv(ENV_EMBEDDINGS_LITELLM_DIMENSIONS),
+                getenv(ENV_EMBEDDINGS_LITELLM_DIMENSIONS),
             ),
             # LiteLLM SDK embeddings (direct API access)
-            embeddings_litellm_sdk_api_key=os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_KEY),
-            embeddings_litellm_sdk_model=os.getenv(
-                ENV_EMBEDDINGS_LITELLM_SDK_MODEL, DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL
-            ),
-            embeddings_litellm_sdk_model_id=os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_MODEL_ID) or None,
-            embeddings_litellm_sdk_api_base=os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_BASE) or None,
+            embeddings_litellm_sdk_api_key=getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_KEY),
+            embeddings_litellm_sdk_model=getenv(ENV_EMBEDDINGS_LITELLM_SDK_MODEL, DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL),
+            embeddings_litellm_sdk_model_id=getenv(ENV_EMBEDDINGS_LITELLM_SDK_MODEL_ID) or None,
+            embeddings_litellm_sdk_api_base=getenv(ENV_EMBEDDINGS_LITELLM_SDK_API_BASE) or None,
             embeddings_litellm_sdk_output_dimensions=int(v)
-            if (v := os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_OUTPUT_DIMENSIONS))
+            if (v := getenv(ENV_EMBEDDINGS_LITELLM_SDK_OUTPUT_DIMENSIONS))
             else None,
-            embeddings_litellm_sdk_encoding_format=os.getenv(
+            embeddings_litellm_sdk_encoding_format=getenv(
                 ENV_EMBEDDINGS_LITELLM_SDK_ENCODING_FORMAT, DEFAULT_EMBEDDINGS_LITELLM_SDK_ENCODING_FORMAT
             ),
             # Gemini/Vertex AI embeddings (with fallback to LLM keys)
-            embeddings_gemini_api_key=os.getenv(ENV_EMBEDDINGS_GEMINI_API_KEY) or os.getenv(ENV_LLM_API_KEY),
-            embeddings_gemini_model=os.getenv(ENV_EMBEDDINGS_GEMINI_MODEL, DEFAULT_EMBEDDINGS_GEMINI_MODEL),
+            embeddings_gemini_api_key=getenv(ENV_EMBEDDINGS_GEMINI_API_KEY) or getenv(ENV_LLM_API_KEY),
+            embeddings_gemini_model=getenv(ENV_EMBEDDINGS_GEMINI_MODEL, DEFAULT_EMBEDDINGS_GEMINI_MODEL),
             embeddings_gemini_output_dimensionality=int(
-                os.getenv(
+                getenv(
                     ENV_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY,
                     str(DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY),
                 )
             ),
-            embeddings_gemini_force_ipv4=os.getenv(
+            embeddings_gemini_force_ipv4=getenv(
                 ENV_EMBEDDINGS_GEMINI_FORCE_IPV4,
                 str(DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4),
             ).lower()
             in ("true", "1"),
             embeddings_gemini_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_GEMINI_BATCH_SIZE,
-                os.getenv(ENV_EMBEDDINGS_GEMINI_BATCH_SIZE),
+                getenv(ENV_EMBEDDINGS_GEMINI_BATCH_SIZE),
                 DEFAULT_EMBEDDINGS_GEMINI_BATCH_SIZE,
             ),
-            embeddings_vertexai_project_id=os.getenv(ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID)
-            or os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID),
-            embeddings_vertexai_region=os.getenv(ENV_EMBEDDINGS_VERTEXAI_REGION) or os.getenv(ENV_LLM_VERTEXAI_REGION),
-            embeddings_vertexai_service_account_key=os.getenv(ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY)
-            or os.getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY),
+            embeddings_vertexai_project_id=getenv(ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID)
+            or getenv(ENV_LLM_VERTEXAI_PROJECT_ID),
+            embeddings_vertexai_region=getenv(ENV_EMBEDDINGS_VERTEXAI_REGION) or getenv(ENV_LLM_VERTEXAI_REGION),
+            embeddings_vertexai_service_account_key=getenv(ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY)
+            or getenv(ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY),
             # Reranker
             reranker_provider=os.getenv(ENV_RERANKER_PROVIDER, DEFAULT_RERANKER_PROVIDER),
             # Generic name, falling back to the deprecated LiteLLM-specific alias.
@@ -5247,7 +5394,7 @@ class HindsightConfig:
             # TypeSafe reranker
             reranker_typesafe_api_key=os.getenv(ENV_RERANKER_TYPESAFE_API_KEY),
             reranker_hindsight_api_key=os.getenv(ENV_RERANKER_HINDSIGHT_API_KEY) or None,
-            embeddings_hindsight_api_key=os.getenv(ENV_EMBEDDINGS_HINDSIGHT_API_KEY) or None,
+            embeddings_hindsight_api_key=getenv(ENV_EMBEDDINGS_HINDSIGHT_API_KEY) or None,
             reranker_typesafe_model=os.getenv(ENV_RERANKER_TYPESAFE_MODEL, DEFAULT_RERANKER_TYPESAFE_MODEL),
             reranker_typesafe_base_url=os.getenv(ENV_RERANKER_TYPESAFE_BASE_URL, DEFAULT_RERANKER_TYPESAFE_BASE_URL),
             reranker_typesafe_timeout=float(
@@ -5288,17 +5435,25 @@ class HindsightConfig:
                 else None
             ),
             decision_model_tokenizer=os.getenv(ENV_DECISION_MODEL_TOKENIZER) or None,
-            **{
-                f"{operation}_decision_model_{setting.lower()}": os.getenv(_decision_model_env(operation, setting))
-                or None
-                for operation in DECISION_MODEL_OPERATIONS
-                for setting in ("PROVIDER", "API_KEY", "MODEL", "BASE_URL")
-            },
+            # Typed as Any: a splat of str values is otherwise checked against every keyword
+            # parameter, including the non-str ones (query_embeddings, ...).
+            **cast(
+                "dict[str, Any]",
+                {
+                    f"{operation}_decision_model_{setting.lower()}": os.getenv(_decision_model_env(operation, setting))
+                    or None
+                    for operation in DECISION_MODEL_OPERATIONS
+                    for setting in ("PROVIDER", "API_KEY", "MODEL", "BASE_URL")
+                },
+            ),
             recall_decision_model_prune=_parse_boolean_env(
                 ENV_RECALL_DECISION_MODEL_PRUNE, DEFAULT_RECALL_DECISION_MODEL_PRUNE
             ),
             recall_decision_model_dedup=_parse_boolean_env(
                 ENV_RECALL_DECISION_MODEL_DEDUP, DEFAULT_RECALL_DECISION_MODEL_DEDUP
+            ),
+            recall_decision_model_fallback=_parse_boolean_env(
+                ENV_RECALL_DECISION_MODEL_FALLBACK, DEFAULT_RECALL_DECISION_MODEL_FALLBACK
             ),
             # Server
             host=os.getenv(ENV_HOST) or None,
@@ -5569,10 +5724,11 @@ class HindsightConfig:
                     or DEFAULT_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS
                 ),
             ),
-            knowledge_page_default_trigger=json.loads(
-                os.getenv(ENV_KNOWLEDGE_PAGE_DEFAULT_TRIGGER, "").strip() or "null"
+            page_default_trigger=json.loads(
+                (os.getenv(ENV_PAGE_DEFAULT_TRIGGER) or os.getenv(ENV_PAGE_DEFAULT_TRIGGER_DEPRECATED) or "").strip()
+                or "null"
             )
-            or DEFAULT_KNOWLEDGE_PAGE_DEFAULT_TRIGGER,
+            or DEFAULT_PAGE_DEFAULT_TRIGGER,
             consolidation_batch_size=int(
                 os.getenv(ENV_CONSOLIDATION_BATCH_SIZE, str(DEFAULT_CONSOLIDATION_BATCH_SIZE))
             ),
@@ -5674,6 +5830,9 @@ class HindsightConfig:
             ),
             worker_http_port=int(os.getenv(ENV_WORKER_HTTP_PORT, str(DEFAULT_WORKER_HTTP_PORT))),
             worker_max_slots=int(os.getenv(ENV_WORKER_MAX_SLOTS, str(DEFAULT_WORKER_MAX_SLOTS))),
+            worker_shutdown_drain_seconds=float(
+                os.getenv(ENV_WORKER_SHUTDOWN_DRAIN_SECONDS, str(DEFAULT_WORKER_SHUTDOWN_DRAIN_SECONDS))
+            ),
             worker_slot_reservations=worker_slot_reservations,
             worker_consolidation_bank_priority=_parse_bank_priority(
                 os.getenv(ENV_WORKER_CONSOLIDATION_BANK_PRIORITY, "")
@@ -5863,6 +6022,11 @@ class HindsightConfig:
                 os.getenv(ENV_OPERATION_CLEANUP_INTERVAL_SECONDS),
                 DEFAULT_OPERATION_CLEANUP_INTERVAL_SECONDS,
             ),
+            attachment_sweep_interval_seconds=_parse_non_negative_int(
+                ENV_ATTACHMENT_SWEEP_INTERVAL_SECONDS,
+                os.getenv(ENV_ATTACHMENT_SWEEP_INTERVAL_SECONDS),
+                DEFAULT_ATTACHMENT_SWEEP_INTERVAL_SECONDS,
+            ),
             maintenance_start_jitter_seconds=_parse_non_negative_int(
                 ENV_MAINTENANCE_START_JITTER_SECONDS,
                 os.getenv(ENV_MAINTENANCE_START_JITTER_SECONDS),
@@ -5887,7 +6051,6 @@ class HindsightConfig:
                 h.lower() for h in _parse_str_list(os.getenv(ENV_EXTENSION_PASSTHROUGH_HEADERS, ""))
             ],
         )
-        config.validate()
         return config
 
     def get_llm_base_url(self) -> str:
@@ -5984,11 +6147,21 @@ class HindsightConfig:
         if provider == "hindsight" and operation == "recall" and own_provider is None:
             return None
         defaults = DECISION_MODEL_PROVIDER_DEFAULTS[provider]
-        max_request_tokens = (
-            self.decision_model_max_request_tokens
-            or defaults.max_request_tokens
-            or DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS
-        )
+        inherits_global = provider == (self.decision_model_provider or "").lower()
+
+        def setting(name: str) -> str | None:
+            own = getattr(self, f"{operation}_decision_model_{name}")
+            if own is not None or not inherits_global:
+                return own
+            return getattr(self, f"decision_model_{name}")
+
+        base_url = setting("base_url") or defaults.base_url
+        if self.decision_model_max_request_tokens:
+            max_request_tokens: int | None = self.decision_model_max_request_tokens
+        elif defaults.default_url_fits_requests and (base_url or "").rstrip("/") == defaults.base_url:
+            max_request_tokens = None
+        else:
+            max_request_tokens = defaults.max_request_tokens or DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS
         # Checked here, not on the first request: a ceiling no request fits, or a cap no
         # request gets through, would otherwise surface as every decision failing.
         if self.decision_model_timeout <= 0:
@@ -5997,18 +6170,11 @@ class HindsightConfig:
             raise ValueError(
                 f"{ENV_DECISION_MODEL_MAX_CONCURRENT} must be at least 1, not {self.decision_model_max_concurrent}"
             )
-        if max_request_tokens < MIN_DECISION_MODEL_MAX_REQUEST_TOKENS:
+        if max_request_tokens is not None and max_request_tokens < MIN_DECISION_MODEL_MAX_REQUEST_TOKENS:
             raise ValueError(
                 f"{ENV_DECISION_MODEL_MAX_REQUEST_TOKENS} must be at least {MIN_DECISION_MODEL_MAX_REQUEST_TOKENS}, "
                 f"not {max_request_tokens}"
             )
-        inherits_global = provider == (self.decision_model_provider or "").lower()
-
-        def setting(name: str) -> str | None:
-            own = getattr(self, f"{operation}_decision_model_{name}")
-            if own is not None or not inherits_global:
-                return own
-            return getattr(self, f"decision_model_{name}")
 
         def required(value: str | None, env_setting: str) -> str:
             if not value:
@@ -6043,7 +6209,7 @@ class HindsightConfig:
             provider=provider,
             api_key=required(api_key, "API_KEY"),
             model=setting("model") or defaults.model,
-            base_url=required(setting("base_url") or defaults.base_url, "BASE_URL"),
+            base_url=required(base_url, "BASE_URL"),
             timeout=self.decision_model_timeout,
             max_concurrent=self.decision_model_max_concurrent,
             max_request_tokens=max_request_tokens,
@@ -6075,6 +6241,10 @@ class HindsightConfig:
             refresh_model = self.mental_model_refresh_llm_model or self.reflect_llm_model or self.llm_model
             logger.info(f"LLM (mental model refresh): provider={refresh_provider}, model={refresh_model}")
         logger.info(f"Embeddings: provider={self.embeddings_provider}")
+        if self.query_embeddings is not None:
+            logger.info(f"Embeddings (query): provider={self.query_embeddings.embeddings_provider}")
+        if self.passage_embeddings is not None:
+            logger.info(f"Embeddings (passage): provider={self.passage_embeddings.embeddings_provider}")
         if self.decision_model_config("recall") is not None:
             logger.info("Reranker: replaced by the decision model in recall")
         else:

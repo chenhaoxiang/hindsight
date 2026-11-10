@@ -8,6 +8,7 @@ are stubbed; acquisition, transactions, cascades and observation cleanup are rea
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -96,14 +97,33 @@ async def delete_race(pg0_db_url):
         await setup.close()
 
 
-async def wait_for_lock(race: DeleteRace) -> None:
-    # Observe a real wait rather than relying on a scheduler-dependent sleep.
-    async with asyncio.timeout(10):
-        while (
-            await race.setup.fetchval("SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", race.second_pid)
-            != "Lock"
-        ):
-            await asyncio.sleep(0.01)
+# How long a step may take to reach its expected wait. Generous: on a loaded CI box the
+# steps leading to a wait (pool acquire, the sweep, cold imports) have taken over 10s, and
+# a longer budget weakens nothing, because what each test proves is that the wait (or the
+# finish) is reached while the other side is still held (#6388).
+STEP_TIMEOUT = 30
+
+
+async def wait_for_lock(race: DeleteRace, query_contains: str = "") -> None:
+    # Observe a real wait rather than relying on a scheduler-dependent sleep. With
+    # query_contains, wait until that statement is the one blocked: under load an earlier
+    # statement can wait briefly on a lock first (#6355, #6388).
+    try:
+        async with asyncio.timeout(STEP_TIMEOUT):
+            while not await race.setup.fetchval(
+                "SELECT wait_event_type = 'Lock' AND position($2 in query) > 0 FROM pg_stat_activity WHERE pid=$1",
+                race.second_pid,
+                query_contains,
+            ):
+                await asyncio.sleep(0.01)
+    except TimeoutError:
+        # Name what the second connection is doing instead, and who holds it up.
+        rows = await race.setup.fetch(
+            "SELECT pid, state, wait_event_type, wait_event, query, pg_blocking_pids(pid) AS blockers "
+            "FROM pg_stat_activity WHERE pid = $1 OR pid = ANY(pg_blocking_pids($1))",
+            race.second_pid,
+        )
+        raise AssertionError(f"never blocked on {query_contains!r}: {[dict(r) for r in rows]}") from None
 
 
 @pytest.mark.parametrize("replace", [False, True])
@@ -142,22 +162,24 @@ async def test_document_mutation_and_relink_preserve_queue(
         bank,
         units["b"],
     )
-    claimed, release = asyncio.Event(), asyncio.Event()
+    relinking, release = asyncio.Event(), asyncio.Event()
     ops_type = type(worker._backend.ops)
-    original_claim = ops_type.claim_graph_maintenance_batch
+    original_finish = ops_type.finish_graph_maintenance_batch
 
-    async def pause_claim(
-        ops: DataAccessOps, conn: DatabaseConnection, table: str, bank_id: str, limit: int
-    ) -> list[str]:
-        # Bound the first pass to one real batch. Otherwise it may consume the
-        # mutation's fresh repair before we can assert that it was re-enqueued.
-        if bank_id == bank and claimed.is_set():
-            return []
-        ids = await original_claim(ops, conn, table, bank_id, limit)
-        if bank_id == bank and ids and not claimed.is_set():
-            claimed.set()
+    async def pause_finish(
+        ops: DataAccessOps,
+        conn: DatabaseConnection,
+        table: str,
+        bank_id: str,
+        unit_ids: list[str],
+        claimed_at: datetime,
+    ) -> None:
+        # Hold the worker mid-relink: its claim has committed, its relink
+        # transaction is open, and it has not deleted the claimed rows yet.
+        if bank_id == bank and not relinking.is_set():
+            relinking.set()
             await release.wait()
-        return ids
+        await original_finish(ops, conn, table, bank_id, unit_ids, claimed_at)
 
     async def mutate() -> None:
         if not replace:
@@ -177,20 +199,23 @@ async def test_document_mutation_and_relink_preserve_queue(
                     store_document_text=True,
                 )
 
-    monkeypatch.setattr(ops_type, "claim_graph_maintenance_batch", pause_claim)
+    monkeypatch.setattr(ops_type, "finish_graph_maintenance_batch", pause_finish)
     worker_task = asyncio.create_task(
         relink_pass(backend=worker._backend, fq_table=fq_store_table, bank_id=bank, config=None)
     )
     tasks = [worker_task]
     try:
-        await asyncio.wait_for(claimed.wait(), 10)
+        await asyncio.wait_for(relinking.wait(), STEP_TIMEOUT)
+        # The mutation re-queues b while the worker relinks it. It may wait for
+        # the relink to release the links it just wrote into a's units, but never
+        # on the queue: the worker holds no queue row while it relinks (#6417).
         tasks.append(asyncio.create_task(mutate()))
         await wait_for_lock(race)
-        query = await race.setup.fetchval("SELECT query FROM pg_stat_activity WHERE pid=$1", race.second_pid)
-        assert "INSERT INTO public.graph_maintenance_queue" in query
+        assert "graph_maintenance_queue" not in await race.setup.fetchval(
+            "SELECT query FROM pg_stat_activity WHERE pid=$1", race.second_pid
+        )
         if cancel_relink:
-            # Cancellation rolls back the real claim transaction before the
-            # mutation can finish. It must not consume the queued repair.
+            # Cancellation rolls back the relink. It must not consume the queued repair.
             worker_task.cancel()
         release.set()
         results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 20)
@@ -212,7 +237,7 @@ async def test_document_mutation_and_relink_preserve_queue(
             bank,
         )
         assert [row["unit_id"] for row in queued] == [units["b"]]
-        monkeypatch.setattr(ops_type, "claim_graph_maintenance_batch", original_claim)
+        monkeypatch.setattr(ops_type, "finish_graph_maintenance_batch", original_finish)
         await relink_pass(backend=worker._backend, fq_table=fq_store_table, bank_id=bank, config=None)
         assert not await race.setup.fetchval(
             "SELECT EXISTS(SELECT 1 FROM graph_maintenance_queue WHERE bank_id=$1)",
@@ -243,7 +268,7 @@ async def test_shared_observation_deletes_complete_after_commit_or_rollback(dele
     first._delete_stale_observations_for_memories = pause_after_delete
     tasks = [asyncio.create_task(first.delete_document("a", race.banks[0], request_context=request_context))]
     try:
-        await asyncio.wait_for(paused.wait(), 10)
+        await asyncio.wait_for(paused.wait(), STEP_TIMEOUT)
         tasks.append(asyncio.create_task(second.delete_document("b", race.banks[0], request_context=request_context)))
         await wait_for_lock(race)
     finally:
@@ -299,7 +324,7 @@ async def test_reingest_and_delete_of_observation_sources_both_complete(delete_r
     first._delete_stale_observations_for_memories = pause_after_cascade
     tasks = [asyncio.create_task(first.delete_document("a", race.banks[0], request_context=request_context))]
     try:
-        await asyncio.wait_for(paused.wait(), 10)
+        await asyncio.wait_for(paused.wait(), STEP_TIMEOUT)
         tasks.append(asyncio.create_task(reingest_b()))
         await wait_for_lock(race)
     finally:
@@ -331,7 +356,7 @@ async def test_reingest_and_delete_of_linked_documents_both_complete(delete_race
     async def rendezvous(conn, query: str) -> None:
         if (query.strip() in cascades or "WITH matched_links" in query) and id(conn) not in arrived:
             arrived.add(id(conn))
-            await asyncio.wait_for(barrier.wait(), 10)
+            await asyncio.wait_for(barrier.wait(), STEP_TIMEOUT)
 
     async def rendezvous_execute(conn, query, *args, **kwargs):
         await rendezvous(conn, query)
@@ -424,8 +449,10 @@ async def test_other_bank_can_delete_while_first_bank_is_paused(delete_race, req
     first._delete_stale_observations_for_memories = pause_after_delete
     task = asyncio.create_task(first.delete_document("a", race.banks[0], request_context=request_context))
     try:
-        await asyncio.wait_for(paused.wait(), 10)
-        result = await asyncio.wait_for(second.delete_document("b", race.banks[1], request_context=request_context), 10)
+        await asyncio.wait_for(paused.wait(), STEP_TIMEOUT)
+        result = await asyncio.wait_for(
+            second.delete_document("b", race.banks[1], request_context=request_context), STEP_TIMEOUT
+        )
         assert result["document_deleted"] == 1
         assert await second.get_document("a", race.banks[1], request_context=request_context) is not None
     finally:
@@ -460,7 +487,7 @@ async def test_bank_cleanup_and_document_delete_use_same_lock_order(
     cleanup = first.clear_observations if clear_observations else first.delete_bank
     tasks = [asyncio.create_task(cleanup(race.banks[0], request_context=request_context))]
     try:
-        await asyncio.wait_for(paused.wait(), 10)
+        await asyncio.wait_for(paused.wait(), STEP_TIMEOUT)
         tasks.append(asyncio.create_task(second.delete_document("b", race.banks[0], request_context=request_context)))
         await wait_for_lock(race)
     finally:
@@ -472,3 +499,24 @@ async def test_bank_cleanup_and_document_delete_use_same_lock_order(
     else:
         assert results[0]["bank_deleted"] is True
         assert results[1] == {"document_deleted": 0, "memory_units_deleted": 0}
+
+
+async def test_document_delete_redoes_its_transaction_after_losing_a_deadlock(delete_race, request_context):
+    # Oracle cannot lock a delete's shared rows in one fixed order, so it can lose an
+    # ORA-00060 to a concurrent retain (#6283); the rolled-back delete must be redone.
+    race = delete_race
+    engine = race.engines[0]
+    original = engine._delete_stale_observations_for_memories
+    calls = 0
+
+    async def deadlock_once(conn, bank_id, fact_ids):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise asyncpg.exceptions.DeadlockDetectedError("injected deadlock")
+        return await original(conn, bank_id, fact_ids)
+
+    engine._delete_stale_observations_for_memories = deadlock_once
+    result = await engine.delete_document("a", race.banks[0], request_context=request_context)
+    assert result == {"document_deleted": 1, "memory_units_deleted": 1}
+    assert await engine.get_document("a", race.banks[0], request_context=request_context) is None

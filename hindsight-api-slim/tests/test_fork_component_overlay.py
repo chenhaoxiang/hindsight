@@ -1,6 +1,7 @@
 """Keep the public fork identity compatible with Python's package metadata."""
 
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -41,5 +42,23 @@ def test_fork_distribution_satisfies_unchanged_api_wrapper(overlay: Path) -> Non
     # A Python post-release does not satisfy ==base; a local version does. Keep
     # the unchanged full API wrapper usable without publishing under its name.
     version = Version(distribution[0])
-    assert slim.specifier == SpecifierSet(f"=={version.base_version}")
-    assert version in slim.specifier
+    stable_requirement = SpecifierSet(f"=={version.base_version}")
+    assert version in stable_requirement
+    if version.base_version == project["version"]:
+        assert slim.specifier == stable_requirement
+        assert version in slim.specifier
+
+
+def test_current_overlay_reproduces_maintenance_api_source() -> None:
+    """The stable build and reviewed maintenance source must have one truth."""
+    overlay = ROOT / ".github/patches/api-1.2.1-fork.1.patch"
+    # Reverse-check every hunk against current production bytes without writing files.
+    # This also runs in a shallow source checkout with no release tags available.
+    subprocess.run(["git", "apply", "--reverse", "--check", "--unidiff-zero", str(overlay)], cwd=ROOT, check=True)
+    from hindsight_api import __version__
+
+    assert __version__ == "1.2.1-fork.1"
+    # Reuse remains opt-in across the component update.
+    from hindsight_api.config import DEFAULT_RETAIN_STABLE_CHUNKS
+
+    assert DEFAULT_RETAIN_STABLE_CHUNKS is False

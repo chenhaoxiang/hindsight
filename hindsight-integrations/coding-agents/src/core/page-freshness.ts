@@ -1,4 +1,4 @@
-import type { HindsightClient, KnowledgeNode } from "./hindsight";
+import type { HindsightClient, PageNode } from "./hindsight";
 import { currentRequestSignal } from "./request-signal";
 
 type Client = Pick<HindsightClient, "req" | "bankUrl">;
@@ -20,7 +20,7 @@ function timestamp(value: unknown): string | null {
     : null;
 }
 
-export function shapeFreshness(model?: Model, node?: KnowledgeNode): PageFreshness {
+export function shapeFreshness(model?: Model, node?: PageNode): PageFreshness {
   const stale =
     typeof model?.is_stale === "boolean"
       ? model.is_stale
@@ -90,9 +90,9 @@ export async function readPageFreshness(client: Client, pageId: string): Promise
       2_000
     );
     if (!response.ok) return shapeFreshness();
-    const tree = (await response.json()) as { roots?: KnowledgeNode[] };
+    const tree = (await response.json()) as { roots?: PageNode[] };
     const stack = Array.isArray(tree?.roots) ? [...tree.roots] : [];
-    let node: KnowledgeNode | undefined;
+    let node: PageNode | undefined;
     while (stack.length) {
       const item = stack.pop()!;
       if (item?.kind === "page" && item.id === pageId) {
