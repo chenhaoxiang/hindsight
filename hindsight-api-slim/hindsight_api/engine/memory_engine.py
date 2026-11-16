@@ -16094,6 +16094,10 @@ class MemoryEngine(MemoryEngineInterface):
                 # The floor guards the cut's coarse levels: on that count it kept five.
                 shortlist=25,
                 min_keep=15,
+                # The shared decision-model request ceiling is also the endpoint's
+                # context budget. Keep reflect/page decisions from probing the
+                # historical 26k default against a smaller self-hosted endpoint.
+                max_question_tokens=setup.max_request_tokens,
             )
             # Retried like the shared decision model (DecisionModel.ask): without it a single 429
             # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)

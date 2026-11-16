@@ -1,0 +1,2787 @@
+diff --git a/hindsight-api-slim/hindsight_api/__init__.py b/hindsight-api-slim/hindsight_api/__init__.py
+index cd9d1faaa..07a787184 100644
+--- a/hindsight-api-slim/hindsight_api/__init__.py
++++ b/hindsight-api-slim/hindsight_api/__init__.py
+@@ -40,7 +40,7 @@ from ._thread_limits import apply_default_thread_limits
+ 
+ apply_default_thread_limits()
+ 
+-__version__ = "1.2.1"
++__version__ = "1.2.1-fork.2"
+ 
+ # name -> (module, attribute). Kept as data so `__all__`, `__dir__` and the resolver cannot drift.
+ _LAZY_EXPORTS: "dict[str, tuple[str, str]]" = {
+diff --git a/hindsight-api-slim/hindsight_api/config.py b/hindsight-api-slim/hindsight_api/config.py
+index 2d345b39a..e7d1223e3 100644
+--- a/hindsight-api-slim/hindsight_api/config.py
++++ b/hindsight-api-slim/hindsight_api/config.py
+@@ -533,6 +533,7 @@ ENV_MENTAL_MODEL_REFRESH_LLM_MAX_RETRIES = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_L
+ ENV_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF"
+ ENV_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF"
+ ENV_MENTAL_MODEL_REFRESH_LLM_TIMEOUT = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_TIMEOUT"
++ENV_MENTAL_MODEL_DELTA_TIMEOUT = "HINDSIGHT_API_MENTAL_MODEL_DELTA_TIMEOUT"
+ ENV_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG"
+ ENV_MENTAL_MODEL_REFRESH_LLM_REASONING_EFFORT = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_REASONING_EFFORT"
+ ENV_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY"
+@@ -706,6 +707,9 @@ ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
+ ENV_RERANKER_TEI_HTTP_TIMEOUT = "HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT"
+ ENV_RERANKER_COHERE_TIMEOUT = "HINDSIGHT_API_RERANKER_COHERE_TIMEOUT"
+ ENV_RERANKER_COHERE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_COHERE_MAX_CONCURRENT"
++ENV_RERANKER_COHERE_TOKENIZER_URL = "HINDSIGHT_API_RERANKER_COHERE_TOKENIZER_URL"
++ENV_RERANKER_COHERE_MAX_INPUT_TOKENS = "HINDSIGHT_API_RERANKER_COHERE_MAX_INPUT_TOKENS"
++ENV_RERANKER_COHERE_TOKEN_OVERHEAD = "HINDSIGHT_API_RERANKER_COHERE_TOKEN_OVERHEAD"
+ ENV_RERANKER_OPENROUTER_TIMEOUT = "HINDSIGHT_API_RERANKER_OPENROUTER_TIMEOUT"
+ ENV_RERANKER_ZEROENTROPY_TIMEOUT = "HINDSIGHT_API_RERANKER_ZEROENTROPY_TIMEOUT"
+ ENV_RERANKER_SILICONFLOW_TIMEOUT = "HINDSIGHT_API_RERANKER_SILICONFLOW_TIMEOUT"
+@@ -911,6 +915,7 @@ ENV_LLM_DEBUG_DUMP_4XX = "HINDSIGHT_API_LLM_DEBUG_DUMP_4XX"
+ # Retain settings
+ ENV_RETAIN_MAX_COMPLETION_TOKENS = "HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS"
+ ENV_RETAIN_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_CHUNK_SIZE"
++ENV_RETAIN_STABLE_CHUNKS = "HINDSIGHT_API_RETAIN_STABLE_CHUNKS"
+ ENV_RETAIN_STRUCTURED_CHUNK_SIZE = "HINDSIGHT_API_RETAIN_STRUCTURED_CHUNK_SIZE"
+ ENV_RETAIN_EXTRACT_CAUSAL_LINKS = "HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS"
+ ENV_RETAIN_OPTIONAL_FACT_DIMENSIONS = "HINDSIGHT_API_RETAIN_OPTIONAL_FACT_DIMENSIONS"
+@@ -1443,6 +1448,7 @@ DEFAULT_RERANKER_TEI_HTTP_TIMEOUT = 30.0  # HTTP timeout for TEI reranker reques
+ # HTTP timeout (seconds) for remote rerank providers. Defaults match the previous
+ # hardcoded constructor defaults so unset envs keep current behavior.
+ DEFAULT_RERANKER_COHERE_TIMEOUT = 60.0
++DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD = 128
+ # In-flight rerank requests per process. Excess requests queue locally, so the request
+ # timeout measures server time rather than time spent behind other recalls.
+ DEFAULT_RERANKER_COHERE_MAX_CONCURRENT = 16
+@@ -1883,6 +1889,7 @@ DEFAULT_BANK_STATS_CACHE_MAX_ENTRIES = 1024  # LRU bound across (schema, bank) k
+ # Retain settings
+ DEFAULT_RETAIN_MAX_COMPLETION_TOKENS = 64000  # Max tokens for fact extraction LLM call
+ DEFAULT_RETAIN_CHUNK_SIZE = 3000  # Max chars per chunk for fact extraction
++DEFAULT_RETAIN_STABLE_CHUNKS = False  # Opt-in exact JSONL chunk reuse on supported SQL stores
+ DEFAULT_RETAIN_EXTRACT_CAUSAL_LINKS = True  # Extract causal links between facts
+ # Let a fact leave when/where/who/why empty instead of filling them with "N/A" (#4457).
+ # Off by default because it is not free: the four fields become `string | null` and the
+@@ -3031,6 +3038,9 @@ class RerankerMemberConfig:
+     cohere_base_url: str | None
+     cohere_timeout: float
+     cohere_max_concurrent: int
++    cohere_tokenizer_url: str | None
++    cohere_max_input_tokens: int | None
++    cohere_token_overhead: int
+     # openrouter
+     openrouter_api_key: str | None
+     openrouter_model: str
+@@ -3200,6 +3210,11 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
+                 cohere_model=_member_str(base, "COHERE_MODEL", DEFAULT_RERANKER_COHERE_MODEL),
+                 cohere_base_url=_member_opt_str(base, "COHERE_BASE_URL"),
+                 cohere_timeout=_member_float(base, "COHERE_TIMEOUT", DEFAULT_RERANKER_COHERE_TIMEOUT),
++                cohere_tokenizer_url=_member_opt_str(base, "COHERE_TOKENIZER_URL"),
++                cohere_max_input_tokens=_member_opt_int(base, "COHERE_MAX_INPUT_TOKENS", None),
++                cohere_token_overhead=_member_int(
++                    base, "COHERE_TOKEN_OVERHEAD", DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD
++                ),
+                 cohere_max_concurrent=_member_int(
+                     base, "COHERE_MAX_CONCURRENT", DEFAULT_RERANKER_COHERE_MAX_CONCURRENT
+                 ),
+@@ -3608,6 +3623,8 @@ class HindsightConfig:
+     mental_model_refresh_llm_initial_backoff: float | None
+     mental_model_refresh_llm_max_backoff: float | None
+     mental_model_refresh_llm_timeout: float | None
++    # Optional wall budget for the whole edit/retraction phase, not full synthesis.
++    mental_model_delta_timeout: float | None
+     mental_model_refresh_llm_litellmrouter_config: dict | None
+     mental_model_refresh_llm_reasoning_effort: str | None
+     mental_model_refresh_llm_extra_body: dict | None
+@@ -3707,6 +3724,9 @@ class HindsightConfig:
+     reranker_cohere_base_url: str | None
+     reranker_cohere_timeout: float
+     reranker_cohere_max_concurrent: int
++    reranker_cohere_tokenizer_url: str | None
++    reranker_cohere_max_input_tokens: int | None
++    reranker_cohere_token_overhead: int
+     reranker_openrouter_api_key: str | None
+     reranker_openrouter_model: str
+     reranker_openrouter_base_url: str
+@@ -3818,6 +3838,7 @@ class HindsightConfig:
+     # Retain settings
+     retain_max_completion_tokens: int
+     retain_chunk_size: int
++    retain_stable_chunks: bool
+     retain_structured_chunk_size: int | None
+     retain_extract_causal_links: bool
+     retain_optional_fact_dimensions: bool
+@@ -4286,6 +4307,7 @@ class HindsightConfig:
+         "default_timezone",
+         # Retention settings (behavioral)
+         "retain_chunk_size",
++        "retain_stable_chunks",
+         "retain_structured_chunk_size",
+         "retain_extraction_mode",
+         "retain_mission",
+@@ -4402,6 +4424,9 @@ class HindsightConfig:
+             cohere_base_url=self.reranker_cohere_base_url,
+             cohere_timeout=self.reranker_cohere_timeout,
+             cohere_max_concurrent=self.reranker_cohere_max_concurrent,
++            cohere_tokenizer_url=self.reranker_cohere_tokenizer_url,
++            cohere_max_input_tokens=self.reranker_cohere_max_input_tokens,
++            cohere_token_overhead=self.reranker_cohere_token_overhead,
+             openrouter_api_key=self.reranker_openrouter_api_key,
+             openrouter_model=self.reranker_openrouter_model,
+             openrouter_base_url=self.reranker_openrouter_base_url,
+@@ -4516,6 +4541,8 @@ class HindsightConfig:
+         """Validate configuration values and raise errors for invalid combinations."""
+         for operation in DECISION_MODEL_OPERATIONS:
+             self.decision_model_config(operation)  # raises on an unknown provider or a missing key
++        if self.mental_model_delta_timeout is not None and not (0 < self.mental_model_delta_timeout < float("inf")):
++            raise ValueError(f"{ENV_MENTAL_MODEL_DELTA_TIMEOUT} must be a finite positive number")
+         # Validate vector_extension
+         validate_extension(self.vector_extension)
+ 
+@@ -4954,6 +4981,7 @@ class HindsightConfig:
+             mental_model_refresh_llm_initial_backoff=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF),
+             mental_model_refresh_llm_max_backoff=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF),
+             mental_model_refresh_llm_timeout=_env_float(ENV_MENTAL_MODEL_REFRESH_LLM_TIMEOUT),
++            mental_model_delta_timeout=_env_float(ENV_MENTAL_MODEL_DELTA_TIMEOUT),
+             mental_model_refresh_llm_litellmrouter_config=_parse_llm_router_config(
+                 ENV_MENTAL_MODEL_REFRESH_LLM_LITELLMROUTER_CONFIG
+             ),
+@@ -5297,6 +5325,11 @@ class HindsightConfig:
+             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
+             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
+             reranker_cohere_base_url=os.getenv(ENV_RERANKER_COHERE_BASE_URL) or None,
++            reranker_cohere_tokenizer_url=os.getenv(ENV_RERANKER_COHERE_TOKENIZER_URL) or None,
++            reranker_cohere_max_input_tokens=_env_int(ENV_RERANKER_COHERE_MAX_INPUT_TOKENS),
++            reranker_cohere_token_overhead=int(
++                os.getenv(ENV_RERANKER_COHERE_TOKEN_OVERHEAD, str(DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD))
++            ),
+             reranker_cohere_timeout=float(os.getenv(ENV_RERANKER_COHERE_TIMEOUT, str(DEFAULT_RERANKER_COHERE_TIMEOUT))),
+             reranker_cohere_max_concurrent=int(
+                 os.getenv(ENV_RERANKER_COHERE_MAX_CONCURRENT, str(DEFAULT_RERANKER_COHERE_MAX_CONCURRENT))
+@@ -5549,6 +5582,7 @@ class HindsightConfig:
+                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))
+             ),
+             retain_chunk_size=int(os.getenv(ENV_RETAIN_CHUNK_SIZE, str(DEFAULT_RETAIN_CHUNK_SIZE))),
++            retain_stable_chunks=_parse_boolean_env(ENV_RETAIN_STABLE_CHUNKS, DEFAULT_RETAIN_STABLE_CHUNKS),
+             retain_structured_chunk_size=_parse_optional_positive_int(
+                 ENV_RETAIN_STRUCTURED_CHUNK_SIZE,
+                 os.getenv(ENV_RETAIN_STRUCTURED_CHUNK_SIZE),
+diff --git a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+index 983ae157a..3d2169893 100644
+--- a/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
++++ b/hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py
+@@ -65,6 +65,7 @@ from ..llm_trace import (
+ )
+ from ..llm_wrapper import reask_messages, sanitize_llm_output
+ from ..memories import StoredMemory, get_memories
++from ..remote_retry import is_invalid_remote_request
+ from ..response_models import Budget
+ from ..retain import embedding_utils
+ from ..schema import fq_table
+@@ -1662,23 +1663,26 @@ _FAIR_FETCH_OVERFETCH = 5
+ 
+ 
+ def _fair_group_slice(memories: list[StoredMemory], limit: int, quota: int) -> list[StoredMemory]:
+-    """Oldest-first, but at most ``quota`` facts per consolidation group.
++    """Give each group its fair quota first, then fill spare capacity oldest-first.
+ 
+-    ``memories`` must already be sorted oldest-first: groups are then visited in the order
+-    of their oldest fact, and the round fills from the front. Keying is
+-    ``_consolidation_batch_key``, the same key the dispatcher groups by, so a round that
+-    holds N keys gives the dispatcher N groups to run in parallel.
++    A quota is a fairness reservation, not a hard ceiling: a bank whose facts all
++    target ``shared`` has only one group. Previously that bank read a fraction of
++    the requested batch, repeatedly paying for small tail calls. Filling unused
++    capacity does not introduce parallel writes or change scope isolation.
+     """
+     taken: list[StoredMemory] = []
++    skipped: list[StoredMemory] = []
+     seen: defaultdict[tuple[str, ...], int] = defaultdict(int)
+     for m in memories:
+         key = _consolidation_batch_key({"tags": list(m.tags or []), "observation_scopes": m.observation_scopes})
+         if seen[key] >= quota:
++            skipped.append(m)
+             continue
+         seen[key] += 1
+         taken.append(m)
+         if len(taken) >= limit:
+-            break
++            return taken
++    taken.extend(skipped[: max(0, limit - len(taken))])
+     return taken
+ 
+ 
+@@ -1703,10 +1707,10 @@ async def _fetch_unconsolidated_rows(
+     owns the oldest facts, and the dispatcher parallelises across groups — one group in the
+     round means one LLM call at a time, whatever the parallelism, and a big group's backlog
+     starves every other group until it drains (#4823). So read a window of
+-    ``_FAIR_FETCH_OVERFETCH`` rounds and take at most ``ceil(limit / llm_parallelism)`` facts
+-    per group, leaving enough distinct groups in the round to fill the parallel slots. Facts
+-    are still consumed oldest-first *within* a group, which is the ordering consolidation
+-    actually depends on.
++    ``_FAIR_FETCH_OVERFETCH`` rounds and first reserve ``ceil(limit / llm_parallelism)`` facts
++    per group, leaving enough distinct groups to fill the parallel slots. Unused reservations
++    are then filled oldest-first, so a bank with fewer groups still gets a full batch. Facts
++    remain oldest-first *within* each group, which is the ordering consolidation depends on.
+     """
+     store = get_memories()
+     scopes: list[list[str] | None] = list(observation_scopes) if observation_scopes else [None]
+@@ -2142,6 +2146,11 @@ async def _run_consolidation_job(
+                             mark_consolidated_ids=sub_ids if is_final_pass else None,
+                         )
+                         sub_deleted += pass_deleted
++                        if pass_results and all(r.get("reason") == "source_changed_since_read" for r in pass_results):
++                            # The next fetch must re-read the new scope/version. A
++                            # later pass over this same stale snapshot cannot fix it.
++                            sub_results = pass_results
++                            break
+                         if pass_failed:
+                             # Stop the remaining scopes: the sub-batch is going to be bisected
+                             # and re-run in full, and every write this pass made is already
+@@ -2219,7 +2228,7 @@ async def _run_consolidation_job(
+                     )
+                     ignored_ids = {str(m["id"]) for m in ignored}
+                     for m, r in zip(sub_batch, sub_results):
+-                        if str(m["id"]) not in ignored_ids:
++                        if str(m["id"]) not in ignored_ids and r.get("reason") != "source_changed_since_read":
+                             succeeded_ids.append(m["id"])
+                             all_results.append(r)
+                     if ignored:
+@@ -3110,6 +3119,7 @@ async def _process_memory_batch(
+     # bisects and retries them, and a stamp would exclude them from pending consolidation
+     # for good. With neither writes nor stamps there is nothing to open a transaction for.
+     stamp_ids = list(mark_consolidated_ids or []) if not llm_result.failed else []
++    sources_changed = False
+     if prepared_deletes or prepared_updates or prepared_creates or stamp_ids:
+         # One store batch for everything this response decided. The SQL transaction already makes
+         # these writes all-or-nothing for a store that keeps its rows in SQL; a store whose every
+@@ -3141,6 +3151,7 @@ async def _process_memory_batch(
+                     await assert_job_bank_alive(conn, bank_id)
+                     changed_ids = await _sources_changed_since_read(conn, bank_id, memories)
+                     if changed_ids:
++                        sources_changed = True
+                         # Drop the whole response, stamps included: the facts stay pending and the
+                         # job's next fetch re-reads them as they are now (#4831).
+                         logger.info(
+@@ -3259,6 +3270,11 @@ async def _process_memory_batch(
+     # Build per-memory result dicts for the stats tracker in the outer loop
+     results: list[dict[str, Any]] = []
+     for m in memories:
++        if sources_changed:
++            # This is not an LLM omission. Re-asking the unchanged in-memory copy
++            # would repeat a response that the version check must reject again.
++            results.append({"action": "deferred", "reason": "source_changed_since_read"})
++            continue
+         mid = str(m["id"])
+         created = mid in per_memory_created
+         updated = mid in per_memory_updated
+@@ -3909,6 +3925,10 @@ def _classify_batch_failure(exc: Exception) -> _BatchFailureClass:
+     # front (openai, anthropic) exposes the HTTP status this way.
+     if getattr(exc, "status_code", None) in (401, 403):
+         return _BatchFailureClass.PROPAGATE
++    if is_invalid_remote_request(exc, include_generic_type=False):
++        # A provider parameter does not become valid when the fact list is
++        # bisected. Propagate instead of exhausting every fact's retry budget.
++        return _BatchFailureClass.PROPAGATE
+     if isinstance(exc, json.JSONDecodeError | ValidationError | OutputTooLongError):
+         return _BatchFailureClass.FAIL_FAST
+     # Providers that surface an empty/unusable body flag their own retryability.
+@@ -4109,8 +4129,10 @@ async def _consolidate_batch_with_llm(
+                 },
+                 lambda fid, oid: bool((ft := fact_time.get(fid)) and (ot := obs_time.get(oid)) and ot > ft),
+                 # What the prompt marked: a fact's closest observations, and those newer than every fact.
+-                lambda fid, oid: oid in (closest or {}).get(fid, ())
+-                or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact),
++                lambda fid, oid: (
++                    oid in (closest or {}).get(fid, ())
++                    or bool(newest_fact and (ot := obs_time.get(oid)) and ot > newest_fact)
++                ),
+             )
+             creates = response.creates
+             # The answer's schema carries no cap on new observations: enforce the scope's here.
+diff --git a/hindsight-api-slim/hindsight_api/engine/cross_encoder.py b/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
+index 4039e9307..32a12584f 100644
+--- a/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
++++ b/hindsight-api-slim/hindsight_api/engine/cross_encoder.py
+@@ -29,6 +29,7 @@ from ..config import (
+     DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
+     DEFAULT_RERANKER_COHERE_MODEL,
+     DEFAULT_RERANKER_COHERE_TIMEOUT,
++    DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
+     DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE,
+     DEFAULT_RERANKER_FLASHRANK_CACHE_DIR,
+     DEFAULT_RERANKER_FLASHRANK_MODEL,
+@@ -77,6 +78,7 @@ from .local_device import (
+     select_local_device,
+ )
+ from .remote_retry import RetryPolicy, acall_with_retry
++from .rerank_input_budget import RerankInputBudgetError, ServerTokenizerBudget
+ from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
+ from .token_encoding import count_tokens, truncate_to_tokens
+ 
+@@ -222,6 +224,9 @@ class CrossEncoderModel(ABC):
+         if self.max_tokens_per_candidate is not None and pairs:
+             docs = _truncate_docs_to_tokens([doc for _, doc in pairs], self.max_tokens_per_candidate)
+             pairs = [(query, doc) for (query, _), doc in zip(pairs, docs)]
++        # Provider-specific fitting runs once, before tracing or retrying the model
++        # request. The trace then describes the copies actually sent, not full sources.
++        pairs = await self._prepare_pairs(pairs)
+         if not self.traces_calls:
+             return await self._predict_with_retry(pairs)
+         return await trace_model_call(
+@@ -233,6 +238,10 @@ class CrossEncoderModel(ABC):
+             output_of=lambda scores: {"scores": [float(score) for score in scores]},
+         )
+ 
++    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
++        """Fit provider-specific inputs, leaving all other backends unchanged."""
++        return pairs
++
+     async def _predict_with_retry(self, pairs: list[tuple[str, str]]) -> list[float]:
+         if self.retry_policy is None:
+             return await self._predict(pairs)
+@@ -860,6 +869,9 @@ class CohereCrossEncoder(CrossEncoderModel):
+         base_url: str | None = None,
+         timeout: float = 60.0,
+         max_concurrent: int = DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
++        tokenizer_url: str | None = None,
++        max_input_tokens: int | None = None,
++        token_overhead: int = DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
+     ):
+         """
+         Initialize Cohere cross-encoder client.
+@@ -877,8 +889,22 @@ class CohereCrossEncoder(CrossEncoderModel):
+         self.base_url = base_url
+         self.timeout = timeout
+         self.max_concurrent = max_concurrent
+-        # Held around the request only, so the timeout covers server time, not the wait
+-        # behind other recalls: without it a burst queues at the server, waits there past
++        if (tokenizer_url is None) != (max_input_tokens is None):
++            raise RerankInputBudgetError("Cohere tokenizer URL and maximum input tokens must be configured together")
++        self._input_budget = (
++            ServerTokenizerBudget(
++                rerank_url=base_url,
++                tokenizer_url=tokenizer_url,
++                api_key=api_key,
++                max_input_tokens=max_input_tokens,
++                token_overhead=token_overhead,
++                timeout=timeout,
++            )
++            if tokenizer_url is not None and max_input_tokens is not None
++            else None
++        )
++        # Held around each tokenizer group or model request, so timeouts cover server
++        # time, not the wait behind other recalls: otherwise a burst queues there past
+         # the timeout and retries, adding load exactly when it is saturated.
+         # CrossLoopSemaphore for the same reason as TypeSafeCrossEncoder's cap.
+         self._semaphore = CrossLoopSemaphore(max_concurrent or DEFAULT_RERANKER_COHERE_MAX_CONCURRENT)
+@@ -960,6 +986,22 @@ class CohereCrossEncoder(CrossEncoderModel):
+                 all_scores[idx] = score
+         return all_scores
+ 
++    async def _prepare_pairs(self, pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
++        if self._input_budget is None or not pairs:
++            return pairs
++        if self._http_client is None or not self._http_client.initialized:
++            raise RuntimeError("Reranker not initialized. Call initialize() first.")
++        groups: dict[str, list[int]] = {}
++        for index, (query, _) in enumerate(pairs):
++            groups.setdefault(query, []).append(index)
++        fitted_pairs = list(pairs)
++        for query, indices in groups.items():
++            async with self._semaphore:
++                documents = await self._input_budget.fit(query, [pairs[index][1] for index in indices])
++            for index, document in zip(indices, documents):
++                fitted_pairs[index] = (query, document)
++        return fitted_pairs
++
+     async def _rerank_group(self, query: str, texts: list[str]) -> list[float]:
+         """Score ``texts`` against one query in a single request, within the concurrency cap."""
+         async with self._semaphore:
+@@ -1309,11 +1351,19 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
+         prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
+         shortlist: int | None = None,
+         min_keep: int | None = None,
++        max_question_tokens: int | None = None,
+     ):
+         if shortlist is not None:
+             self.SHORTLIST = shortlist
+         if min_keep is not None:
+             self.MIN_KEEP = min_keep
++        if max_question_tokens is not None:
++            if max_question_tokens < self.MIN_QUESTION_TOKENS:
++                raise ValueError(
++                    f"max_question_tokens must be at least {self.MIN_QUESTION_TOKENS}, "
++                    f"not {max_question_tokens}"
++                )
++            self.MAX_QUESTION_TOKENS = max_question_tokens
+         # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
+         # built with every field zeroed) by falling back to the default.
+         self.model = model or DEFAULT_RERANKER_TYPESAFE_MODEL
+@@ -2891,6 +2941,9 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
+             base_url=member.cohere_base_url,
+             timeout=member.cohere_timeout,
+             max_concurrent=member.cohere_max_concurrent,
++            tokenizer_url=member.cohere_tokenizer_url,
++            max_input_tokens=member.cohere_max_input_tokens,
++            token_overhead=member.cohere_token_overhead,
+         )
+     elif provider == "openrouter":
+         api_key = member.openrouter_api_key
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_attempts.py b/hindsight-api-slim/hindsight_api/engine/llm_attempts.py
+new file mode 100644
+index 000000000..0f4462c73
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/llm_attempts.py
+@@ -0,0 +1,69 @@
++"""Bounded, payload-free provider attempts attached to one logical LLM trace.
++
++The wrapper owns a fresh sink per call. Providers opt in without adding trace
++rows, changing token accounting, or sharing mutable state between concurrent
++calls. Unknown upstream work/usage is not inferred from a successful retry.
++"""
++
++from contextvars import ContextVar, Token
++from dataclasses import dataclass, field, replace
++from typing import Literal
++
++
++@dataclass
++class ProviderAttempt:
++    attempt: int
++    outcome: Literal["queued", "response", "http_error", "transport_error", "parse_error", "error", "cancelled"] = (
++        "queued"
++    )
++    queue_wait_ms: int = 0
++    request_ms: int | None = None
++    elapsed_ms: int = 0
++    backoff_ms: int = 0
++    planned_backoff_ms: int = 0
++    http_status: int | None = None
++    error_type: str | None = None
++    request_id: str | None = None
++
++
++@dataclass(frozen=True)
++class ProviderAttemptSummary:
++    total: int
++    omitted: int
++    records: list[ProviderAttempt]
++
++
++@dataclass
++class ProviderAttemptLog:
++    records: list[ProviderAttempt] = field(default_factory=list)
++    total: int = 0
++
++    def start(self, attempt: int) -> ProviderAttempt:
++        self.total += 1
++        record = ProviderAttempt(attempt=attempt)
++        # Even a caller-configured huge retry count must not make tracing unbounded.
++        if len(self.records) < 32:
++            self.records.append(record)
++        return record
++
++    def summary(self) -> ProviderAttemptSummary:
++        return ProviderAttemptSummary(
++            total=self.total,
++            omitted=self.total - len(self.records),
++            records=[replace(record) for record in self.records],
++        )
++
++
++_attempt_log: ContextVar[ProviderAttemptLog | None] = ContextVar("hindsight_provider_attempts", default=None)
++
++
++def bind_provider_attempts() -> Token:
++    return _attempt_log.set(ProviderAttemptLog())
++
++
++def reset_provider_attempts(token: Token) -> None:
++    _attempt_log.reset(token)
++
++
++def current_provider_attempts() -> ProviderAttemptLog | None:
++    return _attempt_log.get()
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_trace.py b/hindsight-api-slim/hindsight_api/engine/llm_trace.py
+index a3c2b738d..2202882a2 100644
+--- a/hindsight-api-slim/hindsight_api/engine/llm_trace.py
++++ b/hindsight-api-slim/hindsight_api/engine/llm_trace.py
+@@ -38,7 +38,7 @@ from collections import OrderedDict
+ from collections.abc import Awaitable, Callable, Iterable, Iterator
+ from contextlib import contextmanager
+ from contextvars import ContextVar, Token
+-from dataclasses import dataclass, field
++from dataclasses import asdict, dataclass, field
+ from datetime import datetime, timedelta, timezone
+ from typing import Any, Literal, TypeVar
+ 
+@@ -815,6 +815,12 @@ class LLMTraceRecorder:
+             llm_info["tool_calls"] = [tc.get("name", "") for tc in tool_calls]
+         if input_count is not None:
+             llm_info["input_count"] = input_count
++        from .llm_attempts import current_provider_attempts
++
++        attempts = current_provider_attempts()
++        if attempts is not None and attempts.total:
++            # Snapshot now: retries and concurrent calls must not mutate a buffered row.
++            llm_info["provider_attempts"] = asdict(attempts.summary())
+ 
+         record = LLMRequestRecord(
+             provider=provider,
+diff --git a/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py b/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
+index f4ef99f19..4c808ba93 100644
+--- a/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
++++ b/hindsight-api-slim/hindsight_api/engine/llm_wrapper.py
+@@ -2,6 +2,7 @@
+ LLM wrapper for unified configuration across providers.
+ """
+ 
++import asyncio
+ import importlib.util
+ import json
+ import logging
+@@ -1486,6 +1487,9 @@ class LLMProvider:
+         # Cleared per call; the provider stashes real usage once a response is in
+         # hand so the error path below can attach it if parsing/validation fails.
+         usage_token = set_response_usage(None)
++        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
++
++        attempt_token = bind_provider_attempts()
+         try:
+             cached_prefix = await self._cached_prefix_for(prompt_cache) if prompt_cache is not None else None
+             # Providers that own retry loops acquire the shared permits for each
+@@ -1522,7 +1526,7 @@ class LLMProvider:
+                         **cache_kwarg,
+                         **attempt_kwarg,
+                     )
+-                except Exception as e:
++                except (Exception, asyncio.CancelledError) as e:
+                     # The provider call may have succeeded (and incurred token
+                     # cost) before local parsing/validation raised; attach the
+                     # provider-reported usage to the error trace when available.
+@@ -1553,6 +1557,7 @@ class LLMProvider:
+         finally:
+             reset_request_context(request_token)
+             reset_response_usage(usage_token)
++            reset_provider_attempts(attempt_token)
+ 
+         # Single scrub point for every structured/text LLM response in the engine:
+         # a model can emit a lone `\udXXX` escape that JSON decoding turns into an
+@@ -1755,6 +1760,9 @@ class LLMProvider:
+         # Cleared per call; the provider stashes real usage once a response is in
+         # hand so the error path below can attach it if parsing/validation fails.
+         usage_token = set_response_usage(None)
++        from .llm_attempts import bind_provider_attempts, reset_provider_attempts
++
++        attempt_token = bind_provider_attempts()
+         try:
+             attempt_gated = self._provider_impl.supports_attempt_scoped_concurrency()
+             async with AsyncExitStack() as stack:
+@@ -1780,7 +1788,7 @@ class LLMProvider:
+                         tool_choice=tool_choice,
+                         **attempt_kwarg,
+                     )
+-                except Exception as e:
++                except (Exception, asyncio.CancelledError) as e:
+                     # The provider call may have succeeded (and incurred token
+                     # cost) before local parsing/validation raised; attach the
+                     # provider-reported usage to the error trace when available.
+@@ -1811,6 +1819,7 @@ class LLMProvider:
+         finally:
+             reset_request_context(request_token)
+             reset_response_usage(usage_token)
++            reset_provider_attempts(attempt_token)
+ 
+         # Same scrub for the tool-calling path: the agent's text content and every
+         # tool-call argument are model-authored and flow on to storage and reranking.
+diff --git a/hindsight-api-slim/hindsight_api/engine/memories/base.py b/hindsight-api-slim/hindsight_api/engine/memories/base.py
+index d38b2ec96..7730b57e1 100644
+--- a/hindsight-api-slim/hindsight_api/engine/memories/base.py
++++ b/hindsight-api-slim/hindsight_api/engine/memories/base.py
+@@ -57,6 +57,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
+     from ..consolidation.consolidator import _TemporalBounds
+     from ..embeddings import Embeddings
+     from ..response_models import MemoryFact
++    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
+     from ..retain.types import CausalRelation, EmbeddingLike, EntityResolutionResult, ProcessedFact
+     from ..search.retrieval import GraphRetriever
+     from ..transfer.export import _LoadedExport, _UnitLocation
+@@ -3697,6 +3698,51 @@ class MemoriesExtension(Extension, ABC):
+         record = await self.get_document_record(bank_id=bank_id, document_id=document_id, include_text=include_text)
+         return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=include_text)
+ 
++    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
++        """Whether this store can atomically relocate chunk FKs without replacing facts.
++
++        Opt-in capability: external stores and Oracle keep their established retain
++        path until they implement equivalent reference/transaction guarantees.
++        """
++        return False
++
++    async def load_stable_chunks(
++        self,
++        *,
++        backend: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        source_context: str | None = None,
++        source_strategy: str | None = None,
++    ) -> list["ChunkSnapshot"]:
++        return []
++
++    async def compatible_recovery_chunks(
++        self,
++        *,
++        conn: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        content_hash: str,
++        expected_hashes: dict[int, str],
++        source_context: str | None,
++        source_strategy: str | None,
++    ) -> dict[int, str] | None:
++        """Position-bound recovery for stores supporting stable layouts; None declines."""
++        return None
++
++    async def stage_stable_chunk_reuse(
++        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
++    ) -> "StagedChunkReuse | None":
++        return None
++
++    async def finish_stable_chunk_reuse(
++        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
++    ) -> int:
++        raise NotImplementedError("Store does not support atomic stable chunk reuse")
++
+     async def load_existing_chunks(
+         self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+     ) -> list[ExistingChunk]:
+diff --git a/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
+new file mode 100644
+index 000000000..524afa1f4
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/memories/pg/stable_chunks.py
+@@ -0,0 +1,307 @@
++"""Postgres-only transactional relocation of unchanged chunk references.
++
++No schema change: facts keep their UUIDs while temporary chunk rows carry their
++FKs across an index permutation. Callers hold the document lock and run staging,
++normal obsolete-chunk invalidation, and finalization in ONE transaction.
++"""
++
++import uuid
++from collections.abc import Callable
++from typing import Any
++
++from ...chunk_ids import build_chunk_id
++from ...retain.stable_chunks import (
++    MAX_STABLE_CHUNKS,
++    ChunkSnapshot,
++    StableChunkPlan,
++    StagedChunkMove,
++    StagedChunkReuse,
++)
++
++
++async def compatible_recovery_chunks(
++    *,
++    conn: Any,
++    fq_table: Callable[[str], str],
++    bank_id: str,
++    document_id: str,
++    content_hash: str,
++    expected_hashes: dict[int, str],
++    source_context: str | None,
++    source_strategy: str | None,
++) -> dict[int, str] | None:
++    """Only resume committed positions under the same source/extraction contract.
++
++    A body hash does not identify a chunk layout. In particular, a stable layout
++    must never be overwritten by greedy recovery while keeping its old facts.
++    Call again under the document lock before writing a recovered/later batch.
++    """
++    matches = await conn.fetchval(
++        f"SELECT 1 FROM {fq_table('documents')} WHERE bank_id = $1 AND id = $2 AND content_hash = $3 "
++        "AND NULLIF(retain_params->>'context', '') IS NOT DISTINCT FROM NULLIF($4::text, '') "
++        "AND NULLIF(retain_params->>'strategy', '') IS NOT DISTINCT FROM NULLIF($5::text, '')",
++        bank_id,
++        document_id,
++        content_hash,
++        source_context,
++        source_strategy,
++    )
++    if not matches:
++        return None
++    rows = await conn.fetch(
++        f"SELECT chunk_index, content_hash FROM {fq_table('chunks')} "
++        "WHERE bank_id = $1 AND document_id = $2 ORDER BY chunk_index LIMIT $3",
++        bank_id,
++        document_id,
++        len(expected_hashes) + 1,
++    )
++    if any(
++        row["chunk_index"] not in expected_hashes or expected_hashes[row["chunk_index"]] != row["content_hash"]
++        for row in rows
++    ):
++        return None
++    return {row["chunk_index"]: row["content_hash"] for row in rows}
++
++
++async def load_chunks(
++    *,
++    conn: Any,
++    fq_table: Callable[[str], str],
++    bank_id: str,
++    document_id: str,
++    source_context: str | None = None,
++    source_strategy: str | None = None,
++) -> list[ChunkSnapshot]:
++    rows = await conn.fetch(
++        f"SELECT c.chunk_id, c.chunk_index, c.content_hash, c.chunk_text, c.created_at FROM {fq_table('chunks')} c "
++        f"JOIN {fq_table('documents')} d ON d.bank_id = c.bank_id AND d.id = c.document_id "
++        "WHERE c.bank_id = $1 AND c.document_id = $2 "
++        "AND NULLIF(d.retain_params->>'context', '') IS NOT DISTINCT FROM NULLIF($4::text, '') "
++        "AND NULLIF(d.retain_params->>'strategy', '') IS NOT DISTINCT FROM NULLIF($5::text, '') "
++        "ORDER BY c.chunk_index LIMIT $3",
++        bank_id,
++        document_id,
++        MAX_STABLE_CHUNKS + 1,
++        source_context,
++        source_strategy,
++    )
++    return [
++        ChunkSnapshot(
++            chunk_id=row["chunk_id"],
++            chunk_index=row["chunk_index"],
++            content_hash=row["content_hash"],
++            chunk_text=row["chunk_text"],
++            created_at=row["created_at"],
++        )
++        for row in rows
++    ]
++
++
++async def _lock_reuse_write_set(
++    *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: StableChunkPlan
++) -> bool:
++    """Lock the UNION, not two individually sorted writer sets.
++
++    Include all document facts because metadata/tag synchronization can write
++    stationary anchors too. Only obsolete sources select observations to retire;
++    moving sources are lock-only and must not invalidate their valid evidence.
++    """
++    facts = await conn.fetch(
++        f"SELECT id, chunk_id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2",
++        bank_id,
++        document_id,
++    )
++    retired = set(plan.obsolete_ids)
++    outgoing = [uuid.UUID(str(row["id"])) for row in facts if row["chunk_id"] in retired]
++
++    async def sweep_write_ids() -> set[uuid.UUID]:
++        if not outgoing:
++            return set()
++        rows = await conn.fetch(
++            f"SELECT id, source_memory_ids FROM {fq_table('memory_units')} "
++            "WHERE bank_id = $1 AND fact_type = 'observation' AND source_memory_ids && $2::uuid[]",
++            bank_id,
++            outgoing,
++        )
++        identities = {uuid.UUID(str(row["id"])) for row in rows}
++        for row in rows:
++            identities.update(uuid.UUID(str(value)) for value in (row["source_memory_ids"] or []))
++        return identities
++
++    write_ids = {uuid.UUID(str(row["id"])) for row in facts} | await sweep_write_ids()
++    if write_ids:
++        await conn.fetch(
++            f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) "
++            "ORDER BY id FOR NO KEY UPDATE",
++            bank_id,
++            sorted(write_ids),
++        )
++    # Observation creation takes SHARE on its sources. A publication that won
++    # while we waited may expand the set: retry without writes, never acquire an
++    # extra lower UUID after holding the original set.
++    return await sweep_write_ids() <= write_ids
++
++
++async def stage_reuse(
++    *,
++    conn: Any,
++    fq_table: Callable[[str], str],
++    bank_id: str,
++    document_id: str,
++    plan: StableChunkPlan,
++) -> StagedChunkReuse | None:
++    """Validate the whole read snapshot before making any write; None means stale.
++
++    A sliced recovery can change chunks while keeping the document body's hash,
++    so the ordinary document CAS alone is not enough for a relocation plan.
++    """
++    contract = await conn.fetchrow(
++        f"SELECT retain_params->>'context' AS context, retain_params->>'strategy' AS strategy "
++        f"FROM {fq_table('documents')} WHERE bank_id = $1 AND id = $2",
++        bank_id,
++        document_id,
++    )
++    if (
++        contract is None
++        or (contract["context"] or None) != (plan.source_context or None)
++        or (contract["strategy"] or None) != (plan.source_strategy or None)
++    ):
++        return None
++    rows = await conn.fetch(
++        f"SELECT chunk_id, chunk_index, content_hash, chunk_text FROM {fq_table('chunks')} "
++        "WHERE bank_id = $1 AND document_id = $2 ORDER BY chunk_id FOR UPDATE",
++        bank_id,
++        document_id,
++    )
++    current = {row["chunk_id"]: row for row in rows}
++    if len(current) != len(plan.old_chunks) or any(
++        old.chunk_id not in current
++        or current[old.chunk_id]["chunk_index"] != old.chunk_index
++        or current[old.chunk_id]["content_hash"] != old.content_hash
++        or current[old.chunk_id]["chunk_text"] != old.chunk_text
++        for old in plan.old_chunks
++    ):
++        return None
++    old_by_id = {old.chunk_id: old for old in plan.old_chunks}
++    moving = [
++        chunk
++        for chunk in plan.chunks
++        if chunk.reuse_from is not None and old_by_id[chunk.reuse_from].chunk_index != chunk.chunk_index
++    ]
++    temporary_base = max(len(plan.old_chunks), len(plan.chunks))
++    moves = [
++        StagedChunkMove(
++            original=old_by_id[chunk.reuse_from],
++            temporary_id=build_chunk_id(bank_id, document_id, temporary_base + offset),
++            temporary_index=temporary_base + offset,
++            target_id=build_chunk_id(bank_id, document_id, chunk.chunk_index),
++            target_index=chunk.chunk_index,
++        )
++        for offset, chunk in enumerate(moving)
++        if chunk.reuse_from is not None
++    ]
++    if not await _lock_reuse_write_set(
++        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, plan=plan
++    ):
++        return None
++    # No source writes yet. The complete fact/sweep write union is now held in
++    # UUID order; the normal sweep and relocation can reuse those locks safely.
++    return StagedChunkReuse(moves=moves)
++
++
++async def _move_to_temporary(
++    *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, moves: list[StagedChunkMove]
++) -> int:
++    old_ids = [move.original.chunk_id for move in moves]
++    temp_ids = [move.temporary_id for move in moves]
++    # Staging acquired the entire document/sweep write union in one UUID order.
++    # The normal obsolete sweep has run; these writer locks are already owned.
++    units = await conn.fetch(
++        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND document_id = $2 "
++        "AND chunk_id = ANY($3::text[]) ORDER BY id FOR NO KEY UPDATE",
++        bank_id,
++        document_id,
++        old_ids,
++    )
++    await conn.execute(
++        f"""INSERT INTO {fq_table("chunks")}
++            (chunk_id, document_id, bank_id, chunk_index, chunk_text, created_at, content_hash)
++        SELECT m.temporary_id, c.document_id, c.bank_id, m.temporary_index,
++               c.chunk_text, c.created_at, c.content_hash
++        FROM {fq_table("chunks")} c
++        JOIN unnest($3::text[], $4::text[], $5::int[]) AS m(old_id, temporary_id, temporary_index)
++          ON c.chunk_id = m.old_id
++        WHERE c.bank_id = $1 AND c.document_id = $2""",
++        bank_id,
++        document_id,
++        old_ids,
++        temp_ids,
++        [move.temporary_index for move in moves],
++    )
++    # Only a source LOCATION changed. Do not turn this bookkeeping into a content
++    # edit: UUID/text/embedding/times/scopes/consolidation stamps remain untouched.
++    await conn.execute(
++        f"""UPDATE {fq_table("memory_units")} u SET chunk_id = m.temporary_id
++        FROM unnest($3::text[], $4::text[]) AS m(old_id, temporary_id)
++        WHERE u.bank_id = $1 AND u.document_id = $2 AND u.chunk_id = m.old_id""",
++        bank_id,
++        document_id,
++        old_ids,
++        temp_ids,
++    )
++    await conn.execute(
++        f"DELETE FROM {fq_table('chunks')} WHERE bank_id = $1 AND document_id = $2 AND chunk_id = ANY($3::text[])",
++        bank_id,
++        document_id,
++        old_ids,
++    )
++    return len(units)
++
++
++async def finish_reuse(
++    *,
++    conn: Any,
++    fq_table: Callable[[str], str],
++    bank_id: str,
++    document_id: str,
++    staged: StagedChunkReuse,
++) -> int:
++    """Move references only AFTER the standard obsolete-source/observation sweep."""
++    if not staged.moves:
++        return 0
++    moved_count = await _move_to_temporary(
++        conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, moves=staged.moves
++    )
++    temp_ids = [move.temporary_id for move in staged.moves]
++    target_ids = [move.target_id for move in staged.moves]
++    await conn.execute(
++        f"""INSERT INTO {fq_table("chunks")}
++            (chunk_id, document_id, bank_id, chunk_index, chunk_text, created_at, content_hash)
++        SELECT m.target_id, c.document_id, c.bank_id, m.target_index,
++               c.chunk_text, c.created_at, c.content_hash
++        FROM {fq_table("chunks")} c
++        JOIN unnest($3::text[], $4::text[], $5::int[]) AS m(temporary_id, target_id, target_index)
++          ON c.chunk_id = m.temporary_id
++        WHERE c.bank_id = $1 AND c.document_id = $2""",
++        bank_id,
++        document_id,
++        temp_ids,
++        target_ids,
++        [move.target_index for move in staged.moves],
++    )
++    await conn.execute(
++        f"""UPDATE {fq_table("memory_units")} u SET chunk_id = m.target_id
++        FROM unnest($3::text[], $4::text[]) AS m(temporary_id, target_id)
++        WHERE u.bank_id = $1 AND u.document_id = $2 AND u.chunk_id = m.temporary_id""",
++        bank_id,
++        document_id,
++        temp_ids,
++        target_ids,
++    )
++    await conn.execute(
++        f"DELETE FROM {fq_table('chunks')} WHERE bank_id = $1 AND document_id = $2 AND chunk_id = ANY($3::text[])",
++        bank_id,
++        document_id,
++        temp_ids,
++    )
++    return moved_count
+diff --git a/hindsight-api-slim/hindsight_api/engine/memories/postgres.py b/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
+index 823f3373b..b953e2c9d 100644
+--- a/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
++++ b/hindsight-api-slim/hindsight_api/engine/memories/postgres.py
+@@ -65,12 +65,14 @@ from .pg import counts, curation, documents, engine_curation, graph, reads, writ
+ from .pg import expand as pg_expand
+ from .pg import links as pg_links
+ from .pg import retain as pg_retain
++from .pg import stable_chunks as pg_stable_chunks
+ from .pg import transfer as pg_transfer
+ 
+ if TYPE_CHECKING:  # pragma: no cover - typing only
+     from ..consolidation.consolidator import _TemporalBounds
+     from ..embeddings import Embeddings
+     from ..response_models import MemoryFact
++    from ..retain.stable_chunks import ChunkSnapshot, StableChunkPlan, StagedChunkReuse
+     from ..retain.types import CausalRelation, ProcessedFact
+     from ..search.graph_retrieval import GraphRetriever
+     from ..transfer.export import _LoadedExport, _UnitLocation
+@@ -1222,6 +1224,68 @@ class PostgresMemories(MemoriesExtension):
+             pool=backend, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, include_text=include_text
+         )
+ 
++    def supports_stable_chunk_reuse(self, backend: Any) -> bool:
++        return backend.backend_type == "postgresql"
++
++    async def load_stable_chunks(
++        self,
++        *,
++        backend: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        source_context: str | None = None,
++        source_strategy: str | None = None,
++    ) -> list["ChunkSnapshot"]:
++        from ..db_utils import acquire_with_retry
++
++        async with acquire_with_retry(backend) as conn:
++            return await pg_stable_chunks.load_chunks(
++                conn=conn,
++                fq_table=fq_store_table,
++                bank_id=bank_id,
++                document_id=document_id,
++                source_context=source_context,
++                source_strategy=source_strategy,
++            )
++
++    async def compatible_recovery_chunks(
++        self,
++        *,
++        conn: Any,
++        fq_table: Callable[[str], str],
++        bank_id: str,
++        document_id: str,
++        content_hash: str,
++        expected_hashes: dict[int, str],
++        source_context: str | None,
++        source_strategy: str | None,
++    ) -> dict[int, str] | None:
++        return await pg_stable_chunks.compatible_recovery_chunks(
++            conn=conn,
++            fq_table=fq_store_table,
++            bank_id=bank_id,
++            document_id=document_id,
++            content_hash=content_hash,
++            expected_hashes=expected_hashes,
++            source_context=source_context,
++            source_strategy=source_strategy,
++        )
++
++    async def stage_stable_chunk_reuse(
++        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, plan: "StableChunkPlan"
++    ) -> "StagedChunkReuse | None":
++        return await pg_stable_chunks.stage_reuse(
++            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, plan=plan
++        )
++
++    async def finish_stable_chunk_reuse(
++        self, *, conn: Any, fq_table: Callable[[str], str], bank_id: str, document_id: str, staged: "StagedChunkReuse"
++    ) -> int:
++        return await pg_stable_chunks.finish_reuse(
++            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, staged=staged
++        )
++
+     async def load_existing_chunks(
+         self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+     ) -> list[ExistingChunk]:
+diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+index 497114bdd..4821e9fd3 100644
+--- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
++++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
+@@ -26,7 +26,7 @@ import time
+ import uuid
+ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
+-from dataclasses import dataclass, field, replace
++from dataclasses import asdict, dataclass, field, replace
+ from datetime import UTC, date, datetime, timedelta, timezone
+ from types import SimpleNamespace
+ from typing import IO, TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar, cast
+@@ -768,7 +768,7 @@ from .reflect.tools import (
+     tool_search_mental_models,
+     tool_search_observations,
+ )
+-from .remote_retry import RetryPolicy, is_transient_remote_error, status_code_of
++from .remote_retry import RetryPolicy, is_invalid_remote_request, is_transient_remote_error, status_code_of
+ from .response_models import (
+     DIRECTIVE_PRIORITY_MAX,
+     DIRECTIVE_PRIORITY_MIN,
+@@ -1772,6 +1772,7 @@ def _is_non_retryable_task_error(e: Exception) -> bool:
+         # tasks that let the provider's own error through (consolidation, refresh).
+         or isinstance(e, ProviderAuthError)
+         or status_code_of(e) in (401, 403)
++        or is_invalid_remote_request(e)
+         # An operation validator rejected the refresh's document and did not ask
+         # for another run (#5970).
+         or (isinstance(e, MentalModelRefreshError) and not e.retryable)
+@@ -2018,6 +2019,19 @@ class RefreshTagFiltering:
+     tag_groups: list[TagGroup] | None
+ 
+ 
++@dataclass(frozen=True)
++class _ExactPageHit:
++    """A scoped identity result, serialized into the existing search envelope."""
++
++    id: str
++    name: str
++    mental_model_id: str | None
++    source_query: str | None
++    snippet: str
++    updated_at: str | None
++    score: float = 1.0
++
++
+ @dataclass(frozen=True)
+ class PageTagFilter:
+     """Which pages a tree or search read may return, by their tags.
+@@ -5414,12 +5428,10 @@ class MemoryEngine(MemoryEngineInterface):
+         for the same reason: its ``except`` blocks never ran, and without the record
+         the automatic triggers would queue it again on the next tick (#4532).
+ 
+-        Except when the ceiling fired during a retry backoff (``stage`` ends in
+-        ``.backoff``): the time ran out waiting for a provider that had just failed,
+-        not on a prompt that can never finish. That is the temporary failure #5394
+-        already declines to pause on, so it is recorded without pausing (#5561).
+-        The same holds while queued for an LLM permit (``.queued``): the time ran out
+-        waiting for capacity other tasks held, not on this prompt (#6140).
++        Except when the ceiling fired during retry backoff or a local permit wait
++        (``stage`` ends in ``.backoff`` or ``.queued``): congestion is not proof that
++        the prompt cannot finish. The provider-failure path already declines to
++        pause on temporary failures (#5394, #5561); a local queue needs the same rule.
+         """
+         if task_dict.get("type") == "refresh_mental_model":
+             token = _current_schema.set(schema)
+@@ -5430,7 +5442,10 @@ class MemoryEngine(MemoryEngineInterface):
+                     outcome="refresh_failed_error",
+                     failure_reason="unexpected_error",
+                     error_message=error_message,
+-                    pause_automatic=not stage.endswith((".backoff", ".queued")),
++                    # Waiting for a local permit says nothing about whether this
++                    # page can be refreshed. Like provider backoff, it must never
++                    # turn congestion into a permanent automatic-refresh pause.
++                    pause_automatic=not stage.endswith((".backoff", ".queued", ".budget_exhausted")),
+                 )
+             finally:
+                 _current_schema.reset(token)
+@@ -7663,8 +7678,58 @@ class MemoryEngine(MemoryEngineInterface):
+         # for slice 1: the delta check runs for the handful of documents in that slice and is
+         # silently skipped for every other document in the retain.
+         #
+-        # Postgres keeps splitting. Its writes really are per sub-batch, so the bound is real there.
++        # Postgres normally keeps splitting: each slice commits independently. A
++        # bounded, opt-in single-document reuse pass must finish the WHOLE delta,
++        # however: later greedy slices would otherwise overwrite its anchored suffix
++        # and replace precisely the facts it just preserved. The orchestrator still
++        # bounds extraction concurrency, and unsupported plans retain its streaming
++        # fallback. Larger/multi-document inputs keep the old token splitter.
++        bounded_stable_pass = False
++        retain_config = None
+         if retain_session is None and total_tokens > tokens_per_batch:
++            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
++            from .retain.stable_chunks import MAX_STABLE_SOURCE_CHARS, fits_stable_chunk_budget, is_jsonl_source
++
++            bounded_stable_pass = (
++                retain_config.retain_stable_chunks
++                and retain_config.store_document_text
++                and len(contents) == 1
++                and bool(document_id or contents[0].get("document_id"))
++                and len(contents[0].get("content", "")) <= MAX_STABLE_SOURCE_CHARS
++                and _store.supports_stable_chunk_reuse(self._backend)
++            )
++            if bounded_stable_pass:
++                from .retain import attachment_content, fact_storage
++
++                incoming = contents[0].get("content", "")
++                candidate_body = incoming
++                appending = contents[0].get("update_mode") == "append"
++                bounded_stable_pass = not attachment_content.contains_attachment(incoming) and await asyncio.to_thread(
++                    is_jsonl_source, incoming, 1 if appending else 2
++                )
++                if bounded_stable_pass and appending:
++                    # A tail's size alone does not bound the complete append. Keep
++                    # oversized/format-changing bases on the existing sliced path.
++                    async with acquire_with_retry(await self._get_backend()) as conn:
++                        base_text = await fact_storage.get_document_content(
++                            conn, bank_id, document_id or contents[0]["document_id"]
++                        )
++                    bounded_stable_pass = (
++                        base_text is not None
++                        and len(base_text) + len(incoming) + 1 <= MAX_STABLE_SOURCE_CHARS
++                        and not attachment_content.contains_attachment(base_text)
++                        and await asyncio.to_thread(is_jsonl_source, base_text)
++                    )
++                    if bounded_stable_pass:
++                        candidate_body = base_text + "\n" + incoming
++                if bounded_stable_pass:
++                    bounded_stable_pass = await asyncio.to_thread(
++                        fits_stable_chunk_budget,
++                        candidate_body,
++                        retain_config.retain_chunk_size,
++                        retain_config.retain_structured_chunk_size,
++                    )
++        if retain_session is None and total_tokens > tokens_per_batch and not bounded_stable_pass:
+             # Split into smaller batches based on token count
+             logger.info(
+                 f"Large batch detected ({total_tokens:,} tokens from {len(contents)} items). Splitting into sub-batches of ~{tokens_per_batch:,} tokens each..."
+@@ -7674,7 +7739,7 @@ class MemoryEngine(MemoryEngineInterface):
+             # retain config before splitting — the splitter and the orchestrator
+             # must chunk identically for the slices to line up with what gets
+             # stored (see _split_contents_into_sub_batches).
+-            retain_config = await self._resolve_retain_config(bank_id, request_context, strategy)
++            assert retain_config is not None
+             chunking_config = self._retain_chunking_config(retain_config)
+ 
+             # In update_mode="append", retain_batch prepends the existing document
+@@ -16029,6 +16094,10 @@ class MemoryEngine(MemoryEngineInterface):
+                 # The floor guards the cut's coarse levels: on that count it kept five.
+                 shortlist=25,
+                 min_keep=15,
++                # The shared decision-model request ceiling is also the endpoint's
++                # context budget. Keep reflect/page decisions from probing the
++                # historical 26k default against a smaller self-hosted endpoint.
++                max_question_tokens=setup.max_request_tokens,
+             )
+             # Retried like the shared decision model (DecisionModel.ask): without it a single 429
+             # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)
+@@ -18858,6 +18927,17 @@ class MemoryEngine(MemoryEngineInterface):
+         # Both op calls share one LLM handle, built on first use so a refresh that
+         # neither retracts nor has new facts still pays no config resolution.
+         _op_llm_config: ConfiguredLLMProvider | None = None
++        # Full synthesis has already run. The retraction/edit calls and any corrected
++        # response now share ONE phase budget, clamped to this task's remaining wall time.
++        from ..worker.stage import get_task_deadline
++
++        edit_deadline = get_task_deadline()
++        edit_timeout = get_config().mental_model_delta_timeout
++        if edit_timeout is not None:
++            configured_deadline = asyncio.get_running_loop().time() + edit_timeout
++            edit_deadline = (
++                min(edit_deadline, configured_deadline) if edit_deadline is not None else configured_deadline
++            )
+ 
+         async def _op_llm() -> ConfiguredLLMProvider:
+             nonlocal _op_llm_config
+@@ -18925,6 +19005,7 @@ class MemoryEngine(MemoryEngineInterface):
+                             system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
+                             user_prompt=unsay_prompt,
+                             scope="mental_model_retraction_ops",
++                            deadline=edit_deadline,
+                             max_completion_tokens=get_config().reflect_max_completion_tokens,
+                             temperature=get_config().llm_temperature_mental_model_refresh,
+                         )
+@@ -18948,6 +19029,13 @@ class MemoryEngine(MemoryEngineInterface):
+                             f"{len(unsay_outcome.applied)} op(s), skipped {len(unsay_outcome.skipped)}"
+                         )
+                     except Exception as exc:
++                        # A transport outage or control signal is not an invalid edit. Preserve
++                        # its type for the task's retry/defer/cancel policy; swallowing it here
++                        # could advance the watermark while leaving a retired claim in place.
++                        if isinstance(
++                            exc, (OperationCancelledError, ProviderRateLimitResetError)
++                        ) or is_transient_remote_error(exc):
++                            raise
+                         # Leave based_on alone so the next refresh sees the same
+                         # retraction and tries again.
+                         logger.warning(
+@@ -19056,6 +19144,7 @@ class MemoryEngine(MemoryEngineInterface):
+                         system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
+                         user_prompt=user_prompt,
+                         scope="mental_model_delta_ops",
++                        deadline=edit_deadline,
+                         document=current_doc,
+                         response_format=DeltaOperationList,
+                         strict_schema=get_config().llm_strict_schema_reflect,
+@@ -19107,6 +19196,13 @@ class MemoryEngine(MemoryEngineInterface):
+                                 "operations for the reason each was dropped."
+                             )
+                 except Exception as exc:
++                    # Do not turn a temporary provider failure into delta_ops_failed: that
++                    # refusal pauses automatic refresh and hides the original retryability.
++                    # Structural/schema failures still follow the data-preserving refusal.
++                    if isinstance(
++                        exc, (OperationCancelledError, ProviderRateLimitResetError)
++                    ) or is_transient_remote_error(exc):
++                        raise
+                     logger.warning(
+                         f"[MENTAL_MODELS] Structured delta failed for {mental_model_id} "
+                         f"({exc}); delta operations were not applied"
+@@ -20816,12 +20912,16 @@ class MemoryEngine(MemoryEngineInterface):
+         """Doc-level hybrid search over a bank's pages.
+ 
+         Fuses a full-text (BM25) match over the page name + content with vector
+-        similarity (``mm.embedding``) using Reciprocal Rank Fusion, in a single
+-        round trip. No reranker — this path is tuned for latency. Returns pages
++        similarity (``mm.embedding``) using Reciprocal Rank Fusion. A bounded exact
++        title lookup precedes hybrid ranking, so identity matches cannot disappear
++        below an ANN/BM25 candidate cut. No reranker. Returns pages
+         ranked by fused score, each with its ``source_query`` (the question it
+         answers) and a short content snippet. Folders are excluded.
+ 
+-        ``score`` is normalized to ``0..1``, where 1.0 is the best a page can do
++        Case-insensitive full-title matches come first with score 1.0; the title is
++        not tokenized, so Chinese titles and punctuation work without a text index.
++        Other pages retain the existing rank-fusion score, normalized to ``0..1``,
++        where 1.0 is the best a non-exact page can do
+         on this query: every arm at rank 1. It is a *rank* score, not a relevance
+         one — it says where a page placed, never how well it matched, so it is
+         only meaningful against the other results for the same query. A one-arm
+@@ -20862,13 +20962,49 @@ class MemoryEngine(MemoryEngineInterface):
+ 
+         from .retain import embedding_utils
+ 
+-        # Embed with the query input type (asymmetric models prefix queries).
+-        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
+-        emb_str = str(emb[0]) if emb and emb[0] else None
+-
+         kp = fq_table("knowledge_pages")
+         mm = fq_table("mental_models")
+         join = self._kp_join()
++        exact_tags = tag_filter.clause(3)
++        backend = await self._get_backend()
++        async with acquire_with_retry(backend) as conn:
++            # Like the hybrid arms, slice in Python: SQL_ASCII LEFT counts bytes
++            # and can split a multibyte character before the client decodes it.
++            exact_rows = await conn.fetch(
++                f"""
++                SELECT kp.id, kp.name, kp.mental_model_id,
++                       mm.content, mm.source_query, mm.last_refreshed_at AS updated_at
++                FROM {join}
++                WHERE kp.bank_id = $1 AND kp.kind = 'page' AND LOWER(kp.name) = LOWER($2)
++                      {exact_tags.sql}
++                ORDER BY kp.name, kp.id
++                LIMIT {limit}
++                """,
++                bank_id,
++                query,
++                *exact_tags.params,
++            )
++        exact_ids = {r["id"] for r in exact_rows}
++        exact_results = [
++            asdict(
++                _ExactPageHit(
++                    id=r["id"],
++                    name=r["name"],
++                    mental_model_id=r["mental_model_id"],
++                    source_query=r["source_query"],
++                    snippet=_page_snippet(r["content"]),
++                    updated_at=r["updated_at"].isoformat() if r["updated_at"] else None,
++                )
++            )
++            for r in exact_rows
++        ]
++        if len(exact_results) == limit:
++            return exact_results
++
++        # Embed only after the scoped identity lookup. An exact-only result does
++        # not depend on a working embedding service or the text-search index.
++        emb = await embedding_utils.generate_embeddings_batch(self.embeddings, [query], input_type="query")
++        emb_str = str(emb[0]) if emb and emb[0] else None
+ 
+         # A store that indexes pages answers the ranking; Postgres still hydrates it. The store is
+         # given the whole page set and knows nothing about folders, so the join below is what keeps
+@@ -20885,7 +21021,7 @@ class MemoryEngine(MemoryEngineInterface):
+                 limit=fetch,
+             )
+             if not matches:
+-                return []
++                return exact_results
+             order = {m.page_id: i for i, m in enumerate(matches)}
+             # ponytail: the store ranks the whole page set, so a filter applied at hydration can
+             # leave fewer than `limit` hits; push the filter into the store protocol if that bites.
+@@ -20923,7 +21059,7 @@ class MemoryEngine(MemoryEngineInterface):
+                 if r["mental_model_id"] in order
+             ]
+             out.sort(key=lambda d: order[cast(str, d["mental_model_id"])])
+-            return out[:limit]
++            return (exact_results + [hit for hit in out if hit["id"] not in exact_ids])[:limit]
+ 
+         # BM25 clauses for the configured text-search backend (same per-backend
+         # dispatch the memory-recall BM25 arm uses — see page_bm25_arm).
+@@ -20947,7 +21083,7 @@ class MemoryEngine(MemoryEngineInterface):
+         tokens = tokenize_query(query) if enable_text_search else []
+         include_bm25 = bool(tokens)
+         if not include_bm25 and emb_str is None:
+-            return []
++            return exact_results
+ 
+         backend = await self._get_backend()
+         async with acquire_with_retry(backend) as conn:
+@@ -21062,7 +21198,7 @@ class MemoryEngine(MemoryEngineInterface):
+                     """
+                     rows = await conn.fetch(sql, bank_id, bm25_text, *tags_clause.params)
+ 
+-        return [
++        hybrid_results = [
+             {
+                 "id": r["id"],
+                 "name": r["name"],
+@@ -21073,7 +21209,9 @@ class MemoryEngine(MemoryEngineInterface):
+                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+             }
+             for r in rows
++            if r["id"] not in exact_ids
+         ]
++        return (exact_results + hybrid_results)[:limit]
+ 
+     async def update_page_node(
+         self,
+diff --git a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+index 382d7a9a6..20cdb0b77 100644
+--- a/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
++++ b/hindsight-api-slim/hindsight_api/engine/providers/openai_responses_llm.py
+@@ -41,6 +41,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI
+ from hindsight_api.config import get_config
+ from hindsight_api.engine.bank_attribution import apply_bank_attribution
+ from hindsight_api.engine.cache_affinity import apply_opencode_session
++from hindsight_api.engine.llm_attempts import ProviderAttempt, current_provider_attempts
+ from hindsight_api.engine.llm_interface import (
+     LLMInterface,
+     OutputTooLongError,
+@@ -58,7 +59,7 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
+     _strip_code_fences,
+     _strip_reasoning_tags,
+ )
+-from hindsight_api.engine.remote_retry import jittered_backoff
++from hindsight_api.engine.remote_retry import is_invalid_remote_request, jittered_backoff
+ from hindsight_api.engine.response_models import TokenUsage
+ from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
+ from hindsight_api.metrics import get_metrics_collector
+@@ -372,14 +373,40 @@ class OpenAIResponsesLLM(LLMInterface):
+         real token counts (see #2387).
+         """
+         last_exception: Exception | None = None
++
++        async def backoff(record: ProviderAttempt, seconds: float) -> None:
++            record.planned_backoff_ms = int(seconds * 1000)
++            # The wall-timeout handler distinguishes temporary backoff from execution.
++            # Previously the last attempt label survived the sleep and could freeze a page.
++            set_stage(f"llm.{self.provider}.{scope}.backoff")
++            started = time.perf_counter()
++            try:
++                await asyncio.sleep(seconds)
++            finally:
++                record.backoff_ms = int((time.perf_counter() - started) * 1000)
++
+         for attempt in range(max_retries + 1):
++            log = current_provider_attempts()
++            record = log.start(attempt + 1) if log is not None else ProviderAttempt(attempt=attempt + 1)
++            attempt_started = time.perf_counter()
++            request_started: float | None = None
+             try:
+                 async with attempt_context() if attempt_context is not None else nullcontext():
++                    request_started = time.perf_counter()
++                    record.queue_wait_ms = int((request_started - attempt_started) * 1000)
+                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
+                     # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
+                     # on every byte, so an upstream trickling keep-alive whitespace never trips it
+                     # and the call pins its worker slot forever (#4763).
+                     response = await asyncio.wait_for(self._create_response(params), timeout=self.timeout)
++                record.outcome = "response"
++                record.http_status = 200
++                record.request_ms = int((time.perf_counter() - request_started) * 1000)
++                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
++                # Only the SDK's bounded correlation id; never headers, error prose or payloads.
++                request_id = getattr(response, "_request_id", None)
++                if isinstance(request_id, str) and len(request_id) <= 128:
++                    record.request_id = request_id
+                 usage = self._extract_usage(response)
+                 stash_response_usage(
+                     LLMResponseUsage(
+@@ -391,7 +418,13 @@ class OpenAIResponsesLLM(LLMInterface):
+                 )
+                 return parse(response)
+ 
++            except asyncio.CancelledError:
++                record.outcome = "cancelled"
++                record.error_type = "CancelledError"
++                raise
+             except json.JSONDecodeError as e:
++                record.outcome = "parse_error"
++                record.error_type = type(e).__name__
+                 last_exception = e
+                 logger.warning(
+                     f"JSON parse error from Responses reply "
+@@ -399,11 +432,13 @@ class OpenAIResponsesLLM(LLMInterface):
+                     f"{str(e)[:200]}"
+                 )
+                 if attempt < max_retries:
+-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
++                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
+                     continue
+                 raise
+ 
+             except (APIConnectionError, TimeoutError, RetryableResponsesError) as e:
++                record.outcome = "transport_error"
++                record.error_type = type(e).__name__
+                 last_exception = e
+                 status_code = getattr(e, "status_code", None) or getattr(
+                     getattr(e, "response", None), "status_code", None
+@@ -413,11 +448,24 @@ class OpenAIResponsesLLM(LLMInterface):
+                     f"attempt {attempt + 1}/{max_retries + 1}): {describe_llm_error(e)}"
+                 )
+                 if attempt < max_retries:
+-                    await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
++                    await backoff(record, min(initial_backoff * (2**attempt), max_backoff))
+                     continue
+                 raise
+ 
+             except APIStatusError as e:
++                record.outcome = "http_error"
++                record.error_type = type(e).__name__
++                record.http_status = e.status_code
++                request_id = getattr(e, "request_id", None)
++                if isinstance(request_id, str) and len(request_id) <= 128:
++                    record.request_id = request_id
++                if is_invalid_remote_request(e):
++                    # A proxy can wrap invalid_value in HTTP 502. Replaying the same
++                    # payload cannot fix it and multiplies the outer worker retries.
++                    logger.error(
++                        "Invalid Responses request (%s/%s, scope=%s), not retrying", self.provider, self.model, scope
++                    )
++                    raise
+                 if e.status_code in (401, 403):
+                     logger.error(f"Auth error (HTTP {e.status_code}, {self.provider}/{self.model}), not retrying")
+                     raise
+@@ -433,13 +481,23 @@ class OpenAIResponsesLLM(LLMInterface):
+                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
+                         f"attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status_code}"
+                     )
+-                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
++                    await backoff(record, jittered_backoff(attempt, initial_backoff, max_backoff))
+                     continue
+                 logger.error(
+                     f"API error after {max_retries + 1} attempts "
+                     f"({self.provider}/{self.model}, scope={scope}): HTTP {e.status_code}"
+                 )
+                 raise
++            except Exception as e:
++                record.outcome = "error"
++                record.error_type = type(e).__name__
++                raise
++            finally:
++                record.elapsed_ms = int((time.perf_counter() - attempt_started) * 1000)
++                if request_started is None:
++                    record.queue_wait_ms = record.elapsed_ms
++                elif record.request_ms is None:
++                    record.request_ms = max(0, record.elapsed_ms - record.queue_wait_ms - record.backoff_ms)
+ 
+         if last_exception:
+             raise last_exception
+diff --git a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+index 24bb61a6b..e05647689 100644
+--- a/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
++++ b/hindsight-api-slim/hindsight_api/engine/reflect/agent.py
+@@ -21,6 +21,7 @@ from ...config import DEFAULT_RECALL_CHUNKS_MAX_TOKENS, DEFAULT_RECALL_MAX_TOKEN
+ from ..llm_interface import LLM_TOOL_CHOICE_REQUIRED, LLMToolChoice
+ from ..llm_trace import LLMQueueWait, reset_queue_wait_sink, set_queue_wait_sink
+ from ..llm_transport import describe_llm_error
++from ..remote_retry import is_invalid_remote_request, is_transient_remote_error
+ from ..response_models import LLMToolCall, LLMToolCallResult
+ from .models import (
+     DirectiveInfo,
+@@ -1413,6 +1414,10 @@ async def _run_reflect_agent_inner(
+                         "forcing final synthesis from gathered evidence."
+                     )
+                     return await _forced_final_synthesis(iteration + 1)
++                # Transport retries already ran inside the provider. A second agent
++                # iteration repeats that whole budget without gathering any evidence.
++                if is_invalid_remote_request(e) or is_transient_remote_error(e):
++                    raise
+                 # Any other error: retry (capped, so a persistently failing provider does
+                 # not hang the run), then give up. Synthesizing an answer here instead
+                 # would be built on an evidence set the failed turn never finished
+diff --git a/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py b/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
+index 7f6335c5a..cc7401c3a 100644
+--- a/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
++++ b/hindsight-api-slim/hindsight_api/engine/reflect/delta_ops.py
+@@ -41,6 +41,7 @@ or stay the same per refresh, never get worse.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import json
+ import logging
+ import re
+@@ -49,6 +50,8 @@ from typing import Annotated, Any, Literal, Union, cast
+ 
+ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+ 
++from hindsight_api.cancellation import OperationCancelledError
++from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+ from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, parse_llm_json, reask_messages
+ 
+ from .structured_doc import (
+@@ -495,6 +498,64 @@ async def request_delta_operations(
+     user_prompt: str,
+     scope: str,
+     document: StructuredDocument | None = None,
++    deadline: float | None = None,
++    **call_kwargs: Any,
++) -> DeltaOperationList:
++    """One shared edit deadline, including provider retries and the semantic correction.
++
++    An exhausted budget is temporary, never permission to overwrite the old page
++    with a partial candidate. External cancellation is still external cancellation.
++    """
++    from hindsight_api.worker.stage import set_stage
++
++    if deadline is not None and deadline <= asyncio.get_running_loop().time():
++        set_stage("mental_model_delta.budget_exhausted")
++        raise TimeoutError("Delta edit has no remaining stage budget")
++    try:
++        async with asyncio.timeout_at(deadline):
++            result = await _request_delta_operations(
++                llm,
++                system_prompt=system_prompt,
++                user_prompt=user_prompt,
++                scope=scope,
++                document=document,
++                deadline=deadline,
++                **call_kwargs,
++            )
++            # A provider may suppress cancellation or finish between timer ticks.
++            # A late answer must not turn an expired budget into permission to write.
++            if deadline is not None and deadline <= asyncio.get_running_loop().time():
++                raise TimeoutError("Delta edit completed after its stage deadline")
++            return result
++    except (OperationCancelledError, ProviderRateLimitResetError):
++        # A caller cancellation or a provider's known reset remains a control signal.
++        raise
++    except Exception as exc:
++        if deadline is not None and deadline <= asyncio.get_running_loop().time() and not isinstance(exc, TimeoutError):
++            # Validation exceptions from a late/cancellation-suppressing provider are
++            # not allowed to turn a spent budget into a structural permanent pause.
++            raise TimeoutError("Delta edit failed after its stage deadline") from exc
++        raise
++    finally:
++        if deadline is not None and deadline <= asyncio.get_running_loop().time():
++            # Runs even if the outer worker ceiling cancels at the same deadline.
++            # That cancellation must not be mistaken for a deterministic page failure.
++            set_stage("mental_model_delta.budget_exhausted")
++
++
++def _check_edit_deadline(deadline: float | None) -> None:
++    if deadline is not None and deadline <= asyncio.get_running_loop().time():
++        raise TimeoutError("Delta edit completed after its stage deadline")
++
++
++async def _request_delta_operations(
++    llm: ConfiguredLLMProvider,
++    *,
++    system_prompt: str,
++    user_prompt: str,
++    scope: str,
++    document: StructuredDocument | None = None,
++    deadline: float | None = None,
+     **call_kwargs: Any,
+ ) -> DeltaOperationList:
+     """Ask the model for an operation list, and once more with the errors if it is refused.
+@@ -529,7 +590,9 @@ async def request_delta_operations(
+     touching nothing is a legitimate answer.
+     """
+     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
++    _check_edit_deadline(deadline)
+     first = await llm.call(messages=messages, scope=scope, **call_kwargs)
++    _check_edit_deadline(deadline)
+     try:
+         op_list = parse_delta_operation_list(first.content)
+     except (ValueError, TypeError) as exc:  # DeltaOperationsInvalidError and JSON errors are ValueErrors
+@@ -554,7 +617,9 @@ async def request_delta_operations(
+             len(op_list.operations),
+         )
+         correction = _unreachable_correction_prompt(unreachable, document, any_applied=bool(outcome.applied))
++    _check_edit_deadline(deadline)
+     second = await llm.call(messages=reask_messages(messages, first.content, correction), scope=scope, **call_kwargs)
++    _check_edit_deadline(deadline)
+     return parse_delta_operation_list(second.content)
+ 
+ 
+diff --git a/hindsight-api-slim/hindsight_api/engine/remote_retry.py b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+index 2458f7040..1580dc726 100644
+--- a/hindsight-api-slim/hindsight_api/engine/remote_retry.py
++++ b/hindsight-api-slim/hindsight_api/engine/remote_retry.py
+@@ -50,6 +50,7 @@ _TRANSIENT_EXCEPTION_NAMES = frozenset(
+         "ConnectionError",
+         "InternalServerError",
+         "RateLimitError",
++        "RetryableResponsesError",
+         "ServiceUnavailableError",
+         "Timeout",
+         "TimeoutError",
+@@ -134,6 +135,32 @@ def status_code_of(exc: BaseException) -> int | None:
+     return None
+ 
+ 
++def is_invalid_remote_request(exc: BaseException, *, include_generic_type: bool = True) -> bool:
++    """Recognize deterministic SDK request errors even when a gateway wraps them in 5xx.
++
++    OpenAI SDK errors expose the structured upstream code/type on the exception.
++    Do not match prose: an overloaded backend mentioning a parameter is still transient.
++    Context overflow stays on reflect's existing partial-evidence synthesis path.
++    Consolidation excludes a generic error type: it may describe an oversized
++    batch that adaptive bisection can rescue, not an invalid provider parameter.
++    """
++    return getattr(exc, "code", None) in {
++        "invalid_value",
++        "invalid_parameter",
++        "unsupported_parameter",
++        "unsupported_value",
++        "unknown_parameter",
++        "missing_required_parameter",
++    } or (
++        include_generic_type
++        and getattr(exc, "type", None) == "invalid_request_error"
++        # Compatible providers also use this generic envelope for 429/5xx. Only an
++        # explicit parameter code may override a transient HTTP status; otherwise a
++        # temporary outage would permanently pause automatic page refreshes.
++        and ((status := status_code_of(exc)) is None or (400 <= status < 500 and status not in _TRANSIENT_STATUS_CODES))
++    )
++
++
+ def is_transient_remote_error(exc: BaseException) -> bool:
+     """
+     Return True when ``exc``, or the error it was raised from, is worth retrying.
+@@ -153,6 +180,8 @@ def is_transient_remote_error(exc: BaseException) -> bool:
+     link: BaseException | None = exc
+     while link is not None and id(link) not in seen:
+         seen.add(id(link))
++        if is_invalid_remote_request(link):
++            return False
+         if any(cls.__name__ in _PERMANENT_EXCEPTION_NAMES for cls in type(link).__mro__):
+             return False
+         status = status_code_of(link)
+diff --git a/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py b/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py
+new file mode 100644
+index 000000000..ad0f7f2ef
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/rerank_input_budget.py
+@@ -0,0 +1,129 @@
++"""Opt-in input fitting for a self-hosted Cohere-compatible reranker.
++
++Use that server's llama.cpp-compatible tokenizer, not Hindsight's fact tokenizer.
++Only ranking copies are shortened; queries and stored source text stay intact.
++"""
++
++import asyncio
++import math
++from urllib.parse import urlsplit, urlunsplit
++
++from pydantic import BaseModel, StrictInt, StrictStr
++
++from .aiohttp_session import LoopLocalSession, per_phase_timeout, raise_for_status
++
++
++class RerankInputBudgetError(ValueError):
++    """An input cannot be safely fitted to the configured server budget."""
++
++
++class _TokenizedText(BaseModel):
++    tokens: list[StrictInt]
++
++
++class _DetokenizedText(BaseModel):
++    content: StrictStr
++
++
++class ServerTokenizerBudget:
++    """Fit query/document pairs with the same tokenizer used by the serving model."""
++
++    def __init__(
++        self,
++        *,
++        rerank_url: str | None,
++        tokenizer_url: str,
++        api_key: str,
++        max_input_tokens: int,
++        token_overhead: int = 128,
++        timeout: float = 30.0,
++    ) -> None:
++        if max_input_tokens <= 0 or token_overhead < 0 or token_overhead >= max_input_tokens:
++            raise RerankInputBudgetError("Reranker input budget must exceed its nonnegative template reserve")
++        if not math.isfinite(timeout) or timeout <= 0:
++            raise RerankInputBudgetError("Tokenizer timeout must be finite and positive")
++        rerank = urlsplit(rerank_url or "")
++        tokenizer = urlsplit(tokenizer_url)
++        # Reuse the existing credential only at the operator's same-origin endpoint.
++        # Disallow userinfo, query strings and redirects instead of forwarding secrets.
++        if (
++            rerank.scheme not in {"http", "https"}
++            or tokenizer.scheme not in {"http", "https"}
++            or not rerank.hostname
++            or not tokenizer.hostname
++            or rerank.username is not None
++            or tokenizer.username is not None
++            or tokenizer.query
++            or tokenizer.fragment
++            or (rerank.scheme, rerank.hostname, rerank.port) != (tokenizer.scheme, tokenizer.hostname, tokenizer.port)
++            or not tokenizer.path.endswith("/tokenize")
++        ):
++            raise RerankInputBudgetError("Tokenizer must be a same-origin /tokenize endpoint of a custom reranker")
++        self.tokenizer_url = tokenizer_url
++        self.detokenizer_url = urlunsplit(
++            tokenizer._replace(path=tokenizer.path.removesuffix("tokenize") + "detokenize")
++        )
++        self.max_input_tokens = max_input_tokens
++        self.token_overhead = token_overhead
++        self.timeout = min(timeout, 30.0)
++        self._session = LoopLocalSession(
++            timeout=per_phase_timeout(self.timeout),
++            headers={"Authorization": f"Bearer {api_key}"},
++        )
++
++    async def _tokenize(self, text: str) -> list[int]:
++        async with self._session.get().post(
++            self.tokenizer_url, json={"content": text, "add_special": False}, allow_redirects=False
++        ) as response:
++            if 300 <= response.status < 400:
++                raise RerankInputBudgetError("Tokenizer redirects are not supported")
++            await raise_for_status(response)
++            tokens = _TokenizedText.model_validate(await response.json(content_type=None)).tokens
++            if any(token < 0 for token in tokens) or (text and not tokens):
++                raise RerankInputBudgetError("Tokenizer returned invalid or empty token IDs")
++            return tokens
++
++    async def _detokenize(self, tokens: list[int]) -> str:
++        async with self._session.get().post(
++            self.detokenizer_url, json={"tokens": tokens}, allow_redirects=False
++        ) as response:
++            if 300 <= response.status < 400:
++                raise RerankInputBudgetError("Tokenizer redirects are not supported")
++            await raise_for_status(response)
++            return _DetokenizedText.model_validate(await response.json(content_type=None)).content
++
++    async def fit(self, query: str, documents: list[str]) -> list[str]:
++        """Keep one ranking pool, fitting each copy under query + template + document."""
++        # One wall budget for all tokenization/detokenization, not N request timeouts.
++        async with asyncio.timeout(self.timeout):
++            query_tokens = await self._tokenize(query)
++            available = self.max_input_tokens - self.token_overhead - len(query_tokens)
++            if available <= 0:
++                raise RerankInputBudgetError("Reranker query leaves no document budget; query was not truncated")
++            semaphore = asyncio.Semaphore(8)  # Per-call, on this loop; no process-global asyncio primitive.
++
++            async def fit_document(document: str) -> str:
++                async with semaphore:
++                    tokens = await self._tokenize(document)
++                    if document and not tokens:
++                        raise RerankInputBudgetError("Tokenizer returned no tokens for a nonempty document")
++                    if len(tokens) <= available:
++                        return document
++                    # A token prefix can end halfway through a UTF-8 character. Back
++                    # off a bounded suffix rather than introducing replacement text.
++                    for tail in range(min(8, available)):
++                        fitted = await self._detokenize(tokens[: available - tail])
++                        if fitted and document.startswith(fitted) and len(await self._tokenize(fitted)) <= available:
++                            return fitted
++                    raise RerankInputBudgetError("Tokenizer could not produce a verified nonempty document prefix")
++
++            tasks = [asyncio.create_task(fit_document(document)) for document in documents]
++            try:
++                return await asyncio.gather(*tasks)
++            finally:
++                # gather does not cancel siblings when one fails. No orphan tokenizer
++                # calls may continue after this fit failed or its caller was cancelled.
++                for task in tasks:
++                    if not task.done():
++                        task.cancel()
++                await asyncio.gather(*tasks, return_exceptions=True)
+diff --git a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
+index fc84902ec..4263f208b 100644
+--- a/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
++++ b/hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py
+@@ -12,7 +12,7 @@ import logging
+ import time
+ import uuid
+ from collections.abc import Awaitable, Callable
+-from dataclasses import dataclass
++from dataclasses import asdict, dataclass
+ from datetime import UTC, datetime, tzinfo
+ from typing import TYPE_CHECKING, Any, cast
+ from zoneinfo import ZoneInfo
+@@ -523,6 +523,7 @@ from . import timing as _timing
+ from .embedding_coalescer import CoalescingEmbedder
+ from .entity_labels import label_tag_keys
+ from .memory_budget import PRODUCER_WAITING, RetainMemoryBudget, estimate_chunk_bytes
++from .stable_chunks import MAX_STABLE_SOURCE_CHARS, StableChunkPlan, is_jsonl_source, plan_stable_chunks
+ from .types import (
+     CausalRelation,
+     ChunkMetadata,
+@@ -2145,6 +2146,12 @@ async def retain_batch(
+     # delta ran with no concurrency control at all.
+     from ..memories import get_memories as _get_memories_delta
+ 
++    stable_recovery_plan: StableChunkPlan | None = None
++
++    def preserve_recovery_layout(plan: StableChunkPlan) -> None:
++        nonlocal stable_recovery_plan
++        stable_recovery_plan = plan
++
+     _delta_provider = _get_memories_delta()
+     if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
+         with track_observation_changes() as delta_changes:
+@@ -2170,6 +2177,8 @@ async def retain_batch(
+                 document_prefetch=document_prefetch,
+                 full_document_body=full_document_body,
+                 delta_full_body=_delta_full_body,
++                single_input=original_count == 1,
++                recovery_plan_callback=preserve_recovery_layout,
+                 document_body_hash=document_body_hash,
+                 append_base_hash=append_base_hash,
+                 attachment_loader=attachment_loader,
+@@ -2213,6 +2222,12 @@ async def retain_batch(
+             all_pre_chunks.append(chunk)
+             chunk_to_content.append(content_idx)
+ 
++    if stable_recovery_plan is not None:
++        # Resume missing chunks at the verified persisted positions, not at a
++        # fresh greedy layout. Extraction remains producer/consumer bounded.
++        all_pre_chunks = [chunk.text for chunk in stable_recovery_plan.chunks]
++        chunk_to_content = [0] * len(all_pre_chunks)
++
+     # Memory: after chunking, the original content bodies in RetainContent are
+     # no longer needed (all_pre_chunks holds the working set). Clear them so
+     # Python can reclaim the (potentially multi-MB) strings.
+@@ -2774,23 +2789,69 @@ async def _streaming_retain_batch(
+     # preserves every existing unit and skips every matching chunk, which is exactly the
+     # silent no-op #3899 reports. Skipping the probe also skips its two queries.
+     # `conn` is the pool: only Postgres acquires a connection for the probe.
+-    try:
+-        if not force_reextract:
+-            existing_chunk_hashes = await _get_memories_recov().recovery_chunk_hashes(
+-                backend=pool,
+-                fq_table=fq_table,
+-                bank_id=bank_id,
+-                document_id=effective_doc_id,
+-                content_hash=new_content_hash,
++    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
++    recovery_store = _get_memories_recov()
++    recovery_expected_hashes: dict[int, str] | None = None
++    recovery_positions: dict[int, str] | None = None
++    recovery_context = retain_params.get("context") or None
++    recovery_strategy = retain_params.get("strategy") or None
++    if (
++        recovery_store.supports_stable_chunk_reuse(pool)
++        and len(combined_content) <= MAX_STABLE_SOURCE_CHARS
++        and await asyncio.to_thread(is_jsonl_source, combined_content)
++    ):
++        # This remains active when the feature is turned OFF: existing non-greedy
++        # layouts still exist. Same body != same layout/extraction contract.
++        if full_document_body is None:
++            recovery_expected_hashes = {
++                chunk_index_offset + i: chunk_storage.compute_chunk_hash(text) for i, text in enumerate(all_pre_chunks)
++            }
++        else:
++            complete_chunks = await asyncio.to_thread(
++                _chunk_contents_for_delta, [RetainContent(content=combined_content)], config
+             )
+-            if existing_chunk_hashes:
+-                is_recovery = True
+-                log_buffer.append(
+-                    f"[streaming] RECOVERY: found {len(existing_chunk_hashes)} already-committed chunks — "
+-                    f"will skip matching and preserve existing data"
++            recovery_expected_hashes = {
++                index: chunk_storage.compute_chunk_hash(text) for index, text in complete_chunks.items()
++            }
++        recovery_positions = {}
++        if not force_reextract:
++            async with acquire_with_retry(pool) as conn:
++                compatible = await recovery_store.compatible_recovery_chunks(
++                    conn=conn,
++                    fq_table=fq_table,
++                    bank_id=bank_id,
++                    document_id=effective_doc_id,
++                    content_hash=new_content_hash,
++                    expected_hashes=recovery_expected_hashes,
++                    source_context=recovery_context,
++                    source_strategy=recovery_strategy,
+                 )
+-    except Exception:
+-        pass  # If we can't load, just process all chunks
++            if compatible is None and not is_first_batch:
++                message = "Document layout or extraction contract changed between retain slices; retry"
++                if append_base_hash is not None:
++                    raise ConcurrentAppendConflict(message)
++                raise RuntimeError(message)
++            recovery_positions = compatible or {}
++            is_recovery = bool(recovery_positions)
++    else:
++        try:
++            if not force_reextract:
++                existing_chunk_hashes = await recovery_store.recovery_chunk_hashes(
++                    backend=pool,
++                    fq_table=fq_table,
++                    bank_id=bank_id,
++                    document_id=effective_doc_id,
++                    content_hash=new_content_hash,
++                )
++                is_recovery = bool(existing_chunk_hashes)
++        except Exception:
++            pass  # Legacy stores keep their existing recovery behavior.
++    if is_recovery:
++        committed = len(recovery_positions) if recovery_positions is not None else len(existing_chunk_hashes)
++        log_buffer.append(
++            f"[streaming] RECOVERY: found {committed} already-committed chunks — "
++            "will skip matching positions and preserve existing data"
++        )
+ 
+     # ---------------------------------------------------------------------------
+     # Document tracking is DEFERRED to the first consumer batch TXN.
+@@ -2805,8 +2866,6 @@ async def _streaming_retain_batch(
+     # workers. Each batch TXN also verifies document ownership via content_hash
+     # to detect when a concurrent request has taken over the document.
+     # See _run_mini_batch_db_work() for the implementation.
+-    retain_params, merged_tags = _build_retain_params(contents_dicts, document_tags)
+-
+     # Route the document's bulky bodies (extracted text + ordered chunk texts) to the store's
+     # dedicated document store when it owns one — up front, before the streaming batches
+     # write facts. Idempotent and content-addressed, so this is safe here and dedups a re-ingest;
+@@ -2966,6 +3025,26 @@ async def _streaming_retain_batch(
+             f"Document {effective_doc_id} was updated by a concurrent retain while this append was extracting"
+         )
+ 
++    async def validate_streaming_write_layout(conn: Any) -> None:
++        """One locked guard for all three SQL streaming write entrances."""
++        if recovery_expected_hashes is None or (not is_recovery and not doc_tracking_done[0] and is_first_batch):
++            return
++        compatible = await recovery_store.compatible_recovery_chunks(
++            conn=conn,
++            fq_table=fq_table,
++            bank_id=bank_id,
++            document_id=effective_doc_id,
++            content_hash=new_content_hash,
++            expected_hashes=recovery_expected_hashes,
++            source_context=recovery_context,
++            source_strategy=recovery_strategy,
++        )
++        if compatible is None:
++            message = "Document layout or extraction contract changed before streaming write; retry"
++            if append_base_hash is not None:
++                raise ConcurrentAppendConflict(message)
++            raise RuntimeError(message)
++
+     # Every chunk task embeds only its own chunk's facts, which makes each embedding
+     # call one text wide — and in `chunks` extraction mode, where there is no LLM call
+     # to overlap, that single round trip is the whole per-chunk cost (issue #3784).
+@@ -3038,7 +3117,11 @@ async def _streaming_retain_batch(
+         try:
+             for i, chunk_text in enumerate(all_pre_chunks):
+                 chunk_hash = chunk_storage.compute_chunk_hash(chunk_text)
+-                if chunk_hash in existing_chunk_hashes:
++                if (
++                    recovery_positions.get(chunk_index_offset + i) == chunk_hash
++                    if recovery_positions is not None
++                    else chunk_hash in existing_chunk_hashes
++                ):
+                     # Memory: skipped chunks aren't needed either.
+                     all_pre_chunks[i] = ""
+                     skipped_total += 1
+@@ -3283,6 +3366,7 @@ async def _streaming_retain_batch(
+                             document_id=effective_doc_id,
+                         )
+                         _assert_append_base_unchanged(existing_hash)
++                        await validate_streaming_write_layout(conn)
+                         if is_recovery:
+                             await fact_storage.upsert_document_metadata(
+                                 conn,
+@@ -3486,6 +3570,8 @@ async def _streaming_retain_batch(
+                         document_id=effective_doc_id,
+                     )
+ 
++                    await validate_streaming_write_layout(conn)
++
+                     # True once this transaction has cleared the document: then nothing is committed yet.
+                     document_cleared = False
+                     if not doc_tracking_done[0]:
+@@ -3780,6 +3866,7 @@ async def _streaming_retain_batch(
+                         await _edge_provider.lock_pending_document(
+                             conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
+                         )
++                        await validate_streaming_write_layout(conn)
+                         if is_recovery:
+                             await fact_storage.upsert_document_metadata(
+                                 conn,
+@@ -4007,6 +4094,8 @@ async def _try_delta_retain(
+     # `full_document_body`, which is what gets WRITTEN — the two are the same for a replacement and
+     # deliberately not for an append.
+     delta_full_body: str | None = None,
++    single_input: bool = False,
++    recovery_plan_callback: Callable[[StableChunkPlan], None] | None = None,
+     document_body_hash: str | None = None,
+     append_base_hash: str | None = None,
+     attachment_loader: "RetainAttachmentLoader | None" = None,
+@@ -4046,6 +4135,14 @@ async def _try_delta_retain(
+ 
+     _delta_store = _get_memories_delta()
+     _store_owned_delta = _delta_store.store_owned_for(bank_id)
++    stable_enabled = (
++        bool(getattr(config, "retain_stable_chunks", False))
++        and config.store_document_text
++        and single_input
++        and full_document_body is None  # Never complete a whole plan inside a greedy slice.
++        and not _store_owned_delta
++        and _delta_store.supports_stable_chunk_reuse(pool)
++    )
+ 
+     # Need a single document_id
+     effective_doc_id = document_id
+@@ -4066,7 +4163,7 @@ async def _try_delta_retain(
+     # document's record in one read; that answers here when no text is wanted (the prefetch
+     # deliberately carries no bodies, so an append still reads its own). Absent from the prefetch
+     # means the document does not exist — an answer, not a miss to retry.
+-    if document_prefetch is not None and full_document_body is None:
++    if document_prefetch is not None and full_document_body is None and not stable_enabled:
+         # May be the in-flight read rather than its result -- see where it is started. Resolved
+         # here, which is the first point that actually needs it.
+         if isinstance(document_prefetch, asyncio.Task):
+@@ -4083,7 +4180,7 @@ async def _try_delta_retain(
+             fq_table=fq_table,
+             bank_id=bank_id,
+             document_id=effective_doc_id,
+-            include_text=full_document_body is not None,
++            include_text=full_document_body is not None or stable_enabled,
+         )
+     doc_hash_at_load = state.content_hash
+     # The document's tags before this retain rewrites them: a survivor's tag the document did not
+@@ -4124,7 +4221,41 @@ async def _try_delta_retain(
+     # `contents` — see the gate in `retain_batch`.
+     step_start = time.perf_counter()
+     _diff_contents = [RetainContent(content=delta_full_body)] if delta_full_body is not None else contents
+-    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
++    stable_plan: StableChunkPlan | None = None
++    if stable_enabled:
++        reuse_params = _build_retain_params(contents_dicts, document_tags)[0]
++        source_context = reuse_params.get("context") or None
++        source_strategy = reuse_params.get("strategy") or None
++        snapshots = await _delta_store.load_stable_chunks(
++            backend=pool,
++            fq_table=fq_table,
++            bank_id=bank_id,
++            document_id=effective_doc_id,
++            source_context=source_context,
++            source_strategy=source_strategy,
++        )
++        if {(s.chunk_id, s.chunk_index, s.content_hash) for s in snapshots} != {
++            (s.chunk_id, s.chunk_index, s.content_hash) for s in existing_chunks
++        }:
++            return None  # Snapshot moved, including same-hash sliced recovery.
++        new_body = "\n".join(content.content for content in contents)
++        stable_plan = await asyncio.to_thread(
++            plan_stable_chunks,
++            original_text_at_load,
++            new_body,
++            snapshots,
++            max_chars=config.retain_chunk_size,
++            structured_chunk_size=config.retain_structured_chunk_size,
++            source_context=source_context,
++            source_strategy=source_strategy,
++        )
++        if stable_plan is not None:
++            # Same-body retries with unfinished chunks must resume through streaming,
++            # not buy one large atomic extraction of everything not yet written.
++            document_body_hash = hashlib.sha256(new_body.encode()).hexdigest()
++    new_chunks_with_contents = (
++        stable_plan.texts if stable_plan is not None else _chunk_contents_for_delta(_diff_contents, config)
++    )
+     log_buffer.append(
+         f"[delta] Chunked new content: {len(new_chunks_with_contents)} chunks in {time.perf_counter() - step_start:.3f}s"
+     )
+@@ -4137,12 +4268,20 @@ async def _try_delta_retain(
+     changed_indices = diff.changed
+     new_indices = diff.new
+     removed_indices = diff.removed
+-
+-    log_buffer.append(
+-        f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
+-        f"{len(changed_indices)} changed, {len(new_indices)} new, "
+-        f"{len(removed_indices)} removed"
+-    )
++    if stable_plan is not None:
++        unchanged_indices = [chunk.chunk_index for chunk in stable_plan.chunks if chunk.reuse_from is not None]
++        changed_indices = [i for i in stable_plan.extraction_indices if i in existing_by_index]
++        new_indices = [i for i in stable_plan.extraction_indices if i not in existing_by_index]
++        retired = set(stable_plan.obsolete_ids)
++        removed_indices = [chunk.chunk_index for chunk in stable_plan.old_chunks if chunk.chunk_id in retired]
++        log_buffer.append(f"[delta] Stable chunk reuse: {asdict(stable_plan.stats)}")
++
++    if stable_plan is None:
++        log_buffer.append(
++            f"[delta] Chunk diff: {len(unchanged_indices)} unchanged, "
++            f"{len(changed_indices)} changed, {len(new_indices)} new, "
++            f"{len(removed_indices)} removed"
++        )
+ 
+     if not unchanged_indices:
+         # `delta_full_body`, not `full_document_body`: this branch is the OVERSIZED REPLACEMENT
+@@ -4188,6 +4327,8 @@ async def _try_delta_retain(
+     # probe matches this same hash and skips the committed chunks, resuming the interrupted retain
+     # slice by slice on the very path that wrote the partial copy.
+     if chunks_to_process and document_body_hash is not None and doc_hash_at_load == document_body_hash:
++        if stable_plan is not None and len(contents) == 1 and recovery_plan_callback is not None:
++            recovery_plan_callback(stable_plan)
+         log_buffer.append(
+             f"[delta] Document {effective_doc_id} is a partially written copy of this body — "
+             f"resuming slice by slice instead of extracting {len(chunks_to_process)} chunks at once"
+@@ -4321,8 +4462,12 @@ async def _try_delta_retain(
+     # compare-and-set that ADVANCES the document, so it has no way to commit facts while leaving the
+     # document at its base -- and since it never leaves a document half-written, a retry never
+     # inherits a predecessor's unwritten chunks either.
++    # Relocation has one bounded, atomic write set: splitting it would expose temporary
++    # positions and break rollback/source-lock guarantees. Ordinary deltas use upstream batches.
+     groups = (
+-        [chunks_to_process] if _store_owned_delta else _delta_batches(chunks_to_process, config.retain_chunk_batch_size)
++        [chunks_to_process]
++        if _store_owned_delta or stable_plan is not None
++        else _delta_batches(chunks_to_process, config.retain_chunk_batch_size)
+     )
+     all_unit_ids: list[list[str]] = []
+     usage = TokenUsage()
+@@ -4338,7 +4483,10 @@ async def _try_delta_retain(
+         # to it (a document accrues one trace per full/delta retain).
+         from ..llm_trace import reset_call_metadata, set_call_metadata
+ 
+-        meta_token = set_call_metadata({"document_id": effective_doc_id})
++        call_metadata: dict[str, Any] = {"document_id": effective_doc_id}
++        if stable_plan is not None:
++            call_metadata["chunk_reuse"] = asdict(stable_plan.stats)
++        meta_token = set_call_metadata(call_metadata)
+         try:
+             embedded = await _extract_and_embed(
+                 delta_contents,
+@@ -4442,51 +4590,67 @@ async def _try_delta_retain(
+                         # an append) verifies the base this content was built on.
+                         return False
+ 
+-                    stored_hashes = {
+-                        c.chunk_index: c.content_hash
+-                        for c in await _delta_store.load_existing_chunks(
+-                            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
++                    staged_reuse = None
++                    already_stored: set[int] = set()
++                    if stable_plan is not None:
++                        staged_reuse = await _delta_store.stage_stable_chunk_reuse(
++                            conn=conn,
++                            fq_table=fq_table,
++                            bank_id=bank_id,
++                            document_id=effective_doc_id,
++                            plan=stable_plan,
+                         )
+-                    }
+-                    # The hash check above cannot see a writer that is part-way through its own
+-                    # batched delta: those batches commit chunks but leave the document's hash at
+-                    # its base until the last one. Two such writers planned on the same base would
+-                    # each upsert chunks over the other's and leave both versions' facts behind.
+-                    # Any stored chunk that is neither the one this delta planned against nor the
+-                    # one it writes means another run changed the document — fall back.
+-                    moved = _chunks_moved_since_plan(
+-                        stored_hashes, {i: c.content_hash for i, c in existing_by_index.items()}, new_hashes
+-                    )
+-                    if moved:
+-                        log_buffer.append(
+-                            f"[delta] Document {effective_doc_id}: {len(moved)} chunks were changed by a "
+-                            f"concurrent retain since they were loaded — falling back to full retain"
++                        if staged_reuse is None:
++                            log_buffer.append(
++                                "[delta] Chunk snapshot moved before reuse; preserving it and falling back"
++                            )
++                            return False
++                    else:
++                        stored_hashes = {
++                            c.chunk_index: c.content_hash
++                            for c in await _delta_store.load_existing_chunks(
++                                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
++                            )
++                        }
++                        # The hash check above cannot see a writer that is part-way through its own
++                        # batched delta: those batches commit chunks but leave the document's hash at
++                        # its base until the last one. Two such writers planned on the same base would
++                        # each upsert chunks over the other's and leave both versions' facts behind.
++                        # Any stored chunk that is neither the one this delta planned against nor the
++                        # one it writes means another run changed the document — fall back.
++                        moved = _chunks_moved_since_plan(
++                            stored_hashes, {i: c.content_hash for i, c in existing_by_index.items()}, new_hashes
+                         )
+-                        logger.info("\n" + "\n".join(log_buffer) + "\n")
+-                        return False
++                        if moved:
++                            log_buffer.append(
++                                f"[delta] Document {effective_doc_id}: {len(moved)} chunks were changed by a "
++                                f"concurrent retain since they were loaded — falling back to full retain"
++                            )
++                            logger.info("\n" + "\n".join(log_buffer) + "\n")
++                            return False
+ 
+-                    # Same content, written by another run since the load above: drop the chunks
+-                    # already stored with our text, and their facts — the same guard the streaming
+-                    # batches apply (#6337).
+-                    already_stored = {
+-                        cm.chunk_index
+-                        for cm in new_chunk_metadata
+-                        if stored_hashes.get(delta_chunk_map.get(cm.chunk_index, cm.chunk_index))
+-                        == chunk_storage.compute_chunk_hash(cm.chunk_text)
+-                    }
+-                    if already_stored:
+-                        phase1 = _drop_committed_chunks(
+-                            already_stored,
+-                            new_chunk_metadata,
+-                            extracted_facts,
+-                            processed_facts,
+-                            phase1,
+-                            entity_resolver,
+-                        )
+-                        log_buffer.append(
+-                            f"  {len(already_stored)} chunks already stored by a concurrent retain "
+-                            f"of the same content — skipped with their facts"
+-                        )
++                        # Same content, written by another run since the load above: drop the chunks
++                        # already stored with our text, and their facts — the same guard the streaming
++                        # batches apply (#6337).
++                        already_stored = {
++                            cm.chunk_index
++                            for cm in new_chunk_metadata
++                            if stored_hashes.get(delta_chunk_map.get(cm.chunk_index, cm.chunk_index))
++                            == chunk_storage.compute_chunk_hash(cm.chunk_text)
++                        }
++                        if already_stored:
++                            phase1 = _drop_committed_chunks(
++                                already_stored,
++                                new_chunk_metadata,
++                                extracted_facts,
++                                processed_facts,
++                                phase1,
++                                entity_resolver,
++                            )
++                            log_buffer.append(
++                                f"  {len(already_stored)} chunks already stored by a concurrent retain "
++                                f"of the same content — skipped with their facts"
++                            )
+                     kept_indices = {delta_chunk_map.get(i, i) for i in already_stored}
+ 
+                     # Update document metadata (no delete). Only the final batch moves the document to
+@@ -4531,12 +4695,16 @@ async def _try_delta_retain(
+ 
+                     # Delete changed and removed chunks (cascades to memory_units and links)
+                     step_start = time.perf_counter()
+-                    chunks_to_delete = [
+-                        existing_by_index[idx].chunk_id
+-                        for idx in [i for i in changed_indices if i in group_set]
+-                        + (removed_indices if is_final else [])
+-                        if idx in existing_by_index and idx not in kept_indices
+-                    ]
++                    chunks_to_delete = (
++                        stable_plan.obsolete_ids
++                        if stable_plan is not None
++                        else [
++                            existing_by_index[idx].chunk_id
++                            for idx in [i for i in changed_indices if i in group_set]
++                            + (removed_indices if is_final else [])
++                            if idx in existing_by_index and idx not in kept_indices
++                        ]
++                    )
+                     invalidated_obs = await chunk_storage.delete_chunks_by_ids(
+                         conn, chunks_to_delete, bank_id, ops=pool.ops
+                     )
+@@ -4547,6 +4715,27 @@ async def _try_delta_retain(
+                         f"in {time.perf_counter() - step_start:.3f}s"
+                     )
+ 
++                    if staged_reuse is not None and stable_plan is not None:
++                        moved_fact_count = await _delta_store.finish_stable_chunk_reuse(
++                            conn=conn,
++                            fq_table=fq_table,
++                            bank_id=bank_id,
++                            document_id=effective_doc_id,
++                            staged=staged_reuse,
++                        )
++                        if operation_id:
++                            from dataclasses import replace
++
++                            summary = replace(stable_plan.stats, moved_fact_refs=moved_fact_count)
++                            await conn.execute(
++                                f"UPDATE {fq_table('async_operations')} SET result_metadata = "
++                                "COALESCE(result_metadata, '{}'::jsonb) || jsonb_build_object('chunk_reuse', $3::jsonb) "
++                                "WHERE bank_id = $1 AND operation_id = $2",
++                                bank_id,
++                                uuid.UUID(str(operation_id)),
++                                json.dumps(asdict(summary)),
++                            )
++
+                     if is_final:
+                         # Changed/removed units were deleted above. Sync unchanged
+                         # survivors; new/changed units inserted below already carry
+@@ -4667,6 +4856,9 @@ async def _try_delta_retain(
+         processed_tokens += _count_delta_content_tokens(delta_contents)
+         all_unit_ids.extend(result_unit_ids)
+     await _record_retain_document_outcome(pool, bank_id, effective_doc_id, sum(len(ids) for ids in all_unit_ids))
++    if stable_plan is not None:
++        # Stable plans accept one caller item; extraction slots are changed chunks.
++        all_unit_ids = [[identity for ids in all_unit_ids for identity in ids]]
+     return RetainBatchResult(all_unit_ids, usage, processed_tokens)
+ 
+ 
+diff --git a/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py b/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py
+new file mode 100644
+index 000000000..901fe5b2f
+--- /dev/null
++++ b/hindsight-api-slim/hindsight_api/engine/retain/stable_chunks.py
+@@ -0,0 +1,240 @@
++"""Bounded, source-ordered reuse of complete JSONL chunks.
++
++The ordinary greedy splitter remains unchanged. A historical insertion shifts its
++boundaries, however, so re-running it over the whole body needlessly replaces the
++facts of the unchanged suffix. This planner anchors complete, unique old chunks
++and cuts only the gaps. Persistence must relocate their references atomically.
++"""
++
++import hashlib
++import json
++from collections import Counter
++from dataclasses import dataclass
++from datetime import datetime
++
++from . import attachment_content
++
++MAX_STABLE_SOURCE_CHARS = 2 * 1024 * 1024
++MAX_STABLE_CHUNKS = 512
++
++
++@dataclass(frozen=True)
++class ChunkSnapshot:
++    chunk_id: str
++    chunk_index: int
++    content_hash: str | None
++    chunk_text: str
++    created_at: datetime | None = None
++
++
++@dataclass(frozen=True)
++class PlannedChunk:
++    chunk_index: int
++    text: str
++    reuse_from: str | None = None
++
++
++@dataclass(frozen=True)
++class ChunkReuseStats:
++    old_chunks: int
++    new_chunks: int
++    reused_chunks: int
++    moved_chunks: int
++    retired_chunks: int
++    extraction_chunks: int
++    extraction_chars: int
++    moved_fact_refs: int | None = None
++
++
++@dataclass(frozen=True)
++class StableChunkPlan:
++    old_chunks: list[ChunkSnapshot]
++    chunks: list[PlannedChunk]
++    source_context: str | None = None
++    source_strategy: str | None = None
++
++    @property
++    def texts(self) -> dict[int, str]:
++        return {chunk.chunk_index: chunk.text for chunk in self.chunks}
++
++    @property
++    def reused_ids(self) -> set[str]:
++        return {chunk.reuse_from for chunk in self.chunks if chunk.reuse_from is not None}
++
++    @property
++    def obsolete_ids(self) -> list[str]:
++        reused = self.reused_ids
++        return [chunk.chunk_id for chunk in self.old_chunks if chunk.chunk_id not in reused]
++
++    @property
++    def extraction_indices(self) -> list[int]:
++        return [chunk.chunk_index for chunk in self.chunks if chunk.reuse_from is None]
++
++    @property
++    def stats(self) -> ChunkReuseStats:
++        return ChunkReuseStats(
++            old_chunks=len(self.old_chunks),
++            new_chunks=len(self.chunks),
++            reused_chunks=len(self.reused_ids),
++            moved_chunks=self.moved_count,
++            retired_chunks=len(self.obsolete_ids),
++            extraction_chunks=len(self.extraction_indices),
++            extraction_chars=sum(len(chunk.text) for chunk in self.chunks if chunk.reuse_from is None),
++        )
++
++    @property
++    def moved_count(self) -> int:
++        indices = {chunk.chunk_id: chunk.chunk_index for chunk in self.old_chunks}
++        return sum(
++            chunk.reuse_from is not None and indices[chunk.reuse_from] != chunk.chunk_index for chunk in self.chunks
++        )
++
++
++@dataclass(frozen=True)
++class StagedChunkMove:
++    original: ChunkSnapshot
++    temporary_id: str
++    temporary_index: int
++    target_id: str
++    target_index: int
++
++
++@dataclass(frozen=True)
++class StagedChunkReuse:
++    moves: list[StagedChunkMove]
++
++
++def is_jsonl_source(text: str, minimum_lines: int = 2) -> bool:
++    lines = [line for line in text.splitlines() if line.strip()]
++    if len(lines) < minimum_lines:
++        return False
++    try:
++        return all(isinstance(json.loads(line), dict) for line in lines)
++    except (ValueError, TypeError):
++        return False
++
++
++def fits_stable_chunk_budget(text: str, max_chars: int, structured_chunk_size: int | None) -> bool:
++    """Stop at the first over-budget chunk before bypassing the outer splitter."""
++    from . import fact_extraction
++
++    if len(text) > MAX_STABLE_SOURCE_CHARS:
++        return False
++    for index, _chunk in enumerate(
++        fact_extraction.iter_chunks(text, max_chars, structured_chunk_size=structured_chunk_size)
++    ):
++        if index >= MAX_STABLE_CHUNKS:
++            return False
++    return True
++
++
++def _at_line_boundaries(body: str, start: int, end: int) -> bool:
++    return (start == 0 or body[start - 1] == "\n") and (end == len(body) or body[end] == "\n")
++
++
++def plan_stable_chunks(
++    old_body: str | None,
++    new_body: str,
++    old_chunks: list[ChunkSnapshot],
++    *,
++    max_chars: int,
++    structured_chunk_size: int | None,
++    source_context: str | None = None,
++    source_strategy: str | None = None,
++) -> StableChunkPlan | None:
++    """Plan exact anchors, or decline to the existing path without changing data.
++
++    Repeated old chunks and ambiguous new occurrences are not interchangeable:
++    their facts have distinct provenance. Partial JSON turns and attachments also
++    keep the ordinary path rather than crossing extraction/vision boundaries.
++    Work is bounded and the caller runs it outside the serving event loop.
++    """
++    from . import fact_extraction
++
++    if (
++        not old_body
++        or max(len(old_body), len(new_body)) > MAX_STABLE_SOURCE_CHARS
++        or not old_chunks
++        or len(old_chunks) > MAX_STABLE_CHUNKS
++        or max_chars <= 0
++        or not is_jsonl_source(old_body)
++        or not is_jsonl_source(new_body)
++        or attachment_content.contains_attachment(old_body)
++        or attachment_content.contains_attachment(new_body)
++    ):
++        return None
++    old_chunks = sorted(old_chunks, key=lambda chunk: chunk.chunk_index)
++    if [chunk.chunk_index for chunk in old_chunks] != list(range(len(old_chunks))):
++        return None
++    # A completed exact-body retry already has occurrence identity and complete
++    # coverage. Keep even tiny tails/repeated chunks in place; anchor heuristics
++    # must not make it look like an interrupted write. A partial recovery's chunk
++    # prefix does not cover the stored full body and cannot take this shortcut.
++    if old_body == new_body and "\n".join(chunk.chunk_text for chunk in old_chunks) == old_body:
++        try:
++            verified = all(
++                chunk.content_hash == hashlib.sha256(chunk.chunk_text.encode()).hexdigest() for chunk in old_chunks
++            )
++        except UnicodeEncodeError:
++            return None
++        if verified:
++            return StableChunkPlan(
++                old_chunks=old_chunks,
++                source_context=source_context,
++                source_strategy=source_strategy,
++                chunks=[
++                    PlannedChunk(chunk_index=chunk.chunk_index, text=chunk.chunk_text, reuse_from=chunk.chunk_id)
++                    for chunk in old_chunks
++                ],
++            )
++    frequencies = Counter(chunk.content_hash for chunk in old_chunks)
++    plan: list[PlannedChunk] = []
++    old_cursor = 0
++    new_cursor = 0
++
++    def append_gap(start: int, end: int) -> None:
++        text = new_body[start:end].strip("\n")
++        if not text.strip():
++            return
++        for chunk in fact_extraction.iter_chunks(text, max_chars, structured_chunk_size=structured_chunk_size):
++            if chunk:
++                plan.append(PlannedChunk(chunk_index=len(plan), text=chunk))
++
++    for old in old_chunks:
++        text = old.chunk_text
++        try:
++            actual_hash = hashlib.sha256(text.encode()).hexdigest()
++        except UnicodeEncodeError:
++            return None
++        if not old.content_hash or actual_hash != old.content_hash:
++            return None
++        if not text or frequencies[old.content_hash] != 1:
++            continue
++        if fact_extraction.chunk_text(text, max_chars, structured_chunk_size=structured_chunk_size) != [text]:
++            continue
++        old_start = old_body.find(text)
++        if old_start < old_cursor or old_body.find(text, old_start + 1) >= 0:
++            continue
++        old_end = old_start + len(text)
++        old_cursor = old_end
++        if not _at_line_boundaries(old_body, old_start, old_end):
++            continue
++        start = new_body.find(text)
++        if start < new_cursor or new_body.find(text, start + 1) >= 0:
++            continue
++        end = start + len(text)
++        if not _at_line_boundaries(new_body, start, end):
++            continue
++        # Repack a growing tail so repeated tiny appends do not each add a chunk.
++        if old.chunk_index == len(old_chunks) - 1 and not old_body[old_end:].strip() and new_body[end:].strip():
++            continue
++        append_gap(new_cursor, start)
++        plan.append(PlannedChunk(chunk_index=len(plan), text=text, reuse_from=old.chunk_id))
++        new_cursor = end
++    append_gap(new_cursor, len(new_body))
++    result = StableChunkPlan(
++        old_chunks=old_chunks, chunks=plan, source_context=source_context, source_strategy=source_strategy
++    )
++    if not result.reused_ids or len(plan) > MAX_STABLE_CHUNKS:
++        return None
++    return result
+diff --git a/hindsight-api-slim/hindsight_api/worker/poller.py b/hindsight-api-slim/hindsight_api/worker/poller.py
+index 2d9205ed5..064d9aba2 100644
+--- a/hindsight-api-slim/hindsight_api/worker/poller.py
++++ b/hindsight-api-slim/hindsight_api/worker/poller.py
+@@ -1183,32 +1183,42 @@ class WorkerPoller:
+         operation_type = task.task_dict.get("operation_type", "unknown")
+         bank_id = task.task_dict.get("bank_id", "unknown")
+ 
+-        # Stage holder is updated by engine code via stage.set_stage(); the
+-        # poller reads it during periodic logging to surface what each
+-        # in-flight task is doing.
+-        holder = StageHolder(stage=f"queued.{task_type}")
+-
+-        # Create background task. The holder is passed in and bound to the
+-        # task's own contextvar scope inside _execute_task_inner so engine
+-        # code running under that task sees it via stage.set_stage().
+-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+-
+-        # Track this task as active
++        # Reserved slots are a floor, not a cap. Starting every claimed refresh
++        # while only two LLM permits exist burns the other jobs' wall budgets in
++        # the semaphore queue. Keep excess refreshes pending instead; admission
++        # and in-flight registration share the lock so concurrent callers agree.
++        refresh_limit = get_config().mental_model_refresh_llm_max_concurrent
++        deferred = False
+         async with self._in_flight_lock:
+-            self._active_tasks[task.operation_id] = ActiveTaskInfo(
+-                op_type=operation_type,
+-                bank_id=bank_id,
+-                schema=task.schema,
+-                bg_task=bg_task,
+-                started_at=time.monotonic(),
+-                stage_holder=holder,
+-                task_type=task_type,
++            if (
++                task_type == "refresh_mental_model"
++                and refresh_limit is not None
++                and refresh_limit > 0
++                and self._in_flight_by_type.get(operation_type, 0) >= refresh_limit
++            ):
++                deferred = True
++            else:
++                holder = StageHolder(stage=f"queued.{task_type}")
++                bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
++                self._active_tasks[task.operation_id] = ActiveTaskInfo(
++                    op_type=operation_type,
++                    bank_id=bank_id,
++                    schema=task.schema,
++                    bg_task=bg_task,
++                    started_at=time.monotonic(),
++                    stage_holder=holder,
++                    task_type=task_type,
++                )
++                self._in_flight_count += 1
++                self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
++                bg_task.add_done_callback(
++                    lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type))
++                )
++        if deferred:
++            retry_at = datetime.now(timezone.utc) + timedelta(seconds=get_config().worker_task_retry_backoff_seconds)
++            await self._write_terminal(
++                task, "deferred", lambda: self._defer_all(task, retry_at, "waiting for refresh execution capacity")
+             )
+-            self._in_flight_count += 1
+-            self._in_flight_by_type[operation_type] = self._in_flight_by_type.get(operation_type, 0) + 1
+-
+-        # Add cleanup callback
+-        bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
+ 
+     async def _cleanup_task(self, operation_id: str, operation_type: str):
+         """Remove task from tracking after completion."""
+@@ -1243,6 +1253,8 @@ class WorkerPoller:
+         # consolidation ceiling from "total runtime" into "time without progress".
+         try:
+             async with asyncio.timeout(wall_timeout) as cm:
++                if holder is not None and not ceiling.extends_on_progress:
++                    holder.deadline = cm.when()
+                 if progress_holder is not None:
+ 
+                     def _extend_deadline() -> None:
+@@ -1263,6 +1275,7 @@ class WorkerPoller:
+                 finally:
+                     if holder is not None:
+                         holder.on_progress = None
++                        holder.deadline = None
+         except asyncio.TimeoutError as e:
+             if cm.expired():
+                 raise _WallTimeoutExceeded(wall_timeout, ceiling) from e
+@@ -1341,9 +1354,18 @@ class WorkerPoller:
+             stage = holder.stage if holder is not None else "unknown"
+             message = e.describe(task_type, stage)
+             logger.error(f"Task {task.operation_id} timed out: {message}")
+-            await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
+-            await self._notify_wall_timeout(task, message, stage)
+-            terminal_success = False
++            config = get_config()
++            if (
++                task_type == "refresh_mental_model"
++                and stage.endswith(".queued")
++                and task.task_dict.get("_retry_count", 0) < config.worker_max_retries
++            ):
++                retry_at = datetime.now(timezone.utc) + timedelta(seconds=config.worker_task_retry_backoff_seconds)
++                await self._write_terminal(task, "retry", lambda: self._schedule_retry_all(task, retry_at, message))
++            else:
++                await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
++                await self._notify_wall_timeout(task, message, stage)
++                terminal_success = False
+         except DeferOperation as e:
+             # Deferral is not a terminal outcome — do not record a completion.
+             defer = e
+diff --git a/hindsight-api-slim/hindsight_api/worker/stage.py b/hindsight-api-slim/hindsight_api/worker/stage.py
+index 9bd2f53d9..00be81702 100644
+--- a/hindsight-api-slim/hindsight_api/worker/stage.py
++++ b/hindsight-api-slim/hindsight_api/worker/stage.py
+@@ -31,6 +31,9 @@ class StageHolder:
+     #: nobody has looked at it yet. Must not raise — it runs on the engine's hot
+     #: path, and a stage breadcrumb is never worth failing a task over.
+     on_progress: Callable[[], None] | None = None
++    # Absolute asyncio loop time for a whole-task ceiling (not an idle ceiling).
++    # Nested edit stages honor the remaining budget instead of starting work past it.
++    deadline: float | None = None
+ 
+ 
+ _current_holder: ContextVar[StageHolder | None] = ContextVar("hindsight_stage_holder", default=None)
+@@ -63,6 +66,12 @@ def set_stage(name: str) -> None:
+         holder.on_progress()
+ 
+ 
++def get_task_deadline() -> float | None:
++    """The active task's absolute deadline, or unknown outside an absolute-ceiling task."""
++    holder = _current_holder.get()
++    return holder.deadline if holder is not None else None
++
++
+ def get_stage() -> str | None:
+     """Return the current stage label, or None if no holder is bound."""
+     holder = _current_holder.get()
+diff --git a/hindsight-api-slim/pyproject.toml b/hindsight-api-slim/pyproject.toml
+index e9392db78..7e0f17b88 100644
+--- a/hindsight-api-slim/pyproject.toml
++++ b/hindsight-api-slim/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
+ 
+ [project]
+ name = "hindsight-api-slim"
+-version = "1.2.1"
++version = "1.2.1+fork.2"
+ description = "Hindsight: Agent Memory That Learns"
+ license = "MIT"
+ readme = "README.md"

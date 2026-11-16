@@ -302,6 +302,15 @@ class _RateLimitedOnceSession(_SufficiencySession):
 
 
 class TestSufficiency:
+    def test_configured_question_budget_overrides_default(self):
+        encoder = TypeSafeCrossEncoder(api_key="k", max_question_tokens=11_000)
+
+        assert encoder.MAX_QUESTION_TOKENS == 11_000
+
+    def test_configured_question_budget_cannot_skip_retry_floor(self):
+        with pytest.raises(ValueError, match="max_question_tokens must be at least"):
+            TypeSafeCrossEncoder(api_key="k", max_question_tokens=2_999)
+
     @pytest.mark.asyncio
     async def test_a_rate_limit_is_retried_not_read_as_not_enough(self):
         """A 429 used to fail the verdict, and reflect then ran the agent turns it exists to save."""

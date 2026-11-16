@@ -178,9 +178,9 @@ are separately identifiable. A rejected or interrupted validation is retained as
 
 Current stable update candidate (source/PR acceptance only, not installation):
 
-- API `1.2.1-fork.1` / Python `1.2.1+fork.1`: exact upstream `v1.2.1`,
+- API `1.2.1-fork.2` / Python `1.2.1+fork.2`: exact upstream `v1.2.1`,
   `0eb02d8c418eac6b489bc63883c993b2257dfac4`, plus
-  [.github/patches/api-1.2.1-fork.1.patch](patches/api-1.2.1-fork.1.patch).
+  [.github/patches/api-1.2.1-fork.2.patch](patches/api-1.2.1-fork.2.patch). The fork.2 overlay additionally aligns TypeSafe decision requests with the configured self-hosted decision endpoint context budget.
   The maintenance API production tree equals this export plus overlay. The full
   official wrapper keeps its `==1.2.1` dependency, satisfied by the local version.
 - Coding Agents `0.8.7-fork.1`: npm `0.8.7` source

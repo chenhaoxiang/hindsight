@@ -1351,11 +1351,19 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
         shortlist: int | None = None,
         min_keep: int | None = None,
+        max_question_tokens: int | None = None,
     ):
         if shortlist is not None:
             self.SHORTLIST = shortlist
         if min_keep is not None:
             self.MIN_KEEP = min_keep
+        if max_question_tokens is not None:
+            if max_question_tokens < self.MIN_QUESTION_TOKENS:
+                raise ValueError(
+                    f"max_question_tokens must be at least {self.MIN_QUESTION_TOKENS}, "
+                    f"not {max_question_tokens}"
+                )
+            self.MAX_QUESTION_TOKENS = max_question_tokens
         # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
         # built with every field zeroed) by falling back to the default.
         self.model = model or DEFAULT_RERANKER_TYPESAFE_MODEL
