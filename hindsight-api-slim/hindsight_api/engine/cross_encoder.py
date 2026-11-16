@@ -869,6 +869,7 @@ class CohereCrossEncoder(CrossEncoderModel):
         base_url: str | None = None,
         timeout: float = 60.0,
         max_concurrent: int = DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
+        tokenizer_max_concurrent: int = 4,
         tokenizer_url: str | None = None,
         max_input_tokens: int | None = None,
         token_overhead: int = DEFAULT_RERANKER_COHERE_TOKEN_OVERHEAD,
@@ -898,6 +899,7 @@ class CohereCrossEncoder(CrossEncoderModel):
                 api_key=api_key,
                 max_input_tokens=max_input_tokens,
                 token_overhead=token_overhead,
+                max_concurrent=tokenizer_max_concurrent,
                 timeout=timeout,
             )
             if tokenizer_url is not None and max_input_tokens is not None
@@ -2941,6 +2943,7 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             base_url=member.cohere_base_url,
             timeout=member.cohere_timeout,
             max_concurrent=member.cohere_max_concurrent,
+            tokenizer_max_concurrent=member.cohere_tokenizer_max_concurrent,
             tokenizer_url=member.cohere_tokenizer_url,
             max_input_tokens=member.cohere_max_input_tokens,
             token_overhead=member.cohere_token_overhead,
