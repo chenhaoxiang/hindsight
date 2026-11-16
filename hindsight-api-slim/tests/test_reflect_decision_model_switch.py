@@ -150,3 +150,28 @@ def test_a_system_one_provider_drives_reflect(engine, monkeypatch, provider):
     # Its cut and verdict are retried like the shared decision model's calls: a single 429 used
     # to drop them, and that round answered like agent mode.
     assert client.retry_policy is not None
+
+
+def test_low_shared_budget_keeps_type_safe_retry_floor(engine, monkeypatch):
+    """A shared budget below TypeSafe's retry floor must not break reflect/page setup."""
+    from hindsight_api.config import DecisionModelConfig
+    from hindsight_api.engine.cross_encoder import TypeSafeCrossEncoder
+
+    setup = DecisionModelConfig(
+        provider="hindsight",
+        api_key="k",
+        model="m",
+        base_url="https://example.invalid",
+        timeout=5.0,
+        max_concurrent=1,
+        max_request_tokens=2_000,
+    )
+    monkeypatch.setattr(
+        "hindsight_api.engine.memory_engine.get_config",
+        lambda: SimpleNamespace(decision_model_config=lambda operation: setup),
+    )
+    monkeypatch.setattr(engine, "_reflect_decision_model_client", None)
+
+    client = engine._reflect_decision_model()
+    assert client is not None
+    assert client.MAX_QUESTION_TOKENS == TypeSafeCrossEncoder.MAX_QUESTION_TOKENS

@@ -16082,6 +16082,21 @@ class MemoryEngine(MemoryEngineInterface):
                         setup.provider,
                     )
                 return None
+            max_question_tokens = setup.max_request_tokens
+            if (
+                max_question_tokens is not None
+                and max_question_tokens < TypeSafeCrossEncoder.MIN_QUESTION_TOKENS
+            ):
+                # The shared DecisionModel floor is lower than TypeSafe's retry floor.
+                # Do not turn a valid shared-model setting into a page/reflect startup
+                # failure; leave the TypeSafe client on its historical safe default.
+                logger.warning(
+                    "Decision model max_request_tokens=%s is below TypeSafe's retry floor %s; "
+                    "using the TypeSafe default question budget",
+                    max_question_tokens,
+                    TypeSafeCrossEncoder.MIN_QUESTION_TOKENS,
+                )
+                max_question_tokens = None
             self._reflect_decision_model_client = TypeSafeCrossEncoder(
                 api_key=setup.api_key,
                 model=setup.model,
@@ -16090,14 +16105,14 @@ class MemoryEngine(MemoryEngineInterface):
                 max_concurrent=setup.max_concurrent,
                 prune_candidates=True,
                 # The recall cut keeps at most 12; a reflect answer can need more (a count
-                # over seven customers is seven facts plus the observations about them).
+                # over seven customers can be seven facts plus the observations about them).
                 # The floor guards the cut's coarse levels: on that count it kept five.
                 shortlist=25,
                 min_keep=15,
                 # The shared decision-model request ceiling is also the endpoint's
                 # context budget. Keep reflect/page decisions from probing the
                 # historical 26k default against a smaller self-hosted endpoint.
-                max_question_tokens=setup.max_request_tokens,
+                max_question_tokens=max_question_tokens,
             )
             # Retried like the shared decision model (DecisionModel.ask): without it a single 429
             # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)

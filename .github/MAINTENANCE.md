@@ -261,10 +261,11 @@ Preserve all previous overlays and Releases byte-for-byte:
 Build only from committed public source into ignored temporary directories. A
 fresh API export can be prepared with `git archive` at the exact API base (`v1.2.1`
 for the current candidate). From
-the maintenance repository root, apply the committed zero-context overlay with
-`git apply --unidiff-zero --directory=tmp/api-1.2.1-src .github/patches/api-1.2.1-fork.1.patch`.
-Use a fresh export and verify the resulting source bytes; this avoids patch-tool
-backup files entering the package. Build its
+the maintenance repository root, apply the committed fork.2 overlay with
+`git apply --directory=tmp/api-1.2.1-src .github/patches/api-1.2.1-fork.2.patch`.
+Keep the immutable fork.1 overlay for historical reproduction. Use a fresh export and
+verify the resulting source bytes; this avoids patch-tool backup files entering the package.
+Build its
 `hindsight-api-slim` wheel there with `uv build --package hindsight-api-slim --wheel`.
 The integration uses its committed lockfile, generated skill and `npm run build`,
 then `npm pack --ignore-scripts`. These operations are builds, not publication.

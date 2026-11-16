@@ -1056,7 +1056,7 @@ index 823f3373b..b953e2c9d 100644
          self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
      ) -> list[ExistingChunk]:
 diff --git a/hindsight-api-slim/hindsight_api/engine/memory_engine.py b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
-index 497114bdd..4821e9fd3 100644
+index 497114bdd..1e33ecf78 100644
 --- a/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 +++ b/hindsight-api-slim/hindsight_api/engine/memory_engine.py
 @@ -26,7 +26,7 @@ import time
@@ -1203,18 +1203,45 @@ index 497114bdd..4821e9fd3 100644
              chunking_config = self._retain_chunking_config(retain_config)
  
              # In update_mode="append", retain_batch prepends the existing document
-@@ -16029,6 +16094,10 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -16017,6 +16082,21 @@ class MemoryEngine(MemoryEngineInterface):
+                         setup.provider,
+                     )
+                 return None
++            max_question_tokens = setup.max_request_tokens
++            if (
++                max_question_tokens is not None
++                and max_question_tokens < TypeSafeCrossEncoder.MIN_QUESTION_TOKENS
++            ):
++                # The shared DecisionModel floor is lower than TypeSafe's retry floor.
++                # Do not turn a valid shared-model setting into a page/reflect startup
++                # failure; leave the TypeSafe client on its historical safe default.
++                logger.warning(
++                    "Decision model max_request_tokens=%s is below TypeSafe's retry floor %s; "
++                    "using the TypeSafe default question budget",
++                    max_question_tokens,
++                    TypeSafeCrossEncoder.MIN_QUESTION_TOKENS,
++                )
++                max_question_tokens = None
+             self._reflect_decision_model_client = TypeSafeCrossEncoder(
+                 api_key=setup.api_key,
+                 model=setup.model,
+@@ -16025,10 +16105,14 @@ class MemoryEngine(MemoryEngineInterface):
+                 max_concurrent=setup.max_concurrent,
+                 prune_candidates=True,
+                 # The recall cut keeps at most 12; a reflect answer can need more (a count
+-                # over seven customers is seven facts plus the observations about them).
++                # over seven customers can be seven facts plus the observations about them).
                  # The floor guards the cut's coarse levels: on that count it kept five.
                  shortlist=25,
                  min_keep=15,
 +                # The shared decision-model request ceiling is also the endpoint's
 +                # context budget. Keep reflect/page decisions from probing the
 +                # historical 26k default against a smaller self-hosted endpoint.
-+                max_question_tokens=setup.max_request_tokens,
++                max_question_tokens=max_question_tokens,
              )
              # Retried like the shared decision model (DecisionModel.ask): without it a single 429
              # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)
-@@ -18858,6 +18927,17 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18858,6 +18942,17 @@ class MemoryEngine(MemoryEngineInterface):
          # Both op calls share one LLM handle, built on first use so a refresh that
          # neither retracts nor has new facts still pays no config resolution.
          _op_llm_config: ConfiguredLLMProvider | None = None
@@ -1232,7 +1259,7 @@ index 497114bdd..4821e9fd3 100644
  
          async def _op_llm() -> ConfiguredLLMProvider:
              nonlocal _op_llm_config
-@@ -18925,6 +19005,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18925,6 +19020,7 @@ class MemoryEngine(MemoryEngineInterface):
                              system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
                              user_prompt=unsay_prompt,
                              scope="mental_model_retraction_ops",
@@ -1240,7 +1267,7 @@ index 497114bdd..4821e9fd3 100644
                              max_completion_tokens=get_config().reflect_max_completion_tokens,
                              temperature=get_config().llm_temperature_mental_model_refresh,
                          )
-@@ -18948,6 +19029,13 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -18948,6 +19044,13 @@ class MemoryEngine(MemoryEngineInterface):
                              f"{len(unsay_outcome.applied)} op(s), skipped {len(unsay_outcome.skipped)}"
                          )
                      except Exception as exc:
@@ -1254,7 +1281,7 @@ index 497114bdd..4821e9fd3 100644
                          # Leave based_on alone so the next refresh sees the same
                          # retraction and tries again.
                          logger.warning(
-@@ -19056,6 +19144,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -19056,6 +19159,7 @@ class MemoryEngine(MemoryEngineInterface):
                          system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
                          user_prompt=user_prompt,
                          scope="mental_model_delta_ops",
@@ -1262,7 +1289,7 @@ index 497114bdd..4821e9fd3 100644
                          document=current_doc,
                          response_format=DeltaOperationList,
                          strict_schema=get_config().llm_strict_schema_reflect,
-@@ -19107,6 +19196,13 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -19107,6 +19211,13 @@ class MemoryEngine(MemoryEngineInterface):
                                  "operations for the reason each was dropped."
                              )
                  except Exception as exc:
@@ -1276,7 +1303,7 @@ index 497114bdd..4821e9fd3 100644
                      logger.warning(
                          f"[MENTAL_MODELS] Structured delta failed for {mental_model_id} "
                          f"({exc}); delta operations were not applied"
-@@ -20816,12 +20912,16 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20816,12 +20927,16 @@ class MemoryEngine(MemoryEngineInterface):
          """Doc-level hybrid search over a bank's pages.
  
          Fuses a full-text (BM25) match over the page name + content with vector
@@ -1296,7 +1323,7 @@ index 497114bdd..4821e9fd3 100644
          on this query: every arm at rank 1. It is a *rank* score, not a relevance
          one — it says where a page placed, never how well it matched, so it is
          only meaningful against the other results for the same query. A one-arm
-@@ -20862,13 +20962,49 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20862,13 +20977,49 @@ class MemoryEngine(MemoryEngineInterface):
  
          from .retain import embedding_utils
  
@@ -1350,7 +1377,7 @@ index 497114bdd..4821e9fd3 100644
  
          # A store that indexes pages answers the ranking; Postgres still hydrates it. The store is
          # given the whole page set and knows nothing about folders, so the join below is what keeps
-@@ -20885,7 +21021,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20885,7 +21036,7 @@ class MemoryEngine(MemoryEngineInterface):
                  limit=fetch,
              )
              if not matches:
@@ -1359,7 +1386,7 @@ index 497114bdd..4821e9fd3 100644
              order = {m.page_id: i for i, m in enumerate(matches)}
              # ponytail: the store ranks the whole page set, so a filter applied at hydration can
              # leave fewer than `limit` hits; push the filter into the store protocol if that bites.
-@@ -20923,7 +21059,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20923,7 +21074,7 @@ class MemoryEngine(MemoryEngineInterface):
                  if r["mental_model_id"] in order
              ]
              out.sort(key=lambda d: order[cast(str, d["mental_model_id"])])
@@ -1368,7 +1395,7 @@ index 497114bdd..4821e9fd3 100644
  
          # BM25 clauses for the configured text-search backend (same per-backend
          # dispatch the memory-recall BM25 arm uses — see page_bm25_arm).
-@@ -20947,7 +21083,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -20947,7 +21098,7 @@ class MemoryEngine(MemoryEngineInterface):
          tokens = tokenize_query(query) if enable_text_search else []
          include_bm25 = bool(tokens)
          if not include_bm25 and emb_str is None:
@@ -1377,7 +1404,7 @@ index 497114bdd..4821e9fd3 100644
  
          backend = await self._get_backend()
          async with acquire_with_retry(backend) as conn:
-@@ -21062,7 +21198,7 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -21062,7 +21213,7 @@ class MemoryEngine(MemoryEngineInterface):
                      """
                      rows = await conn.fetch(sql, bank_id, bm25_text, *tags_clause.params)
  
@@ -1386,7 +1413,7 @@ index 497114bdd..4821e9fd3 100644
              {
                  "id": r["id"],
                  "name": r["name"],
-@@ -21073,7 +21209,9 @@ class MemoryEngine(MemoryEngineInterface):
+@@ -21073,7 +21224,9 @@ class MemoryEngine(MemoryEngineInterface):
                  "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
              }
              for r in rows
