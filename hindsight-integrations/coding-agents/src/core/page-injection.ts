@@ -85,7 +85,10 @@ const TOOL_GUIDE =
   "This filters memory updated_at, not event dates. It is a bounded list, not semantic search; " +
   "truncated results are not exhaustive. Do not treat recall's temporal ranking as a strict filter.\n" +
   "  Page freshness is a scoped-write signal, not proof of correctness; missing metadata is unknown " +
-  "and deletions are not observed. Follow next_offset for bounded page reads/rosters.\n" +
+  "and deletions are not observed. For current-state questions, page snippets/bodies are never " +
+  "returned or injected: the page-search gate returns only raw-facts-required or explicit unknown " +
+  "metadata; call hindsight_recall/hindsight_recent_memories explicitly, with no hidden follow-up. Follow " +
+  "next_offset for bounded page reads/rosters.\n" +
   "- hindsight_reflect(query) — when pages/facts are too shallow and you need the WHY: deep reasoning over the " +
   "repo's full memory for the past decision and exact values that explain a behavior or bug (slower — " +
   'use deliberately, and credit results with a blockquote header "> 🧠 **From Hindsight memory** — <summary>").\n' +

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -36,6 +37,27 @@ const PAGES_HEADER = "Project knowledge from Hindsight, this repository's long-t
 
 /** A prompt overlapping the "Retry backoff" section (pages still must not inject). */
 const MATCHING_PROMPT = "why does the upload retry backoff fail?";
+const CURRENT_STATE_CASE_VARIANTS = [
+  "What is the current upload retry status?",
+  "What is the CURRENT upload retry status?",
+  "What is the Latest upload retry status?",
+  "What is the cUrReNt upload retry status?",
+  "What was the upload retry status AS OF yesterday?",
+  "当前状态是什么？",
+] as const;
+const CODE_ORIENTED_STATUS_VARIANTS = [
+  "How does the status code mapping work?",
+  "How does the STATUS CODE mapping work?",
+  "status-code",
+  "STATUS-CODE",
+  "status_code",
+  "STATUS_CODE",
+  "status()",
+  "status (value)",
+  "status = current",
+  "status:=current",
+  "request.status",
+] as const;
 /** A prompt matching nothing in the page. */
 const UNRELATED_PROMPT = "completely unrelated banana smoothie question";
 
@@ -46,8 +68,18 @@ function makeClient(
     getPage: (pageId: string) => Promise<unknown>;
     searchPages: (
       query: string,
-      opts?: { limit?: number; timeoutMs?: number }
-    ) => Promise<{ id: string; name: string; snippet: string }[]>;
+      opts?: { limit?: number; timeoutMs?: number; includeFreshness?: boolean }
+    ) => Promise<
+      {
+        id: string;
+        name: string;
+        snippet: string;
+        freshness?: {
+          state: "unknown" | "stale" | "refresh_failed" | "no_scoped_writes_reported";
+          source_watermark_available: boolean;
+        };
+      }[]
+    >;
     recallObservations: (query: string, opts: { timeoutMs: number }) => Promise<string[]>;
   }> = {}
 ) {
@@ -538,6 +570,482 @@ describe("buildHookOutput", () => {
     expect(next.context ?? "").not.toContain("<hindsight_memory>");
   });
 
+  it.each(CODE_ORIENTED_STATUS_VARIANTS)(
+    "autoInject pages keeps %s on the ordinary stable path",
+    async (prompt) => {
+      const client = makeClient({
+        searchPages: vi.fn(async () => [
+          { id: "mapping", name: "Status mapping", snippet: "stable mapping details" },
+        ]),
+      });
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt,
+        cfg: resolveConfig({ autoInject: "pages" }),
+        client,
+        cacheFile,
+      });
+
+      expect(client.searchPages).toHaveBeenCalledWith(prompt, { timeoutMs: 7000 });
+      expect(client.reflect).not.toHaveBeenCalled();
+      expect(out.context).toContain("Status mapping (mapping): stable mapping details");
+      expect(out.context ?? "").not.toContain("<hindsight_current_state_gate>");
+    }
+  );
+
+  it.each(CODE_ORIENTED_STATUS_VARIANTS)(
+    "autoInject reflect keeps %s on the ordinary stable path",
+    async (prompt) => {
+      const client = makeClient({
+        reflect: vi.fn(async () => "STATUS_CODE_REFLECT_ANSWER"),
+      });
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt,
+        cfg: resolveConfig({}),
+        client,
+        cacheFile,
+      });
+
+      expect(client.reflect).toHaveBeenCalledTimes(1);
+      expect(out.context).toContain("STATUS_CODE_REFLECT_ANSWER");
+      expect(out.context ?? "").not.toContain("<hindsight_current_state_gate>");
+      expect(out.notice ?? "").not.toContain("current-state gate");
+    }
+  );
+
+  it.each(CURRENT_STATE_CASE_VARIANTS)(
+    "autoInject pages: current-state queries withhold unsafe pages and never recall implicitly (%s)",
+    async (prompt) => {
+      const client = makeClient({
+        searchPages: vi.fn(async () => [
+          {
+            id: "stale",
+            name: "Stale policy",
+            snippet: "unsafe stale answer",
+            freshness: { state: "stale", source_watermark_available: true } as const,
+          },
+          {
+            id: "safe",
+            name: "Watermarked policy",
+            snippet: "historical page answer",
+            freshness: {
+              state: "no_scoped_writes_reported",
+              source_watermark_available: true,
+            } as const,
+          },
+        ]),
+        recallObservations: vi.fn(async () => ["raw fallback must not run"]),
+      });
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt,
+        cfg: resolveConfig({ autoInject: "pages" }),
+        client,
+        cacheFile,
+      });
+
+      expect(client.searchPages).toHaveBeenCalledWith(prompt, {
+        timeoutMs: 7000,
+        includeFreshness: true,
+      });
+      expect(client.recallObservations).not.toHaveBeenCalled();
+      // Current-state gates are metadata-only: even a freshness-safe page must not expose its title,
+      // snippet, or body through automatic injection.
+      expect(out.context).not.toContain("Watermarked policy");
+      expect(out.context).not.toContain("historical page answer");
+      expect(out.context).not.toContain("unsafe stale answer");
+      expect(out.context).toContain('"status":"current_fact_unverified"');
+      expect(out.context).toContain('"raw_facts_required":true');
+      expect(out.context).toContain('"safe_pages":1');
+      expect(out.notice).toContain("current_fact_unverified");
+    }
+  );
+
+  it("autoInject pages: no safe current-state page yields unknown without recall", async () => {
+    const client = makeClient({
+      searchPages: vi.fn(async () => [
+        {
+          id: "unknown",
+          name: "Unknown policy",
+          snippet: "unsafe unknown answer",
+          freshness: { state: "unknown", source_watermark_available: false } as const,
+        },
+        {
+          id: "failed",
+          name: "Failed policy",
+          snippet: "unsafe failed answer",
+          freshness: { state: "refresh_failed", source_watermark_available: true } as const,
+        },
+      ]),
+      recallObservations: vi.fn(async () => ["raw fallback must not run"]),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "What is the current upload retry status?",
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    });
+
+    expect(client.searchPages).toHaveBeenCalledWith("What is the current upload retry status?", {
+      timeoutMs: 7000,
+      includeFreshness: true,
+    });
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context).not.toContain("unsafe unknown answer");
+    expect(out.context).not.toContain("unsafe failed answer");
+    expect(out.context).toContain('"status":"unknown"');
+    expect(out.context).toContain('"safe_pages":0');
+    expect(out.context).toContain('"unknown_reason":"no_safe_page"');
+    expect(out.notice).toContain("unknown");
+  });
+
+  it("autoInject pages: failed current-state search reports search_failed without raw fallback", async () => {
+    const client = makeClient({
+      searchPages: vi.fn(async () => {
+        throw new Error("page search unavailable");
+      }),
+      recallObservations: vi.fn(async () => ["raw fallback must not run"]),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "What is the current upload retry status?",
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    });
+
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context).toContain('"unknown_reason":"search_failed"');
+    expect(out.context).not.toContain("raw fallback must not run");
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).currentStateGate.gate).toMatchObject({
+      status: "unknown",
+      unknownReason: "search_failed",
+    });
+    await buildHookOutput({
+      harness: "claude-code",
+      prompt: "What is the current upload retry status?",
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    });
+    expect(client.searchPages).toHaveBeenCalledTimes(1);
+  });
+
+  it("current-state safe gate is cached separately from empty injection and reused", async () => {
+    const prompt = "What is the current upload retry status?";
+    const client = makeClient({
+      searchPages: vi.fn(async () => [
+        {
+          id: "safe",
+          name: "Watermarked policy",
+          snippet: "must remain metadata-only",
+          freshness: {
+            state: "no_scoped_writes_reported",
+            source_watermark_available: true,
+          } as const,
+        },
+      ]),
+    });
+    const args = {
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    };
+
+    for (let turn = 0; turn < 5; turn++) {
+      const out = await buildHookOutput(args);
+      expect(out.context).toContain('"status":"current_fact_unverified"');
+      expect(out.context).toContain('"safe_pages":1');
+      expect(out.context).not.toContain("must remain metadata-only");
+    }
+
+    expect(client.searchPages).toHaveBeenCalledTimes(1);
+    const cached = JSON.parse(readFileSync(cacheFile, "utf8")) as Record<string, unknown>;
+    expect(cached.reflectAnswer).toBeUndefined();
+    expect(cached.currentStateGate).toMatchObject({
+      gate: {
+        status: "current_fact_unverified",
+        safePages: 1,
+        rawFactsRequired: true,
+      },
+    });
+    expect(JSON.stringify(cached)).not.toContain(prompt);
+    expect(JSON.stringify(cached)).not.toContain("must remain metadata-only");
+  });
+
+  it("current-state unknown gate is cached and does not loop hidden searches", async () => {
+    const prompt = "What is the latest upload retry status?";
+    const client = makeClient({
+      searchPages: vi.fn(async () => [
+        {
+          id: "unknown",
+          name: "Unknown policy",
+          snippet: "must not be injected",
+          freshness: { state: "unknown", source_watermark_available: false } as const,
+        },
+      ]),
+    });
+    const args = {
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    };
+
+    for (let turn = 0; turn < 5; turn++) {
+      const out = await buildHookOutput(args);
+      expect(out.context).toContain('"status":"unknown"');
+      expect(out.context).toContain('"unknown_reason":"no_safe_page"');
+      expect(out.context).not.toContain("must not be injected");
+    }
+
+    expect(client.searchPages).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).reflectAnswer).toBeUndefined();
+  });
+
+  it("current-state query fingerprints isolate different prompts", async () => {
+    const first = "What is the current upload retry status?";
+    const second = "What is the current authentication status?";
+    const client = makeClient({
+      searchPages: vi.fn(async (query: string) =>
+        query === first
+          ? [
+              {
+                id: "safe",
+                name: "Retry policy",
+                snippet: "retry metadata",
+                freshness: {
+                  state: "no_scoped_writes_reported",
+                  source_watermark_available: true,
+                } as const,
+              },
+            ]
+          : [
+              {
+                id: "unknown",
+                name: "Auth policy",
+                snippet: "auth metadata",
+                freshness: { state: "unknown", source_watermark_available: false } as const,
+              },
+            ]
+      ),
+    });
+    const cfg = resolveConfig({ autoInject: "pages" });
+
+    const firstOut = await buildHookOutput({
+      harness: "claude-code",
+      prompt: first,
+      cfg,
+      client,
+      cacheFile,
+    });
+    const secondOut = await buildHookOutput({
+      harness: "claude-code",
+      prompt: second,
+      cfg,
+      client,
+      cacheFile,
+    });
+    const secondAgain = await buildHookOutput({
+      harness: "claude-code",
+      prompt: second,
+      cfg,
+      client,
+      cacheFile,
+    });
+
+    expect(firstOut.context).toContain('"status":"current_fact_unverified"');
+    expect(secondOut.context).toContain('"status":"unknown"');
+    expect(secondAgain.context).toContain('"status":"unknown"');
+    expect(client.searchPages).toHaveBeenCalledTimes(2);
+    const searchCalls = (client.searchPages as ReturnType<typeof vi.fn>).mock.calls as [string][];
+    expect(searchCalls.map(([query]) => query)).toEqual([first, second]);
+  });
+
+  it("legacy current-state cache without a reason remains compatible without false certainty", async () => {
+    const prompt = "What is the latest upload retry status?";
+    const client = makeClient({
+      searchPages: vi.fn(async () => {
+        throw new Error("legacy cache should be reused");
+      }),
+    });
+    const fingerprint = createHash("sha256")
+      .update(prompt.trim().replace(/\s+/gu, " "), "utf8")
+      .digest("hex");
+    mkdirSync(dirname(cacheFile), { recursive: true });
+    writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        currentStateGate: {
+          queryFingerprint: fingerprint,
+          gate: {
+            status: "unknown",
+            omittedUnsafePages: 1,
+            safePages: 0,
+            rawFactsRequired: true,
+          },
+        },
+      })
+    );
+
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    });
+
+    expect(client.searchPages).not.toHaveBeenCalled();
+    // Legacy cache entries remain reusable, but their old flattened representation cannot prove
+    // whether the search found no safe page or failed, so no reason is invented.
+    expect(out.context).toContain('"status":"unknown"');
+    expect(out.context).not.toContain('"unknown_reason"');
+  });
+
+  it("current-state cache reason follows the active injection mode", async () => {
+    const prompt = "What is the current upload retry status?";
+    const client = makeClient({
+      searchPages: vi.fn(async () => [
+        {
+          id: "safe",
+          name: "Watermarked policy",
+          snippet: "must remain metadata-only",
+          freshness: {
+            state: "no_scoped_writes_reported",
+            source_watermark_available: true,
+          } as const,
+        },
+      ]),
+    });
+    await buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "pages" }),
+      client,
+      cacheFile,
+    });
+    const reflect = await buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "reflect" }),
+      client,
+      cacheFile,
+    });
+
+    expect(reflect.context).toContain('"unknown_reason":"not_checked"');
+    expect(reflect.context).not.toContain('"status":"current_fact_unverified"');
+    expect(client.searchPages).toHaveBeenCalledTimes(1);
+    expect(client.reflect).not.toHaveBeenCalled();
+  });
+
+  it("autoInject none neither reads nor writes a current-state gate", async () => {
+    mkdirSync(dirname(cacheFile), { recursive: true });
+    writeFileSync(
+      cacheFile,
+      JSON.stringify({
+        turns: 2,
+        currentStateGate: {
+          queryFingerprint: "a".repeat(64),
+          gate: {
+            status: "current_fact_unverified",
+            omittedUnsafePages: 0,
+            safePages: 1,
+            rawFactsRequired: true,
+          },
+        },
+      })
+    );
+    const client = makeClient();
+    const prompt = "What is the current upload retry status?";
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "none" }),
+      client,
+      cacheFile,
+    });
+
+    expect(client.searchPages).not.toHaveBeenCalled();
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context ?? "").not.toContain("hindsight_current_state_gate");
+    expect(out.notice).toBeUndefined();
+    expect(JSON.parse(readFileSync(cacheFile, "utf8")).currentStateGate).toBeUndefined();
+  });
+
+  it.each(["reflect", "recall"] as const)(
+    "autoInject %s current-state queries return an unknown gate without hidden retrieval",
+    async (autoInject) => {
+      for (const [index, prompt] of CURRENT_STATE_CASE_VARIANTS.entries()) {
+        const client = makeClient({
+          reflect: vi.fn(async () => "unsafe synthesis"),
+          searchPages: vi.fn(async () => [
+            {
+              id: "unknown",
+              name: "Unknown page",
+              snippet: "unsafe page",
+              freshness: { state: "unknown", source_watermark_available: false } as const,
+            },
+          ]),
+          recallObservations: vi.fn(async () => ["unsafe raw fallback"]),
+        });
+        const out = await buildHookOutput({
+          harness: "claude-code",
+          prompt,
+          cfg: resolveConfig({ autoInject }),
+          client,
+          cacheFile: join(root, `current-${autoInject}-${index}.json`),
+        });
+
+        expect(client.reflect).not.toHaveBeenCalled();
+        if (autoInject === "reflect") expect(client.searchPages).not.toHaveBeenCalled();
+        expect(client.recallObservations).not.toHaveBeenCalled();
+        expect(out.context).toContain('"status":"unknown"');
+        expect(out.context).toContain('"unknown_reason":"not_checked"');
+        expect(out.context).toContain('"raw_facts_required":true');
+        expect(out.context).not.toContain("unsafe page");
+        expect(out.context).not.toContain("unsafe synthesis");
+        expect(out.context).not.toContain("unsafe raw fallback");
+        expect(out.notice).toContain("unknown");
+      }
+    }
+  );
+
+  it("current-state reflect output-only gate skips page and raw fallbacks", async () => {
+    const client = makeClient({
+      reflect: vi.fn(async () => "unsafe synthesis"),
+      searchPages: vi.fn(async () => [
+        {
+          id: "stale",
+          name: "Stale policy",
+          snippet: "unsafe stale answer",
+          freshness: { state: "refresh_failed", source_watermark_available: true } as const,
+        },
+      ]),
+      recallObservations: vi.fn(async () => ["raw fallback must not run"]),
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "What is the cUrReNt upload retry status?",
+      cfg: resolveConfig({}),
+      client,
+      cacheFile,
+    });
+
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(client.searchPages).not.toHaveBeenCalled();
+    expect(client.recallObservations).not.toHaveBeenCalled();
+    expect(out.context).not.toContain("unsafe stale answer");
+    expect(out.context).not.toContain("unsafe synthesis");
+    expect(out.context).toContain('"status":"unknown"');
+    expect(out.notice).toContain("unknown");
+  });
+
   it("autoInject pages: a FAILED search is retried within its budget", async () => {
     // The retryability fix is not reflect-only. A page search that threw used to cache "" just
     // like a search that matched nothing, so a transient blip cost the whole session (#4607).
@@ -654,6 +1162,38 @@ describe("buildHookOutput", () => {
     // These modes used to stay silent, so a memory-less turn looked identical to a healthy one.
     expect(out.notice).toContain("no memory this turn");
   });
+
+  it.each(CURRENT_STATE_CASE_VARIANTS)(
+    "autoInject none: current-state queries remain silent and do not inject a gate (%s)",
+    async (prompt) => {
+      const client = makeClient({
+        reflect: vi.fn(async () => "unsafe synthesis"),
+        searchPages: vi.fn(async () => [
+          {
+            id: "unsafe",
+            name: "Unsafe page",
+            snippet: "unsafe page body",
+            freshness: { state: "stale", source_watermark_available: true } as const,
+          },
+        ]),
+        recallObservations: vi.fn(async () => ["unsafe raw fallback"]),
+      });
+      const out = await buildHookOutput({
+        harness: "claude-code",
+        prompt,
+        cfg: resolveConfig({ autoInject: "none" }),
+        client,
+        cacheFile,
+      });
+
+      expect(client.reflect).not.toHaveBeenCalled();
+      expect(client.searchPages).not.toHaveBeenCalled();
+      expect(client.recallObservations).not.toHaveBeenCalled();
+      expect(out.context ?? "").not.toContain("<hindsight_current_state_gate>");
+      expect(out.context ?? "").not.toContain('"raw_facts_required":true');
+      expect(out.notice).toBeUndefined();
+    }
+  );
 
   it("autoReflect false: never calls reflect, injects no memory block", async () => {
     const cfg = resolveConfig({ autoReflect: false });

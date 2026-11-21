@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,29 @@ function findTool(tools: ReturnType<typeof buildPageTools>, name: string) {
   if (!t) throw new Error(`tool not found: ${name}`);
   return t;
 }
+
+const CURRENT_STATE_CASE_VARIANTS = [
+  "What is the CURRENT policy?",
+  "What is the Latest policy?",
+  "What is the cUrReNt policy?",
+  "What was true AS OF yesterday?",
+  "当前状态是什么？",
+] as const;
+const CODE_ORIENTED_STATUS_VARIANTS = [
+  "How does the status code mapping work?",
+  "How does the STATUS CODE mapping work?",
+  "status code",
+  "Status Code",
+  "status-code",
+  "STATUS-CODE",
+  "status_code",
+  "STATUS_CODE",
+  "status()",
+  "status (value)",
+  "status = ready",
+  "status:=ready",
+  "request.status",
+] as const;
 
 const EXPECTED_TOOLS = [
   "hindsight_sync_status",
@@ -123,18 +146,29 @@ describe("buildPageTools", () => {
   });
 
   it("hindsight_diagnose returns safe runtime configuration without touching the client", async () => {
-    const client = stubClient();
-    const tools = buildPageTools(client, "repo-a");
-    const tool = findTool(tools, "hindsight_diagnose");
-    const result = await tool.handler({});
-    expect(result.isError).toBeFalsy();
-    expect(JSON.parse(result.content[0].text)).toMatchObject({
-      bank_id: "repo-a",
-      harness: "unknown",
-      config: { api_token_configured: false },
-    });
-    expect(client.listPages).not.toHaveBeenCalled();
-    expect(client.getPage).not.toHaveBeenCalled();
+    const configDir = mkdtempSync(join(tmpdir(), "hs-diagnose-"));
+    const configPath = join(configDir, "coding-agent.json");
+    writeFileSync(configPath, "{}");
+    vi.stubEnv("HINDSIGHT_CONFIG", configPath);
+    // Keep an inherited environment token out of this isolated config test as well.
+    vi.stubEnv("HINDSIGHT_API_TOKEN", "");
+    try {
+      const client = stubClient();
+      const tools = buildPageTools(client, "repo-a");
+      const tool = findTool(tools, "hindsight_diagnose");
+      const result = await tool.handler({});
+      expect(result.isError).toBeFalsy();
+      expect(JSON.parse(result.content[0].text)).toMatchObject({
+        bank_id: "repo-a",
+        harness: "unknown",
+        config: { api_token_configured: false },
+      });
+      expect(client.listPages).not.toHaveBeenCalled();
+      expect(client.getPage).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(configDir, { recursive: true, force: true });
+    }
   });
 
   it("reports loaded/disk identity and only probes the API when explicitly requested", async () => {
@@ -213,6 +247,92 @@ describe("buildPageTools", () => {
     // search lands mid-session, and a paraphrased snippet otherwise gets absorbed uncredited.
     expect(payload.crediting).toContain("From Hindsight memory");
     expect(payload.crediting).toContain("paraphrased");
+  });
+
+  it.each(CURRENT_STATE_CASE_VARIANTS)(
+    "hindsight_search_knowledge_pages returns metadata-only current-state results (%s)",
+    async (query) => {
+      const client = stubClient({
+        searchPages: vi.fn(async () => [
+          {
+            id: "safe",
+            name: "Current policy",
+            snippet: "synthetic current page body",
+            freshness: {
+              state: "no_scoped_writes_reported",
+              source_watermark_available: true,
+            },
+          },
+          {
+            id: "stale",
+            name: "Stale policy",
+            snippet: "synthetic stale page body",
+            freshness: { state: "stale", source_watermark_available: true },
+          },
+        ]),
+      });
+      const tool = findTool(buildPageTools(client, "repo-a"), "hindsight_search_knowledge_pages");
+      const result = await tool.handler({ query });
+      const payload = JSON.parse(result.content[0].text);
+
+      expect(payload.pages).toEqual([]);
+      expect(result.content[0].text).not.toContain("Current policy");
+      expect(result.content[0].text).not.toContain("synthetic current page body");
+      expect(result.content[0].text).not.toContain("synthetic stale page body");
+      expect(payload.current_state_gate).toMatchObject({
+        applied: true,
+        omitted_unsafe_pages: 1,
+        safe_pages: 1,
+        raw_facts_required: true,
+        status: "current_fact_unverified",
+      });
+    }
+  );
+
+  it.each(CODE_ORIENTED_STATUS_VARIANTS)(
+    "hindsight_search_knowledge_pages keeps %s as ordinary page retrieval",
+    async (statusMarker) => {
+      const client = stubClient({
+        searchPages: vi.fn(async () => [
+          {
+            id: "mapping",
+            name: "Status mapping",
+            snippet: "stable mapping details",
+            freshness: { state: "stale", source_watermark_available: true },
+          },
+        ]),
+      });
+      const tool = findTool(buildPageTools(client, "repo-a"), "hindsight_search_knowledge_pages");
+      const result = await tool.handler({ query: statusMarker });
+      const payload = JSON.parse(result.content[0].text);
+
+      expect(result.isError).toBeFalsy();
+      expect(payload.pages).toMatchObject([
+        { page: "Status mapping", snippet: "stable mapping details" },
+      ]);
+      expect(payload.current_state_gate).toEqual({ applied: false });
+      expect(client.searchPages).toHaveBeenCalledWith(statusMarker, { includeFreshness: true });
+    }
+  );
+
+  it("hindsight_search_knowledge_pages reports search_failed for current-state outages", async () => {
+    const client = stubClient({
+      searchPages: vi.fn(async () => {
+        throw new Error("page search unavailable");
+      }),
+    });
+    const tool = findTool(buildPageTools(client, "repo-a"), "hindsight_search_knowledge_pages");
+    const result = await tool.handler({ query: "What is the current answer?" });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(result.isError).toBe(true);
+    expect(payload.current_state_gate).toMatchObject({
+      applied: true,
+      safe_pages: 0,
+      raw_facts_required: true,
+      status: "unknown",
+      unknown_reason: "search_failed",
+    });
   });
 
   it("hindsight_search_knowledge_pages adds toolGuideExtra after the crediting note (#4791)", async () => {

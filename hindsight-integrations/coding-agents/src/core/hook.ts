@@ -6,8 +6,9 @@
  *     "reflect" (default) is an agentic synthesis over the bank returning the root-cause decision
  *     with exact values; "pages" is a page search and "recall" a raw memory recall, both
  *     retrieval-only and far cheaper; "none" injects nothing and leaves it to the tools. Cached
- *     per session, injected on the turn it ran. A failed or empty attempt is retried on a later
- *     prompt within a small budget (see `resolveInjection`).
+ *     per session, injected on the turn it ran. Stable-source failures or empty results are retried
+ *     on a later prompt within a small budget (see `resolveInjection`); current-state metadata
+ *     gates are resolved separately and bound to their query.
  *   - PAGES every turn: the page set is fetched on a cadence and matched LOCALLY against
  *     the prompt (section-level lexical scoring — no server/LLM call); the top sections are
  *     injected with provenance. Fast like recall, organized like reflect.
@@ -21,6 +22,7 @@
  * in `buildHookOutput` (client + cache file in, injection string out) so it's unit-testable
  * without stdin/stdout; `runHook` is thin plumbing around it, with a `makeClient` seam for tests.
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { deriveBankIdOrSkip } from "./bank";
 import type { Config } from "./config";
@@ -42,6 +44,7 @@ import {
 } from "./inject";
 import type { PageRef } from "./page-injection";
 import { buildRosterRefresh, parsePageList } from "./page-injection";
+import { filterCurrentStatePages, isCurrentStateQuery, type PageFreshness } from "./page-freshness";
 import {
   readSessionCache,
   sessionCacheFile,
@@ -49,6 +52,9 @@ import {
   stashPendingContext,
   takePendingContext,
   writeSessionCache,
+  type CurrentStateGateCache,
+  type CurrentStateGateMetadata,
+  type CurrentStateUnknownReason,
   type SessionCache,
 } from "./session-cache";
 import { appendJournalTurn, journalPath } from "./turn-journal";
@@ -87,13 +93,22 @@ export interface HookSpec {
 }
 
 /** Minimal client shape `buildHookOutput` needs — `HindsightClient` satisfies it structurally. */
+type PageFreshnessHint = Pick<PageFreshness, "state" | "source_watermark_available">;
+
 interface HookClient {
   reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string>;
   listPages(): Promise<unknown>;
   searchPages(
     query: string,
-    opts?: { limit?: number; timeoutMs?: number }
-  ): Promise<{ id: string; name: string; snippet: string }[]>;
+    opts?: { limit?: number; timeoutMs?: number; includeFreshness?: boolean }
+  ): Promise<
+    {
+      id: string;
+      name: string;
+      snippet: string;
+      freshness?: PageFreshnessHint;
+    }[]
+  >;
   recallObservations(query: string, opts: { timeoutMs: number }): Promise<string[]>;
   pagesSupported?: boolean;
   /** Recorded on reflect failures so the diag trail says which bank to look at server-side. */
@@ -142,10 +157,111 @@ function boundRecallQuery(prompt: string): string {
   return prompt.slice(0, end);
 }
 
-/** Page search for the prompt, formatted for injection. `null` = it ran and nothing
+/** Page search for the prompt, formatted for injection. `body:null` = it ran and nothing
  *  matched (an answer); `undefined` = it FAILED (recorded as `${event}_failed`) and is worth
- *  retrying. The two used to be one value, which cached a transient failure as "this session has
- *  no memory" for every remaining turn (#4607). Never throws. */
+ *  retrying. Current-state results also carry a metadata-only gate signal. The two old tri-state
+ *  values used to be flattened, which cached a current-state gate as "this session has no memory"
+ *  for every remaining turn. Stable retrieval keeps its existing retry behavior. Never throws. */
+type CurrentStateSignal = CurrentStateGateMetadata;
+
+/** Stable, non-reversible binding for one current-state prompt. The raw prompt must never enter
+ * the session cache, while distinct prompts must not reuse one another's metadata gate. */
+function currentStateQueryFingerprint(prompt: string): string {
+  return createHash("sha256").update(prompt.trim().replace(/\s+/gu, " "), "utf8").digest("hex");
+}
+
+interface InjectionResult {
+  body: string | null;
+  currentState?: CurrentStateSignal;
+  failed?: boolean;
+}
+
+function currentStateSignal(
+  prompt: string,
+  omittedUnsafePages: number,
+  safePages: number,
+  unknownReason?: CurrentStateUnknownReason
+): CurrentStateSignal | undefined {
+  if (!isCurrentStateQuery(prompt)) return undefined;
+  const status = safePages ? "current_fact_unverified" : "unknown";
+  return {
+    status,
+    omittedUnsafePages,
+    safePages,
+    rawFactsRequired: true,
+    ...(status === "unknown" ? { unknownReason: unknownReason ?? "no_safe_page" } : {}),
+  };
+}
+
+/** Ignore malformed/old cache data rather than injecting it. This keeps the cache best-effort and
+ * lets a valid current-state query repair an entry written by an older or interrupted process. */
+function readCachedCurrentStateGate(
+  cached: SessionCache,
+  queryFingerprint: string
+): CurrentStateSignal | undefined {
+  const entry = cached.currentStateGate;
+  if (
+    !entry ||
+    entry.queryFingerprint !== queryFingerprint ||
+    !/^[a-f0-9]{64}$/u.test(entry.queryFingerprint)
+  ) {
+    return undefined;
+  }
+  const gate = entry.gate;
+  if (
+    !gate ||
+    (gate.status !== "current_fact_unverified" && gate.status !== "unknown") ||
+    gate.rawFactsRequired !== true ||
+    !Number.isSafeInteger(gate.omittedUnsafePages) ||
+    gate.omittedUnsafePages < 0 ||
+    gate.omittedUnsafePages > 1000 ||
+    !Number.isSafeInteger(gate.safePages) ||
+    gate.safePages < 0 ||
+    gate.safePages > 1000 ||
+    (gate.status === "current_fact_unverified" && gate.safePages < 1) ||
+    (gate.status === "unknown" && gate.safePages !== 0) ||
+    (gate.unknownReason !== undefined &&
+      !["no_safe_page", "search_failed", "not_checked"].includes(gate.unknownReason)) ||
+    (gate.status === "current_fact_unverified" && gate.unknownReason !== undefined)
+  ) {
+    return undefined;
+  }
+  return {
+    status: gate.status,
+    omittedUnsafePages: gate.omittedUnsafePages,
+    safePages: gate.safePages,
+    rawFactsRequired: true,
+    ...(gate.unknownReason !== undefined ? { unknownReason: gate.unknownReason } : {}),
+  };
+}
+
+function buildCurrentStateGate(signal: CurrentStateSignal): string {
+  const payload = {
+    status: signal.status,
+    raw_facts_required: signal.rawFactsRequired,
+    omitted_unsafe_pages: signal.omittedUnsafePages,
+    safe_pages: signal.safePages,
+    ...(signal.status === "unknown" && signal.unknownReason
+      ? { unknown_reason: signal.unknownReason }
+      : {}),
+    note:
+      signal.status === "unknown"
+        ? signal.unknownReason === "search_failed"
+          ? "Current-state page search failed; explicitly call hindsight_recall or hindsight_recent_memories, then verify against the code."
+          : signal.unknownReason === "not_checked"
+            ? "Automatic reflect/recall did not check pages; explicitly call hindsight_recall or hindsight_recent_memories, then verify against the code."
+            : signal.unknownReason === "no_safe_page"
+              ? "No safe current-state page was available; explicitly call hindsight_recall or hindsight_recent_memories, then verify against the code."
+              : "Current state is unknown; explicitly call hindsight_recall or hindsight_recent_memories, then verify against the code."
+        : "Current page facts remain unverified; explicitly call hindsight_recall or hindsight_recent_memories, then verify against the code.",
+  };
+  return `<hindsight_current_state_gate>\n${JSON.stringify(payload)}\n</hindsight_current_state_gate>`;
+}
+
+/** Page search for the prompt, formatted for injection. `null` = it ran and nothing matched
+ *  (an answer); `undefined` = it FAILED (recorded as `${event}_failed`) and is worth retrying.
+ *  Current-state searches request freshness metadata and withhold every page that is stale,
+ *  failed, unknown, or missing a source watermark. */
 async function injectPages(
   harness: string,
   prompt: string,
@@ -153,22 +269,59 @@ async function injectPages(
   timeoutMs: number,
   event: string,
   lead?: string
-): Promise<string | null | undefined> {
+): Promise<InjectionResult | undefined> {
   const t0 = Date.now();
+  const current = isCurrentStateQuery(prompt);
   try {
     // The search query rides in a GET query string; the goal's opening carries its keywords.
     // How MANY pages come back is the client's `pageSearchLimit`, shared with the MCP tool.
-    const hits = await client.searchPages(prompt.slice(0, 500), { timeoutMs });
-    diag(harness, event, { ms: Date.now() - t0, count: hits.length });
-    return hits.length ? formatPageFallback(hits, lead) : null;
+    const hits = await client.searchPages(
+      prompt.slice(0, 500),
+      current ? { timeoutMs, includeFreshness: true } : { timeoutMs }
+    );
+    const gated = filterCurrentStatePages(prompt, hits);
+    diag(harness, event, {
+      ms: Date.now() - t0,
+      count: gated.hits.length,
+      ...(current
+        ? {
+            omitted_unsafe_pages: gated.omittedUnsafePages,
+            current_state: currentStateSignal(prompt, gated.omittedUnsafePages, gated.hits.length),
+          }
+        : {}),
+    });
+    // Current-state searches are metadata-only even when a page passes the freshness gate:
+    // freshness is a scoped-write signal, not proof that the page body is current.
+    const body = current ? null : gated.hits.length ? formatPageFallback(gated.hits, lead) : null;
+    return {
+      body,
+      ...(current
+        ? {
+            currentState: currentStateSignal(prompt, gated.omittedUnsafePages, gated.hits.length),
+          }
+        : {}),
+    };
   } catch (e) {
-    diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: describeError(e) });
-    return undefined;
+    diag(harness, `${event}_failed`, {
+      ms: Date.now() - t0,
+      error: describeError(e),
+      ...(current ? { current_state: currentStateSignal(prompt, 0, 0, "search_failed") } : {}),
+    });
+    // A current-state failure cannot safely fall through to raw recall. Return an explicit unknown
+    // signal; the caller resolves and caches that metadata gate independently of stable retries.
+    return current
+      ? {
+          body: null,
+          currentState: currentStateSignal(prompt, 0, 0, "search_failed"),
+          failed: true,
+        }
+      : undefined;
   }
 }
 
 /** Raw recall over the bank (what it asks for is the client's `recallOptions`), formatted for
- *  injection; same contract as `injectPages`. */
+ *  injection; same contract as `injectPages`. Current-state callers are blocked defensively: raw
+ *  facts must be requested explicitly by the agent, never as a hidden hook fallback. */
 async function injectRecall(
   harness: string,
   prompt: string,
@@ -176,13 +329,23 @@ async function injectRecall(
   timeoutMs: number,
   event: string,
   lead?: string
-): Promise<string | null | undefined> {
+): Promise<InjectionResult | undefined> {
+  if (isCurrentStateQuery(prompt)) {
+    diag(harness, `${event}_blocked_current_state`, {
+      raw_facts_required: true,
+      status: "unknown",
+    });
+    return {
+      body: null,
+      currentState: currentStateSignal(prompt, 0, 0, "not_checked"),
+    };
+  }
   const t0 = Date.now();
   try {
     // What is asked for — types, token budget, everything — is the client's `recallOptions`.
     const observations = await client.recallObservations(boundRecallQuery(prompt), { timeoutMs });
     diag(harness, event, { ms: Date.now() - t0, count: observations.length });
-    return observations.length ? formatRecallFallback(observations, lead) : null;
+    return { body: observations.length ? formatRecallFallback(observations, lead) : null };
   } catch (e) {
     diag(harness, `${event}_failed`, { ms: Date.now() - t0, error: describeError(e) });
     return undefined;
@@ -190,34 +353,43 @@ async function injectRecall(
 }
 
 /**
- * Reflect timed out or 5xx'd: the synthesis path broke, but retrieval may still answer. Try the
- * curated pages first (search), and only when none match fall back to a raw recall
- * over the bank's memories. Returns the memory body to inject, or a nullish value when both came
- * back empty or failed — the caller only asks whether there IS a body, so the sources' tri-state
- * is passed through rather than flattened. Never throws.
+ * Reflect timed out or 5xx'd: stable/background retrieval may still answer. Try curated pages
+ * first, then fall back to raw recall. Current-state queries are blocked before this fallback runs
+ * and return only a metadata signal; raw/recent reads are never hidden follow-ups. Never throws.
  */
 async function reflectFallback(
   harness: string,
   prompt: string,
   client: HookClient,
   timeoutMs: number
-): Promise<string | null | undefined> {
+): Promise<InjectionResult | undefined> {
+  // Current-state is output-only: this helper is defensive because the normal caller blocks
+  // automatic reflect before reaching fallback. Do not even run the page-search leg here.
+  if (isCurrentStateQuery(prompt)) {
+    diag(harness, "reflect_fallback_blocked_current_state", {
+      raw_facts_required: true,
+      status: "unknown",
+    });
+    return {
+      body: null,
+      currentState: currentStateSignal(prompt, 0, 0, "not_checked"),
+    };
+  }
   // Page search and recall share ONE retrieval budget after reflect fails, rather than each
   // spending a full injectTimeoutMs and doubling the time added to the host's hook window.
   const deadline = Date.now() + timeoutMs;
   const remaining = () => Math.max(deadline - Date.now(), 1);
-  return (
-    (await injectPages(harness, prompt, client, remaining(), "reflect_fallback_pages")) ??
-    // Event name predates the `injectRecall` rename and is kept: it is a logged contract that
-    // other tools read, so renaming it would silently break them.
-    (await injectRecall(harness, prompt, client, remaining(), "reflect_fallback_observations"))
-  );
+  const pages = await injectPages(harness, prompt, client, remaining(), "reflect_fallback_pages");
+  if (pages?.body) return pages;
+  // Event name predates the `injectRecall` rename and is kept: it is a logged contract that
+  // other tools read, so renaming it would silently break them.
+  return await injectRecall(harness, prompt, client, remaining(), "reflect_fallback_observations");
 }
 
 export interface HookOutput {
   /** The model-facing injection block, or undefined when there's nothing to inject. */
   context?: string;
-  /** User-facing line(s) — set only on the reflect turn (its goal + result preview). */
+  /** User-facing line(s) — source preview for stable retrieval, or a current-state gate signal. */
   notice?: string;
   /** This session's page roster, from the shared per-session cache. The SINGLE source
    *  of truth for every page-derived block in a turn: the persistent-plugin runtime rebuilds its
@@ -257,8 +429,72 @@ export async function buildHookOutput(args: {
   let reflectFailed = false;
   // Set when reflect timed out / 5xx'd and a retrieval-only fallback supplied the memory instead.
   let fallback: string | null | undefined;
+  // `none` is tool-only mode: do not automatically inject or announce even the current-state
+  // gate. Explicit page/retrieval tools apply their own gate contract when called.
+  const currentStateQuery = cfg.autoInject !== "none" && isCurrentStateQuery(prompt);
+  const currentStateFingerprint = currentStateQuery
+    ? currentStateQueryFingerprint(prompt)
+    : undefined;
+  let currentStateGate = currentStateFingerprint
+    ? readCachedCurrentStateGate(cached, currentStateFingerprint)
+    : undefined;
+  // The reason is bounded to the source actually used for this mode. A page gate from a previous
+  // mode cannot describe deliberate reflect/recall no-search, and `not_checked` cannot describe a
+  // page search. Older caches have no reason field: reuse their metadata-only unknown gate without
+  // inventing a reason that the old entry cannot prove.
+  if (currentStateQuery) {
+    if (cfg.autoInject === "pages") {
+      if (currentStateGate?.unknownReason === "not_checked") currentStateGate = undefined;
+    } else if (currentStateGate) {
+      currentStateGate = currentStateSignal(prompt, 0, 0, "not_checked");
+    }
+  }
+  let currentStateGateCache: CurrentStateGateCache | undefined =
+    currentStateGate && currentStateFingerprint
+      ? { queryFingerprint: currentStateFingerprint, gate: currentStateGate }
+      : undefined;
   const deferInitialReflect = cached.deferInitialReflect === true;
-  if (deferInitialReflect) {
+  if (currentStateQuery) {
+    if (!currentStateGate) {
+      // Current-state metadata is its own resolved outcome. It must not enter resolveInjection(null):
+      // a safe-page gate is not an empty memory answer, and an unknown gate must not consume the
+      // ordinary empty-injection retry budget. Cache the gate by fingerprint so repeated turns do
+      // not repeat hidden page search/freshness work.
+      if (cfg.autoInject === "pages") {
+        const got = await injectPages(
+          harness,
+          prompt,
+          client,
+          cfg.injectTimeoutMs,
+          "inject_pages",
+          PAGE_INJECT_LEAD
+        );
+        currentStateGate = got?.currentState ?? currentStateSignal(prompt, 0, 0)!;
+      } else {
+        // Reflect and recall remain output-only for current-state questions: raw/recent facts are an
+        // explicit agent action, never a hidden follow-up. Still cache the independent unknown gate
+        // so the same prompt does not repeatedly manufacture a fresh gate result.
+        currentStateGate = currentStateSignal(prompt, 0, 0, "not_checked")!;
+        diag(
+          harness,
+          cfg.autoInject === "reflect"
+            ? "reflect_blocked_current_state"
+            : "inject_recall_blocked_current_state",
+          { raw_facts_required: true, status: "unknown" }
+        );
+      }
+      currentStateGateCache = {
+        queryFingerprint: currentStateFingerprint!,
+        gate: currentStateGate,
+      };
+    } else {
+      diag(harness, "current_state_gate_cached", {
+        status: currentStateGate.status,
+        safe_pages: currentStateGate.safePages,
+        omitted_unsafe_pages: currentStateGate.omittedUnsafePages,
+      });
+    }
+  } else if (deferInitialReflect) {
     // A new bank has no useful history yet. Do not burn the once-per-session synthesis on prompt
     // one; this marker is deliberately consumed below so prompt two remains eligible to reflect.
     diag(harness, "reflect_deferred_new_bank", { query: prompt.slice(0, 80) });
@@ -276,72 +512,101 @@ export async function buildHookOutput(args: {
     // `undefined` is the search FAILING, distinct from `null` (it ran, nothing matched). These
     // modes stayed silent on a failure while reflect announced one — the same turn looked healthy
     // whether memory was unavailable or simply had nothing to say.
-    if (got === undefined) reflectFailed = true;
-    reflectAnswer = resolveInjection(got, reflectAttempts);
+    if (got === undefined || got.failed) reflectFailed = true;
+    if (got?.currentState) currentStateGate = got.currentState;
+    reflectAnswer = resolveInjection(got?.failed ? undefined : got?.body, reflectAttempts);
   } else if (cfg.autoInject === "recall" && reflectAnswer === undefined) {
-    reflectRanThisTurn = true;
-    reflectAttempts++;
-    const got = await injectRecall(
-      harness,
-      prompt,
-      client,
-      cfg.injectTimeoutMs,
-      "inject_recall",
-      RECALL_INJECT_LEAD
-    );
-    if (got === undefined) reflectFailed = true; // see the pages branch above
-    reflectAnswer = resolveInjection(got, reflectAttempts);
+    if (isCurrentStateQuery(prompt)) {
+      // Raw/recent facts are an explicit agent action, never a hidden automatic read.
+      currentStateGate = currentStateSignal(prompt, 0, 0, "not_checked");
+      diag(harness, "inject_recall_blocked_current_state", {
+        raw_facts_required: true,
+        status: "unknown",
+      });
+    } else {
+      reflectRanThisTurn = true;
+      reflectAttempts++;
+      const got = await injectRecall(
+        harness,
+        prompt,
+        client,
+        cfg.injectTimeoutMs,
+        "inject_recall",
+        RECALL_INJECT_LEAD
+      );
+      if (got === undefined || got.failed) reflectFailed = true; // see the pages branch above
+      if (got?.currentState) currentStateGate = got.currentState;
+      reflectAnswer = resolveInjection(got?.failed ? undefined : got?.body, reflectAttempts);
+    }
   } else if (cfg.autoInject === "reflect" && reflectAnswer === undefined) {
-    reflectRanThisTurn = true;
-    reflectAttempts++;
-    const t0 = Date.now();
-    // Previously clamped to a hardcoded 20s, which made a raised reflectTimeoutMs dead config on
-    // this path (#4398); the 20s now lives in the default instead. Not clamped: a user who raises reflectTimeoutMs past the host's prompt-hook timeout (30s on
-    // the hook harnesses) must raise that too — see the README's reflectTimeoutMs row.
-    const timeoutMs = cfg.reflectTimeoutMs;
-    try {
-      reflectAnswer = await client.reflect(buildReflectQuery(prompt), {
-        // Automatic reflection runs inside the host's hook window. Hindsight's low budget is the
-        // supported default for bounded reflect calls; callers that explicitly invoke the MCP
-        // tool still get the deeper high-budget path.
-        budget: "low",
-        timeoutMs,
+    if (isCurrentStateQuery(prompt)) {
+      // Current-state questions are output-only: do not spend an automatic reflect call or invoke
+      // any fallback. The agent must explicitly request raw/recent facts and verify the code.
+      currentStateGate = currentStateSignal(prompt, 0, 0, "not_checked");
+      diag(harness, "reflect_blocked_current_state", {
+        raw_facts_required: true,
+        status: "unknown",
       });
-      diag(harness, reflectAnswer ? "reflect_ok" : "reflect_empty", {
-        ms: Date.now() - t0,
-        chars: reflectAnswer.length,
-        query: prompt.slice(0, 80),
-        // Verbatim injected synthesis — the ONLY durable record of what the agent actually saw
-        // (post-mortems otherwise depend on the harness happening to persist hook context).
-        answer: reflectAnswer.slice(0, 8000),
-      });
-    } catch (e) {
-      // A failure is RETRYABLE, not an answer — `resolveInjection` leaves it unresolved until the
-      // budget is spent. Caching "" here meant one timeout on the session's first prompt disabled
-      // synthesis for the ENTIRE session, and against a real server a reflect near the timeout is a
-      // coin flip, not an edge case (#4607).
-      // ...except a permanent 4xx, which fails identically on every later turn: resolve it now
-      // rather than spend the session's second attempt on a call that cannot succeed (#5207).
-      reflectAnswer =
-        e instanceof ReflectError && e.permanent
-          ? ""
-          : resolveInjection(undefined, reflectAttempts);
-      reflectFailed = true;
-      log.warn(harness, "reflect failed — session runs without memory", {
-        error: describeError(e),
-      });
-      diag(harness, "reflect_failed", {
-        ms: Date.now() - t0,
-        bank: client.bank,
-        timeoutMs,
-        // Wider than describeError's default: the server's error body is the useful part.
-        error: describeError(e, 1500),
-        query: prompt.slice(0, 80),
-      });
-      if (e instanceof ReflectError && e.fallbackEligible) {
-        fallback = await reflectFallback(harness, prompt, client, cfg.injectTimeoutMs);
-        // The fallback body is cached exactly like a reflect answer: injected once, not retried.
-        if (fallback) reflectAnswer = fallback;
+    } else {
+      reflectRanThisTurn = true;
+      reflectAttempts++;
+      const t0 = Date.now();
+      // Previously clamped to a hardcoded 20s, which made a raised reflectTimeoutMs dead config on
+      // this path (#4398); the 20s now lives in the default instead. Not clamped: a user who raises reflectTimeoutMs past the host's prompt-hook timeout (30s on
+      // the hook harnesses) must raise that too — see the README's reflectTimeoutMs row.
+      const timeoutMs = cfg.reflectTimeoutMs;
+      try {
+        const reflected = await client.reflect(buildReflectQuery(prompt), {
+          // Automatic reflection runs inside the host's hook window. Hindsight's low budget is the
+          // supported default for bounded reflect calls; callers that explicitly invoke the MCP
+          // tool still get the deeper high-budget path.
+          budget: "low",
+          timeoutMs,
+        });
+        reflectAnswer = reflected;
+        diag(harness, reflectAnswer ? "reflect_ok" : "reflect_empty", {
+          ms: Date.now() - t0,
+          chars: reflectAnswer.length,
+          query: prompt.slice(0, 80),
+          // Verbatim injected synthesis — the ONLY durable record of what the agent actually saw
+          // (post-mortems otherwise depend on the harness happening to persist hook context).
+          answer: reflectAnswer.slice(0, 8000),
+        });
+      } catch (e) {
+        // A failure is RETRYABLE, not an answer — `resolveInjection` leaves it unresolved until the
+        // budget is spent. Caching "" here meant one timeout on the session's first prompt disabled
+        // synthesis for the ENTIRE session, and against a real server a reflect near the timeout is a
+        // coin flip, not an edge case (#4607).
+        // ...except a permanent 4xx, which fails identically on every later turn: resolve it now
+        // rather than spend the session's second attempt on a call that cannot succeed (#5207).
+        reflectAnswer =
+          e instanceof ReflectError && e.permanent
+            ? ""
+            : resolveInjection(undefined, reflectAttempts);
+        reflectFailed = true;
+        log.warn(harness, "reflect failed — session runs without memory", {
+          error: describeError(e),
+        });
+        diag(harness, "reflect_failed", {
+          ms: Date.now() - t0,
+          bank: client.bank,
+          timeoutMs,
+          // Wider than describeError's default: the server's error body is the useful part.
+          error: describeError(e, 1500),
+          query: prompt.slice(0, 80),
+        });
+        if (e instanceof ReflectError && e.fallbackEligible) {
+          const fallbackResult = await reflectFallback(
+            harness,
+            prompt,
+            client,
+            cfg.injectTimeoutMs
+          );
+          fallback = fallbackResult?.body;
+          if (fallbackResult?.currentState) currentStateGate = fallbackResult.currentState;
+          // The fallback body is cached exactly like a reflect answer: injected once, not retried.
+          if (fallback) reflectAnswer = fallback;
+        }
       }
     }
   }
@@ -363,10 +628,13 @@ export async function buildHookOutput(args: {
     }
   }
 
+  const cachedGateForWrite =
+    cfg.autoInject !== "none" ? (currentStateGateCache ?? cached.currentStateGate) : undefined;
   writeSessionCache(cacheFile, {
     turns,
     reflectAnswer,
     reflectAttempts,
+    ...(cachedGateForWrite ? { currentStateGate: cachedGateForWrite } : {}),
     pages: { atTurn: stale ? turns : (cached.pages?.atTurn ?? turns), list: pages },
   } satisfies SessionCache);
 
@@ -389,13 +657,18 @@ export async function buildHookOutput(args: {
       })
     );
   }
+  if (currentStateGate) blocks.unshift(buildCurrentStateGate(currentStateGate));
   const kept = blocks.filter(Boolean);
 
   // User-facing notice ONLY on a turn that actually ran a source (reflect, pages or recall),
   // showing its assigned goal and a preview of what came back. Ordinary turns stay silent — page
   // content is pulled via the hindsight_search_knowledge_pages tool, a visible tool call.
   let notice: string | undefined;
-  if (fallback) {
+  if (currentStateGate) {
+    notice =
+      `${brandWord()} · current-state gate: ${currentStateGate.status} ` +
+      `· raw_facts_required=true · omitted_unsafe_pages=${currentStateGate.omittedUnsafePages}`;
+  } else if (fallback) {
     // Silent: the session still got memory, just not a synthesis. The notice used to say which
     // source answered and point at the diag file, but that read as an error on a turn that
     // worked; reflect_failed + reflect_fallback_* in the diag trail carry the details.

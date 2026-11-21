@@ -1,12 +1,40 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HindsightClient } from "./hindsight";
 import { buildPageTools } from "./page-tools";
-import { shapeFreshness } from "./page-freshness";
+import {
+  filterCurrentStatePages,
+  isCurrentStateQuery,
+  isPageSafeForCurrentState,
+  shapeFreshness,
+} from "./page-freshness";
 import { toPiTool } from "../harness/pi-extension";
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 const makeClient = () =>
   new HindsightClient({ apiUrl: "https://fixture.invalid", bank: "synthetic-bank" });
+const CURRENT_STATE_CASE_VARIANTS = [
+  "What is the current status?",
+  "What is the CURRENT answer?",
+  "What is the Latest answer?",
+  "What is the cUrReNt answer?",
+  "What was true AS OF yesterday?",
+  "当前状态是什么？",
+] as const;
+const CODE_ORIENTED_STATUS_VARIANTS = [
+  "How does the status code mapping work?",
+  "How does the STATUS CODE mapping work?",
+  "status code",
+  "Status Code",
+  "status-code",
+  "STATUS-CODE",
+  "status_code",
+  "STATUS_CODE",
+  "status()",
+  "status (value)",
+  "status = current",
+  "status:=current",
+  "request.status",
+] as const;
 const tool = (client: HindsightClient, name: string) =>
   buildPageTools(client, client.bank).find((t) => t.name === name)!;
 afterEach(() => vi.unstubAllGlobals());
@@ -117,6 +145,269 @@ describe("agent-facing page freshness", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/reflect"))).toBe(false);
   });
+
+  it("filters degraded pages for current-state queries without a hidden raw-recall call", async () => {
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const value = String(url);
+      if (value.includes("/pages/search"))
+        return json({
+          results: [
+            {
+              id: "p",
+              name: "Older page",
+              mental_model_id: "m",
+              snippet: "historical answer",
+            },
+          ],
+        });
+      if (value.includes("/mental-models?"))
+        return json({
+          items: [{ id: "m", is_stale: true, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
+          total: 1,
+        });
+      throw new Error("raw recall must be selected explicitly by the caller");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+      query: "What is the current answer?",
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.pages).toEqual([]);
+    expect(result.content[0].text).not.toContain("historical answer");
+    expect(payload.current_state_gate).toMatchObject({
+      applied: true,
+      omitted_unsafe_pages: 1,
+      safe_pages: 0,
+      raw_facts_required: true,
+      status: "unknown",
+      unknown_reason: "no_safe_page",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/memories/recall"))).toBe(
+      false
+    );
+  });
+
+  it("reports search_failed for a failed current-state page search", async () => {
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const value = String(url);
+      if (value.includes("/pages/search")) return json({ detail: "synthetic outage" }, 503);
+      return json({ roots: [] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+      query: "What is the current answer?",
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(payload.current_state_gate).toMatchObject({
+      applied: true,
+      safe_pages: 0,
+      raw_facts_required: true,
+      status: "unknown",
+      unknown_reason: "search_failed",
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/memories/recall"))).toBe(
+      false
+    );
+  });
+
+  it("applies the current-state gate to uppercase, title-case, and mixed-case page searches", async () => {
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const value = String(url);
+      if (value.includes("/pages/search"))
+        return json({
+          results: [
+            {
+              id: "p",
+              name: "Historical policy",
+              mental_model_id: "m",
+              snippet: "unsafe historical answer",
+            },
+          ],
+        });
+      return json({
+        items: [{ id: "m", is_stale: true, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
+        total: 1,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const query of CURRENT_STATE_CASE_VARIANTS) {
+      const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+        query,
+      });
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.pages).toEqual([]);
+      expect(result.content[0].text).not.toContain("unsafe historical answer");
+      expect(payload.current_state_gate).toMatchObject({
+        applied: true,
+        safe_pages: 0,
+        omitted_unsafe_pages: 1,
+        raw_facts_required: true,
+        status: "unknown",
+        unknown_reason: "no_safe_page",
+      });
+    }
+  });
+
+  it.each(CODE_ORIENTED_STATUS_VARIANTS)(
+    "keeps %s page search on the stable path instead of applying the current-state gate",
+    async (statusMarker) => {
+      const fetchMock = vi.fn(async (url: unknown) => {
+        const value = String(url);
+        if (value.includes("/pages/search"))
+          return json({
+            results: [
+              {
+                id: "p",
+                name: "Status mapping page",
+                mental_model_id: "m",
+                snippet: "status mapping architecture",
+              },
+            ],
+          });
+        return json({
+          items: [{ id: "m", is_stale: true, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
+          total: 1,
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+        query: statusMarker,
+      });
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.pages).toMatchObject([{ page: "Status mapping page" }]);
+      expect(payload.current_state_gate).toEqual({ applied: false });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  it("keeps stable background page search unchanged even when the page is stale", async () => {
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const value = String(url);
+      if (value.includes("/pages/search"))
+        return json({
+          results: [
+            {
+              id: "p",
+              name: "Architecture page",
+              mental_model_id: "m",
+              snippet: "historical structure",
+            },
+          ],
+        });
+      return json({
+        items: [{ id: "m", is_stale: true, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
+        total: 1,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+      query: "How is the architecture organized?",
+    });
+    const payload = JSON.parse(result.content[0].text);
+    expect(payload.pages).toMatchObject([{ page: "Architecture page" }]);
+    expect(payload.current_state_gate).toEqual({ applied: false });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires raw facts even for a page with a source watermark, because freshness is not truth", async () => {
+    const fetchMock = vi.fn(async (url: unknown) => {
+      const value = String(url);
+      if (value.includes("/pages/search"))
+        return json({
+          results: [{ id: "p", name: "Current page", mental_model_id: "m", snippet: "answer" }],
+        });
+      return json({
+        items: [{ id: "m", is_stale: false, last_memory_seen_at: "2025-01-03T00:00:00Z" }],
+        total: 1,
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await tool(makeClient(), "hindsight_search_knowledge_pages").handler({
+      query: "What is the current answer?",
+    });
+    const payload = JSON.parse(result.content[0].text);
+    // Current-state search is metadata-only even when freshness says the page is safe.
+    expect(payload.pages).toEqual([]);
+    expect(result.content[0].text).not.toContain("Current page");
+    expect(result.content[0].text).not.toContain("answer");
+    expect(payload.current_state_gate).toMatchObject({
+      status: "current_fact_unverified",
+      raw_facts_required: true,
+      omitted_unsafe_pages: 0,
+      safe_pages: 1,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies recency markers without treating identifiers as current-state queries", () => {
+    expect(isCurrentStateQuery("What is the latest retry policy?")).toBe(true);
+    for (const query of CURRENT_STATE_CASE_VARIANTS) expect(isCurrentStateQuery(query)).toBe(true);
+    expect(isCurrentStateQuery("Current upload policy?")).toBe(true);
+    expect(isCurrentStateQuery("What is the status as of today?")).toBe(true);
+    expect(isCurrentStateQuery("当前状态是什么？")).toBe(true);
+    for (const query of [
+      "current.status",
+      "obj.status",
+      "`status`",
+      "currentUser",
+      "status_code",
+    ]) {
+      expect(isCurrentStateQuery(query)).toBe(false);
+    }
+    expect(isCurrentStateQuery("Explain CURRENT_USER initialization")).toBe(false);
+    expect(isCurrentStateQuery("How does the architecture work?")).toBe(false);
+    expect(
+      isPageSafeForCurrentState({
+        state: "no_scoped_writes_reported",
+        source_watermark_available: true,
+      })
+    ).toBe(true);
+    expect(
+      isPageSafeForCurrentState({
+        state: "no_scoped_writes_reported",
+        source_watermark_available: false,
+      })
+    ).toBe(false);
+    expect(
+      filterCurrentStatePages("latest answer", [
+        {
+          freshness: { state: "stale", source_watermark_available: true },
+        },
+        {
+          freshness: { state: "no_scoped_writes_reported", source_watermark_available: true },
+        },
+      ])
+    ).toMatchObject({ omittedUnsafePages: 1, rawFactsRequired: true });
+  });
+
+  it.each(CURRENT_STATE_CASE_VARIANTS)(
+    "applies the metadata-only page gate to English case variants (%s)",
+    (query) => {
+      expect(
+        filterCurrentStatePages(query, [
+          { freshness: { state: "stale", source_watermark_available: true } },
+          {
+            freshness: {
+              state: "no_scoped_writes_reported",
+              source_watermark_available: true,
+            },
+          },
+        ])
+      ).toMatchObject({
+        omittedUnsafePages: 1,
+        rawFactsRequired: true,
+        hits: [{ freshness: { state: "no_scoped_writes_reported" } }],
+      });
+    }
+  );
 
   it("does not infer freshness from page age when metadata is unavailable", async () => {
     vi.stubGlobal(

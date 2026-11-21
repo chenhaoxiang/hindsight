@@ -76,6 +76,8 @@ describe("buildPagesPreamble", () => {
       );
       expect(out).toMatch(/missing metadata is unknown/);
       expect(out).toMatch(/deletions are not observed/);
+      expect(out).toMatch(/raw-facts-required or explicit unknown/);
+      expect(out).toMatch(/no hidden follow-up/);
       // No `s` flag ON PURPOSE: this must stay a per-LINE guard against the old wording
       // ("call hindsight_reflect with that goal FIRST"). With `s` it would span newlines and
       // match the legitimate "hindsight_reflect ..." / "FIRST STOP" lines further down the guide.
