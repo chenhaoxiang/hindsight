@@ -282,6 +282,27 @@ describe("readClaudeTranscript", () => {
     expect(result[0].content).not.toContain("hindsight_memory");
   });
 
+  it("strips the current-state gate from retained turns", () => {
+    writeFileSync(
+      file,
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content:
+            '<hindsight_current_state_gate>\n{"status":"unknown","raw_facts_required":true}\n' +
+            "</hindsight_current_state_gate>\nWhat is current?",
+        },
+      })
+    );
+
+    const result = readClaudeTranscript(file);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].content).toBe("What is current?");
+    expect(result[0].content).not.toContain("raw_facts_required");
+  });
+
   it("fails open (returns []) when the file cannot be read", () => {
     expect(readClaudeTranscript(join(root, "does-not-exist.jsonl"))).toEqual([]);
   });

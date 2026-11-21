@@ -20,7 +20,7 @@ export const TOOL_TEXT_CAP = 2000;
  *  Tag-structural, not content-guessing. The block is removed and any surrounding text KEPT — a
  *  message that is nothing but a wrapper then renders empty and is dropped as a no-content turn. */
 const MEMORY_TAG_RE =
-  /<(hook_prompt|task-notification|system-reminder|hindsight_memory|hindsight_memories|hindsight_bank|relevant_memories|user_feedback|hindsight_pages|hindsight_page_refresh|hindsight_knowledge|hindsight_knowledge_refresh)\b[\s\S]*?<\/\1>/g;
+  /<(hook_prompt|task-notification|system-reminder|hindsight_memory|hindsight_memories|hindsight_bank|relevant_memories|user_feedback|hindsight_pages|hindsight_page_refresh|hindsight_current_state_gate|hindsight_knowledge|hindsight_knowledge_refresh)\b[\s\S]*?<\/\1>/g;
 
 export function stripInjectedMemory(s: string): string {
   return s.replace(MEMORY_TAG_RE, "");

@@ -18,8 +18,12 @@ explains what happens automatically, which tools you have, and how to configure 
   conversations) and keeps 5 pages current. There is NO ingest command to run.
 - **Session synthesis**: by default, the first prompt of a session triggers one deep memory
   synthesis (`reflect`) injected into context. `autoInject` switches the source: `pages` (knowledge
-  page search hits), `recall` (recalled observations), or `none` (nothing injected; the agent
-  searches pages first, checks raw/recent facts when they lag, and reflects only for deeper reasoning).
+  page search hits), `recall` (recalled observations), or `none` (no automatic memory retrieval: no
+  current-state gate, reflect, recall, or page-body injection; the existing page-roster/tool-guide
+  cadence remains unchanged for explicit tools). In other automatic modes, current-state prompts
+  skip automatic reflect, page snippets/bodies are never injected, and no hidden raw/recent or page
+  fallback runs; the result is only a metadata-only `raw_facts_required` / `unknown` or
+  `current_fact_unverified` signal for explicit retrieval.
 - **Write-back**: the session transcript is retained into the bank automatically at session end
   (per-turn on opencode). The user never needs to "save" a conversation.
 

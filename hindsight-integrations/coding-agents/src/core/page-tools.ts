@@ -37,6 +37,8 @@ import {
   recentInput,
 } from "./memory-retrieval";
 import { boundedPageList, boundedPageRead, boundedPageSearch } from "./page-results";
+import { filterCurrentStatePages, isCurrentStateQuery } from "./page-freshness";
+import type { CurrentStateUnknownReason } from "./session-cache";
 
 export interface ToolResult {
   // Index signature so this structurally satisfies the MCP SDK's CallToolResult (which carries
@@ -80,6 +82,46 @@ const CREDIT_REMINDER =
   "silently — an unhelpful search needs no mention. These are past records: check a claim that " +
   "something was fixed or works against the code before relying on it.";
 
+type CurrentStateGate =
+  | { applied: false }
+  | {
+      applied: true;
+      omitted_unsafe_pages: number;
+      safe_pages: number;
+      raw_facts_required: true;
+      status: "current_fact_unverified";
+      note: string;
+    }
+  | {
+      applied: true;
+      omitted_unsafe_pages: number;
+      safe_pages: 0;
+      raw_facts_required: true;
+      status: "unknown";
+      unknown_reason: CurrentStateUnknownReason;
+      note: string;
+    };
+
+function currentStateUnknownGate(
+  reason: CurrentStateUnknownReason,
+  omittedUnsafePages = 0
+): Extract<CurrentStateGate, { applied: true; status: "unknown" }> {
+  return {
+    applied: true,
+    omitted_unsafe_pages: omittedUnsafePages,
+    safe_pages: 0,
+    raw_facts_required: true,
+    status: "unknown",
+    unknown_reason: reason,
+    note:
+      reason === "search_failed"
+        ? "Page search failed; the current state is unknown until raw/recent facts are checked."
+        : reason === "not_checked"
+          ? "Page search was not checked; the current state is unknown until raw/recent facts are checked."
+          : "No safe page was available; the current state is unknown until raw/recent facts are checked.",
+  };
+}
+
 export interface ToolSpec {
   name: string;
   description: string;
@@ -102,7 +144,7 @@ function ok(value: unknown): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value, null, 2) }] };
 }
 
-function err(e: unknown): ToolResult {
+function err(e: unknown, details?: Record<string, unknown>): ToolResult {
   const message = describeError(e);
   return {
     content: [
@@ -111,6 +153,7 @@ function err(e: unknown): ToolResult {
         text: JSON.stringify({
           error: message,
           ...(e instanceof MemoryReadUnavailableError ? { code: e.code } : {}),
+          ...details,
         }),
       },
     ],
@@ -200,10 +243,11 @@ export function buildPageTools(
           process.env.HINDSIGHT_CONFIG || join(homedir(), ".hindsight", "coding-agent.json");
         const harness = opts.harness ?? "unknown";
         // Resolve through the SAME pipeline the host used — including the `banks.<id>` section for
-        // the bank this client is bound to, which may carry its own apiToken/apiUrl. A bare
-        // loadConfig() would report a mismatch for every per-bank credential.
+        // the bank this client is bound to, which may carry its own apiToken/apiUrl. Pass the
+        // dynamically resolved path too: CONFIG_PATH is captured at module load, while this
+        // diagnostic already reports the current HINDSIGHT_CONFIG path.
         const cfg = applyBankConfig(
-          loadConfig({ harness: opts.harness }),
+          loadConfig({ path: configPath, harness: opts.harness }),
           bankId,
           opts.repoDir
         ).cfg;
@@ -250,7 +294,12 @@ export function buildPageTools(
         "Search this repository's Hindsight pages for content relevant to a query — " +
         "hybrid full-text + semantic search, server-side. Call this when the user's question may " +
         "be answered by the project's accumulated knowledge (architecture, conventions, decisions, " +
-        "initiatives) rather than by reading code. Returns ranked pages with a relevance snippet; " +
+        "initiatives) rather than by reading code. Returns ranked pages with a relevance snippet. " +
+        "For current-state questions (current/latest/now/still/as-of), page snippets and bodies are " +
+        "never returned: the result is a metadata-only raw-facts-required signal with safe/filtered " +
+        "page counts. Only pages with explicit no-scoped-writes-reported freshness plus a source " +
+        "watermark count as safe; when none remain the result is explicitly unknown. Stable background " +
+        "questions keep normal page search behavior. " +
         // Same sentence the payload carries, from the same constant: two copies of a rule this
         // fiddly drift apart, and the description is what a host shows when the tool is listed.
         "read a full page with hindsight_read_knowledge_page. " +
@@ -258,11 +307,28 @@ export function buildPageTools(
       inputSchema: { query: z.string().trim().min(1).max(2000).describe("what to look for") },
       annotations: READ_ONLY_ANNOTATIONS,
       handler: async (args: { query: string }) => {
+        let query: string | undefined;
         try {
           // Limit comes from the client (`pageSearchLimit`), so the tool and the hook's injection
           // can never drift apart — this used to pass its own literal 3.
-          const query = z.string().trim().min(1).max(2000).parse(args.query);
+          query = z.string().trim().min(1).max(2000).parse(args.query);
           const hits = await client.searchPages(query, { includeFreshness: true });
+          const gated = filterCurrentStatePages(query, hits);
+          const currentStateGate: CurrentStateGate = isCurrentStateQuery(query)
+            ? gated.hits.length
+              ? {
+                  applied: true,
+                  omitted_unsafe_pages: gated.omittedUnsafePages,
+                  safe_pages: gated.hits.length,
+                  raw_facts_required: true,
+                  status: "current_fact_unverified",
+                  note:
+                    "Pages are historical synthesis, not proof of current truth. Use " +
+                    "hindsight_recall or hindsight_recent_memories and verify the result against " +
+                    "the code.",
+                }
+              : currentStateUnknownGate("no_safe_page", gated.omittedUnsafePages)
+            : { applied: false };
           // No `score`. The server fuses BM25 and vector search with reciprocal rank fusion, so the
           // number is ~1/(60+rank) summed over two retrievers: a perfect top hit scores about 0.03
           // and nothing ever approaches 1. Handed that, a model reads a strong match as 3% relevant
@@ -274,13 +340,19 @@ export function buildPageTools(
           // see that?". The guide had scrolled far up the context by then; the instruction that
           // lands at the same moment as the results is the one that can still be acted on.
           return ok({
-            ...boundedPageSearch(hits),
+            ...(isCurrentStateQuery(query)
+              ? { pages: [], truncated: false }
+              : boundedPageSearch(gated.hits)),
             crediting,
             freshness_note:
-              "Freshness is scoped-write metadata, not a current-truth guarantee; deletions are not observed. Missing metadata is unknown.",
+              "Freshness is scoped-write metadata, not a current-truth guarantee; deletions are " +
+              "not observed. Missing metadata is unknown.",
+            current_state_gate: currentStateGate,
           });
         } catch (e) {
-          return err(e);
+          return query && isCurrentStateQuery(query)
+            ? err(e, { current_state_gate: currentStateUnknownGate("search_failed") })
+            : err(e);
         }
       },
     },
