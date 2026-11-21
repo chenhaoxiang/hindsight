@@ -111,7 +111,7 @@ describe("agent-facing page freshness", () => {
                 items: [{ id: "m", is_stale: false, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
               })
             ),
-          200
+          1_200
         );
         init?.signal?.addEventListener(
           "abort",
@@ -129,7 +129,7 @@ describe("agent-facing page freshness", () => {
 
     const result = await makeClient().searchPages("q", { timeoutMs, includeFreshness: true });
 
-    expect(performance.now() - started).toBeLessThan(180);
+    expect(performance.now() - started).toBeLessThan(500);
     expect(metadataAborted).toBe(true);
     expect(result[0].freshness?.state).toBe("unknown");
     expect(fetchMock).toHaveBeenCalledTimes(2);
