@@ -1017,13 +1017,19 @@ export class HindsightClient {
     sub: string,
     body?: unknown,
     tolerate: number[] = [],
-    timeoutMs?: number
+    timeoutMs?: number,
+    deadlineMs?: number
   ): Promise<Response | null> {
+    const remainingTimeout = () =>
+      deadlineMs === undefined ? timeoutMs : Math.max(deadlineMs - Date.now(), 1);
+    const hasBudget = () => deadlineMs === undefined || Date.now() < deadlineMs;
     const send = (legacy: boolean) =>
-      this.req(method, this.bankUrl(pagesPath(sub, legacy)), body, tolerate, timeoutMs);
+      this.req(method, this.bankUrl(pagesPath(sub, legacy)), body, tolerate, remainingTimeout());
+    if (!hasBudget()) return null;
     let r = await send(this.legacyPagesPaths);
     if (r.status !== 404 || !(await isEndpointMissing(r))) return r;
-    if (!this.legacyPagesPaths) {
+    // A legacy-path probe is part of this page request, not a second timeout window.
+    if (!this.legacyPagesPaths && hasBudget()) {
       r = await send(true);
       if (r.status !== 404 || !(await isEndpointMissing(r))) {
         this.legacyPagesPaths = true;
@@ -1135,7 +1141,11 @@ export class HindsightClient {
   > {
     if (this.pagesSupported === false) throw new PagesUnavailableError();
     const q = `?q=${encodeURIComponent(query)}&limit=${opts.limit ?? this.pageSearchLimit}`;
-    const r = await this.pagesReq("GET", `/search${q}`, undefined, [], opts.timeoutMs);
+    // The hook's injectTimeoutMs covers the whole current-state retrieval, including this
+    // optional metadata batch; carry an absolute deadline so a slow page search cannot buy a
+    // second full timeout for freshness.
+    const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+    const r = await this.pagesReq("GET", `/search${q}`, undefined, [], opts.timeoutMs, deadline);
     // Routed through the same check as every other page endpoint. Without it a server with no
     // pages API parsed its own 404 body into zero hits and reported "nothing matched"
     // forever, which reads as an empty bank rather than a missing feature.
@@ -1153,7 +1163,12 @@ export class HindsightClient {
       }[];
     };
     const models =
-      opts.includeFreshness && j.results?.length ? await modelMetadata(this) : undefined;
+      opts.includeFreshness && j.results?.length
+        ? await modelMetadata(
+            this,
+            deadline === undefined ? undefined : Math.max(deadline - Date.now(), 0)
+          )
+        : undefined;
     return (j.results ?? []).map((x) => ({
       id: x.id,
       name: x.name,

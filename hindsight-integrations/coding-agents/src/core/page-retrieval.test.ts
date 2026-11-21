@@ -34,6 +34,8 @@ const CODE_ORIENTED_STATUS_VARIANTS = [
   "status = current",
   "status:=current",
   "request.status",
+  "How does the operation status transition work?",
+  "Explain the status field in the operation model.",
 ] as const;
 const tool = (client: HindsightClient, name: string) =>
   buildPageTools(client, client.bank).find((t) => t.name === name)!;
@@ -88,6 +90,49 @@ describe("agent-facing page freshness", () => {
     expect(String(fetchMock.mock.calls[1][0])).toContain(
       "mental-models?detail=metadata&limit=1000&offset=0"
     );
+  });
+
+  it("shares the search timeout with freshness metadata instead of waiting a second full window", async () => {
+    const timeoutMs = 100;
+    let metadataAborted = false;
+    const started = performance.now();
+    const fetchMock = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (String(url).includes("/pages/search")) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return json({
+          results: [{ id: "p", name: "Page", mental_model_id: "m", snippet: "synthetic" }],
+        });
+      }
+      await new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(
+          () =>
+            resolve(
+              json({
+                items: [{ id: "m", is_stale: false, last_memory_seen_at: "2025-01-01T00:00:00Z" }],
+              })
+            ),
+          200
+        );
+        init?.signal?.addEventListener(
+          "abort",
+          () => {
+            metadataAborted = true;
+            clearTimeout(timer);
+            reject(init.signal?.reason);
+          },
+          { once: true }
+        );
+      });
+      throw new Error("metadata response unexpectedly completed");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await makeClient().searchPages("q", { timeoutMs, includeFreshness: true });
+
+    expect(performance.now() - started).toBeLessThan(180);
+    expect(metadataAborted).toBe(true);
+    expect(result[0].freshness?.state).toBe("unknown");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("reads a lagging page then newer unconsolidated facts through the same bank-bound native tools", async () => {

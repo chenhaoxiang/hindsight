@@ -46,6 +46,8 @@ const CODE_ORIENTED_STATUS_VARIANTS = [
   "status = ready",
   "status:=ready",
   "request.status",
+  "How does the operation status transition work?",
+  "Explain the status field in the operation model.",
 ] as const;
 
 const EXPECTED_TOOLS = [

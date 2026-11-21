@@ -57,6 +57,8 @@ const CODE_ORIENTED_STATUS_VARIANTS = [
   "status = current",
   "status:=current",
   "request.status",
+  "How does the operation status transition work?",
+  "Explain the status field in the operation model.",
 ] as const;
 /** A prompt matching nothing in the page. */
 const UNRELATED_PROMPT = "completely unrelated banana smoothie question";

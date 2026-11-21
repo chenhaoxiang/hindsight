@@ -22,7 +22,7 @@ export interface PageFreshness {
  * function calls, and assignments cannot trigger a gate.
  */
 const CURRENT_STATE_ENGLISH =
-  /\b(?:current(?:ly)?|latest|now|today|still|recent(?:ly)?|status)\b|\bas[- ]of\b|\bup[- ]to[- ]date\b/iu;
+  /\b(?:current(?:ly)?|latest|now|today|still|recent(?:ly)?)\b|\bas[- ]of\b|\bup[- ]to[- ]date\b/iu;
 const CURRENT_STATE_CJK = /当前|目前|最新|现在|近期|仍然|状态/u;
 const CODE_LIKE_QUERY_PART =
   /`[^`]*`|\bstatus(?:[ _-])code\b|\bstatus\s*\([^)\n]*\)|\bstatus\s*:?=[^\n;]*|[$\w]+(?:\??\.[$\w]+)+/giu;
@@ -109,15 +109,19 @@ export function shapeFreshness(model?: Model, node?: PageNode): PageFreshness {
 /** One bounded metadata-only batch, never N reads of model bodies/reflect traces. Beyond this
  *  page or on older/unavailable endpoints, unmatched metadata remains unknown. No shared in-flight
  *  cancellation or freshness cache: cancelling one tool cannot poison another's metadata read. */
-export async function modelMetadata(client: Client): Promise<Map<string, Model>> {
+export async function modelMetadata(
+  client: Client,
+  timeoutMs = 2_000
+): Promise<Map<string, Model>> {
   const models = new Map<string, Model>();
+  if (timeoutMs <= 0) return models;
   try {
     const response = await client.req(
       "GET",
       client.bankUrl("/mental-models?detail=metadata&limit=1000&offset=0"),
       undefined,
       [],
-      2_000
+      timeoutMs
     );
     if (!response.ok) return models;
     const data = (await response.json()) as { items?: unknown };
