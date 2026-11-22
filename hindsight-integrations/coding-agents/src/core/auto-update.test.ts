@@ -238,12 +238,8 @@ describe("maybeAutoUpdate", () => {
     binOnPath: extra.binOnPath ?? (() => true),
   });
 
-  it.each([
-    "0.8.5-fork.1",
-    "0.8.5-fork.1+build.2",
-    "0.8.7-fork.1",
-    "0.8.7-fork.2",
-  ])("never replaces maintenance version %s through the official updater",
+  it.each(["0.8.5-fork.1", "0.8.5-fork.1+build.2", "0.8.7-fork.1", "0.8.7-fork.2"])(
+    "never replaces maintenance version %s through the official updater",
     async (version) => {
       const { runtime, spawn, npmViewOk } = staged(version);
       const lookup = npmViewOk("99.0.0");
