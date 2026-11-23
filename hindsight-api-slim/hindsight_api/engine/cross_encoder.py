@@ -1388,8 +1388,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         if max_question_tokens is not None:
             if max_question_tokens < self.MIN_QUESTION_TOKENS:
                 raise ValueError(
-                    f"max_question_tokens must be at least {self.MIN_QUESTION_TOKENS}, "
-                    f"not {max_question_tokens}"
+                    f"max_question_tokens must be at least {self.MIN_QUESTION_TOKENS}, not {max_question_tokens}"
                 )
             self.MAX_QUESTION_TOKENS = max_question_tokens
         # The vocabulary those budgets are counted in (HINDSIGHT_API_DECISION_MODEL_TOKENIZER);

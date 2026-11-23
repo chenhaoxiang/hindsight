@@ -16295,10 +16295,7 @@ class MemoryEngine(MemoryEngineInterface):
                     )
                 return None
             max_question_tokens = setup.max_request_tokens
-            if (
-                max_question_tokens is not None
-                and max_question_tokens < TypeSafeCrossEncoder.MIN_QUESTION_TOKENS
-            ):
+            if max_question_tokens is not None and max_question_tokens < TypeSafeCrossEncoder.MIN_QUESTION_TOKENS:
                 # The shared DecisionModel floor is lower than TypeSafe's retry floor.
                 # Do not turn a valid shared-model setting into a page/reflect startup
                 # failure; leave the TypeSafe client on its historical safe default.

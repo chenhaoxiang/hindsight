@@ -107,6 +107,7 @@ class ServerTokenizerBudget:
             available = self.max_input_tokens - self.token_overhead - len(query_tokens)
             if available <= 0:
                 raise RerankInputBudgetError("Reranker query leaves no document budget; query was not truncated")
+
             async def fit_document(document: str) -> str:
                 async with self._tokenizer_semaphore:
                     tokens = await self._tokenize(document)
