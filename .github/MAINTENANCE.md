@@ -183,7 +183,9 @@ Current stable update candidate (source/PR acceptance only, not installation):
   [.github/patches/api-1.2.3-fork.1.patch](patches/api-1.2.3-fork.1.patch). The overlay preserves the fork.2 TypeSafe decision budget alignment, fork.3 process-wide tokenizer semaphore and reranker input budget, fork.4 low-budget TypeSafe retry floor/tokenizer cap, and the later refresh-decision budget fixes. The maintenance API production tree equals this export plus overlay. The full official wrapper keeps its `==1.2.3` dependency, satisfied by the local `1.2.3+fork.1` version.
 - Coding Agents `0.8.7-fork.2`: npm `0.8.7` source
   `329f8a5ac9baa5567f4516a24dc9fd0f753a75ae` plus the maintained adapter,
-  layered retrieval, source-scoped initiative and update-guard changes.
+  layered retrieval, source-scoped initiative, update-guard and current-state
+  retrieval-gate changes. The exact release source is the normal merge of the
+  release PR from main head `7bbd56eded8cbcb23f2d9d9b45a181e6611ba66f`.
   The integration subtree of the pinned API release equals that published component
   source; this was checked independently, not inferred from the API tag.
   Package, lockfile and plugin versions agree. Native tool names remain the existing
