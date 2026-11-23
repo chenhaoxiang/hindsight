@@ -5,12 +5,37 @@ import type { PageRef } from "./page-injection";
 import type { RetainCursor, RetainCursorStore } from "./retain-cursor";
 import type { UsageCursorStore } from "./usage";
 
+/** Metadata-only result of one current-state page gate. Keep this independent from hook.ts so the
+ * session cache does not import runtime logic (and can remain a best-effort, backwards-compatible
+ * JSON handoff between separate hook processes). */
+export type CurrentStateUnknownReason = "no_safe_page" | "search_failed" | "not_checked";
+
+export interface CurrentStateGateMetadata {
+  status: "current_fact_unverified" | "unknown";
+  omittedUnsafePages: number;
+  safePages: number;
+  rawFactsRequired: true;
+  /** Present for newly-written unknown gates; absent is a legacy-cache value. */
+  unknownReason?: CurrentStateUnknownReason;
+}
+
+/** The one bounded current-state gate remembered for a session. The query itself is never stored;
+ * the fingerprint prevents a gate for one prompt from being reused for another prompt. */
+export interface CurrentStateGateCache {
+  queryFingerprint: string;
+  gate: CurrentStateGateMetadata;
+}
+
 /** Process-shared state for hook harnesses. SessionStart and prompt hooks are separate Node
  * processes, so this temp-file handoff carries lifecycle decisions without writing user config or
  * bank state. */
 export interface SessionCache {
   turns?: number;
   reflectAnswer?: string; // present (even "") = reflect already resolved this session
+  /** One metadata-only current-state gate per session/query. It is intentionally separate from
+   * reflectAnswer: a gate is not an empty injection result and must not spend the normal retry
+   * budget or become a cached empty answer. */
+  currentStateGate?: CurrentStateGateCache;
   /** How many times auto-inject has been ATTEMPTED this session — every source, not just reflect.
    *  A failure leaves `reflectAnswer` unset so a later turn can retry; this bounds that retry (see
    *  HOOK_INJECT_ATTEMPTS). Named for reflect like `reflectAnswer` above, whose name also predates

@@ -178,20 +178,18 @@ are separately identifiable. A rejected or interrupted validation is retained as
 
 Current stable update candidate (source/PR acceptance only, not installation):
 
-- API `1.2.1-fork.4` / Python `1.2.1+fork.4`: exact upstream `v1.2.1`,
-  `0eb02d8c418eac6b489bc63883c993b2257dfac4`, plus
-  [.github/patches/api-1.2.1-fork.4.patch](patches/api-1.2.1-fork.4.patch). The fork.2 overlay aligned TypeSafe decision requests with the configured self-hosted decision endpoint context budget; fork.3 adds a process-wide tokenizer semaphore for self-hosted Cohere-compatible rerankers; fork.4 preserves the low-budget TypeSafe retry floor and the tokenizer cap.
-  The maintenance API production tree equals this export plus overlay. The full
-  official wrapper keeps its `==1.2.1` dependency, satisfied by the local version.
-- Coding Agents `0.8.7-fork.1`: npm `0.8.7` source
+- API `1.2.3-fork.1` / Python `1.2.3+fork.1`: exact upstream `v1.2.3`,
+  `bd230e8bb40e768bf69f266f1dd3c9ae03e22fe3`, plus
+  [.github/patches/api-1.2.3-fork.1.patch](patches/api-1.2.3-fork.1.patch). The overlay preserves the fork.2 TypeSafe decision budget alignment, fork.3 process-wide tokenizer semaphore and reranker input budget, fork.4 low-budget TypeSafe retry floor/tokenizer cap, and the later refresh-decision budget fixes. The maintenance API production tree equals this export plus overlay. The full official wrapper keeps its `==1.2.3` dependency, satisfied by the local `1.2.3+fork.1` version.
+- Coding Agents `0.8.7-fork.2`: npm `0.8.7` source
   `329f8a5ac9baa5567f4516a24dc9fd0f753a75ae` plus the maintained adapter,
   layered retrieval, source-scoped initiative and update-guard changes.
   The integration subtree of the pinned API release equals that published component
   source; this was checked independently, not inferred from the API tag.
   Package, lockfile and plugin versions agree. Native tool names remain the existing
   ten, including the three `*_knowledge_page*` names, without renamed duplicates.
-- Control Plane uses official `1.2.1`; no fork installation or UI runtime is changed
-  by this candidate. Do not use an unpublished monorepo tip for any component.
+- Control Plane uses official `1.2.3`; no fork installation or UI runtime is changed
+  by this API candidate. Do not use an unpublished monorepo tip for any component.
 
 Upstream's Pages rename keeps the underlying `knowledge_pages` table, page IDs and
 content. Its deprecated `/knowledge-base` HTTP routes, old MCP names, config/env aliases,
@@ -213,23 +211,21 @@ request deadlines or replacing a host's dispatcher with an unrelated client.
 
 #### Upstream schema changes to plan before installation
 
-Compared with the previous pinned stable API `v1.2.0` (head `c7e2f9a4d1b8`),
-`v1.2.1` adds these revisions in order:
+Compared with the previously installed fork API head `05867433a58c`, community `v1.2.3`
+adds these PostgreSQL knowledge-bank revisions in order:
 
-1. `d3f8a1c6e9b2`: Oracle-only composite foreign-key indexes; PostgreSQL no-op.
-2. `d3e8a1f5c7b2`: nullable `graph_maintenance_queue.claimed_at`, PostgreSQL and
-   Oracle. The relink claim protocol uses short transactions and clears the stamp
-   on re-queue; the new runtime requires the new column.
-3. `05867433a58c`: PostgreSQL `banks_with_attachments_in_window` discovery routine
-   for the attachment sweep; Oracle no-op. No new table or page-content conversion.
+1. `k7b1c2d3e4f5`: adds `banks.kind`, knowledge-bank document/passage/staging tables and
+   their indexes. Existing memory-bank rows remain in place.
+2. `300fe58170e9`: rebuilds knowledge-passage keyword search with the `simple` tokenizer
+   and drops the now-unused document language column.
+3. `kbtok1a2b3c4`: adds `kb_documents.content_tokens` for knowledge-bank metering.
 
-The existing bank-alias migration has only an identifier-comment correction.
-The fork overlay adds no schema revision. API startup normally applies upstream
-migrations: installation must therefore include the normal backup/migration/rollback
-planning rather than calling this source change schema-free. This lane activates none
-against an existing store; deterministic tests migrate disposable synthetic stores only.
-Do not blindly downgrade a store with relocated chunks or undo its schema to reuse an
-older executable. A runtime/data rollback is a separate verified operation.
+The fork overlay adds no schema revision. API startup normally applies upstream migrations:
+installation therefore requires the normal backup/migration/rollback planning rather than
+calling this source change schema-free. The 1.2.3-fork.1 installation was performed only
+against the already backed-up local store; deterministic tests migrate disposable stores.
+Do not blindly downgrade a store after these revisions or undo its schema to reuse an older
+executable. A runtime/data rollback is a separate verified operation.
 
 Preserve all previous overlays and Releases byte-for-byte:
 

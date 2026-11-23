@@ -3100,6 +3100,11 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Knowledge banks linked to this memory bank (recall/reflect return their passages)
+        knowledge_banks: list[str] | None = None,
+        # How reflect searches those knowledge banks
+        reflect_kb_search_media_types: list[str] | None = None,
+        reflect_kb_search_apply_tags: bool | None = None,
         # Gemini safety settings
         llm_gemini_safety_settings: list[dict[str, str]] | None = None,
         # Security / audit
@@ -3173,6 +3178,9 @@ class Hindsight:
                 disposition_literalism=disposition_literalism,
                 disposition_empathy=disposition_empathy,
                 mcp_enabled_tools=mcp_enabled_tools,
+                knowledge_banks=knowledge_banks,
+                reflect_kb_search_media_types=reflect_kb_search_media_types,
+                reflect_kb_search_apply_tags=reflect_kb_search_apply_tags,
                 llm_gemini_safety_settings=llm_gemini_safety_settings,
                 memory_defense=memory_defense,
                 audit_log_enabled=audit_log_enabled,
@@ -3250,6 +3258,11 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Knowledge banks linked to this memory bank (recall/reflect return their passages)
+        knowledge_banks: list[str] | None = None,
+        # How reflect searches those knowledge banks
+        reflect_kb_search_media_types: list[str] | None = None,
+        reflect_kb_search_apply_tags: bool | None = None,
         # Gemini safety settings
         llm_gemini_safety_settings: list[dict[str, str]] | None = None,
         # Security / audit
@@ -3346,6 +3359,12 @@ class Hindsight:
             disposition_literalism: How literally to interpret information (1=flexible, 5=literal).
             disposition_empathy: How much to consider emotional context (1=detached, 5=empathetic).
             mcp_enabled_tools: List of MCP tool names to enable for this bank.
+            knowledge_banks: Knowledge banks linked to this bank: reflect also searches them and treats
+                their passages as authoritative. Recall is unchanged.
+            reflect_kb_search_media_types: Media types reflect's knowledge-bank search may return
+                (some of "document", "image", "audio", "video", "text"); unset returns all.
+            reflect_kb_search_apply_tags: Filter the knowledge-bank search by the reflect's tags,
+                tags_match and tag_groups, as its memories are (default True).
             llm_gemini_safety_settings: Gemini/VertexAI safety overrides, as a list of
                 ``{"category": ..., "threshold": ...}`` dicts (the shape the provider takes).
             memory_defense: Memory-defense (prompt-injection / secret redaction) settings.
@@ -3420,6 +3439,9 @@ class Hindsight:
                 "disposition_literalism": disposition_literalism,
                 "disposition_empathy": disposition_empathy,
                 "mcp_enabled_tools": mcp_enabled_tools,
+                "knowledge_banks": knowledge_banks,
+                "reflect_kb_search_media_types": reflect_kb_search_media_types,
+                "reflect_kb_search_apply_tags": reflect_kb_search_apply_tags,
                 "llm_gemini_safety_settings": llm_gemini_safety_settings,
                 "memory_defense": memory_defense,
                 "audit_log_enabled": audit_log_enabled,

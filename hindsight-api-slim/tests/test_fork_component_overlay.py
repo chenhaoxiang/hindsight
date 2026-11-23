@@ -51,13 +51,13 @@ def test_fork_distribution_satisfies_unchanged_api_wrapper(overlay: Path) -> Non
 
 def test_current_overlay_reproduces_maintenance_api_source() -> None:
     """The stable build and reviewed maintenance source must have one truth."""
-    overlay = ROOT / ".github/patches/api-1.2.1-fork.4.patch"
+    overlay = ROOT / ".github/patches/api-1.2.3-fork.1.patch"
     # Reverse-check every hunk against current production bytes without writing files.
     # This also runs in a shallow source checkout with no release tags available.
     subprocess.run(["git", "apply", "--reverse", "--check", "--unidiff-zero", str(overlay)], cwd=ROOT, check=True)
     from hindsight_api import __version__
 
-    assert __version__ == "1.2.1-fork.4"
+    assert __version__ == "1.2.3-fork.1"
     # Reuse remains opt-in across the component update.
     from hindsight_api.config import DEFAULT_RETAIN_STABLE_CHUNKS
 

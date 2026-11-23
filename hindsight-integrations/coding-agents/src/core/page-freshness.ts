@@ -14,6 +14,59 @@ export interface PageFreshness {
   source_watermark_available: boolean;
 }
 
+/**
+ * A current-state question asks about a value that may have changed since a page was synthesized.
+ * Keep this classifier deterministic and deliberately small: it is a retrieval safety gate, not a
+ * language model intent guess. Remove code-like spans before applying the ordinary word-boundary
+ * checks, so dotted/member-access identifiers, backtick-quoted names, status-code identifiers,
+ * function calls, and assignments cannot trigger a gate.
+ */
+const CURRENT_STATE_ENGLISH =
+  /\b(?:current(?:ly)?|latest|now|today|still|recent(?:ly)?)\b|\bas[- ]of\b|\bup[- ]to[- ]date\b/iu;
+const CURRENT_STATE_CJK = /当前|目前|最新|现在|近期|仍然|状态/u;
+const CODE_LIKE_QUERY_PART =
+  /`[^`]*`|\bstatus(?:[ _-])code\b|\bstatus\s*\([^)\n]*\)|\bstatus\s*:?=[^\n;]*|[$\w]+(?:\??\.[$\w]+)+/giu;
+
+export function isCurrentStateQuery(query: string): boolean {
+  const prose = query.replace(CODE_LIKE_QUERY_PART, " ");
+  return CURRENT_STATE_ENGLISH.test(prose) || CURRENT_STATE_CJK.test(prose);
+}
+
+/**
+ * Only an explicit server report that no scoped writes were observed is acceptable as the page-only
+ * source for a current-state question. Unknown metadata is unsafe here: page age is not a freshness
+ * proof, and a failed/stale refresh cannot be treated as current. This remains a scoped-write signal,
+ * not a correctness guarantee.
+ */
+export function isPageSafeForCurrentState(
+  freshness?: Pick<PageFreshness, "state" | "source_watermark_available"> | null
+): boolean {
+  return freshness?.state === "no_scoped_writes_reported" && freshness.source_watermark_available;
+}
+
+/**
+ * Current-state results are metadata-only: withhold every page's content, and count degraded page
+ * hits as unsafe. Every current-state result requires an explicit raw/recent check; if no explicitly
+ * safe page remains, the integration emits an unknown signal rather than silently presenting a stale
+ * synthesis. The caller chooses whether to make the separate raw/recent read. Stable/background
+ * questions keep the normal page result set.
+ */
+export function filterCurrentStatePages<
+  T extends { freshness?: Pick<PageFreshness, "state" | "source_watermark_available"> },
+>(
+  query: string,
+  hits: readonly T[]
+): { hits: T[]; omittedUnsafePages: number; rawFactsRequired: boolean } {
+  if (!isCurrentStateQuery(query))
+    return { hits: [...hits], omittedUnsafePages: 0, rawFactsRequired: false };
+  const safe = hits.filter((hit) => isPageSafeForCurrentState(hit.freshness));
+  return {
+    hits: safe,
+    omittedUnsafePages: hits.length - safe.length,
+    rawFactsRequired: true,
+  };
+}
+
 function timestamp(value: unknown): string | null {
   return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value))
     ? value
@@ -56,15 +109,19 @@ export function shapeFreshness(model?: Model, node?: PageNode): PageFreshness {
 /** One bounded metadata-only batch, never N reads of model bodies/reflect traces. Beyond this
  *  page or on older/unavailable endpoints, unmatched metadata remains unknown. No shared in-flight
  *  cancellation or freshness cache: cancelling one tool cannot poison another's metadata read. */
-export async function modelMetadata(client: Client): Promise<Map<string, Model>> {
+export async function modelMetadata(
+  client: Client,
+  timeoutMs = 2_000
+): Promise<Map<string, Model>> {
   const models = new Map<string, Model>();
+  if (timeoutMs <= 0) return models;
   try {
     const response = await client.req(
       "GET",
       client.bankUrl("/mental-models?detail=metadata&limit=1000&offset=0"),
       undefined,
       [],
-      2_000
+      timeoutMs
     );
     if (!response.ok) return models;
     const data = (await response.json()) as { items?: unknown };
