@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, StrictInt, StrictStr
 
+from .._cross_loop import CrossLoopSemaphore
 from .aiohttp_session import LoopLocalSession, per_phase_timeout, raise_for_status
 
 
@@ -37,11 +38,14 @@ class ServerTokenizerBudget:
         max_input_tokens: int,
         token_overhead: int = 128,
         timeout: float = 30.0,
+        max_concurrent: int = 4,
     ) -> None:
         if max_input_tokens <= 0 or token_overhead < 0 or token_overhead >= max_input_tokens:
             raise RerankInputBudgetError("Reranker input budget must exceed its nonnegative template reserve")
         if not math.isfinite(timeout) or timeout <= 0:
             raise RerankInputBudgetError("Tokenizer timeout must be finite and positive")
+        if max_concurrent < 1:
+            raise RerankInputBudgetError("Tokenizer concurrency must be at least 1")
         rerank = urlsplit(rerank_url or "")
         tokenizer = urlsplit(tokenizer_url)
         # Reuse the existing credential only at the operator's same-origin endpoint.
@@ -66,6 +70,9 @@ class ServerTokenizerBudget:
         self.max_input_tokens = max_input_tokens
         self.token_overhead = token_overhead
         self.timeout = min(timeout, 30.0)
+        # One process-wide permit set per budget client, shared across event loops.
+        # A per-fit asyncio.Semaphore still multiplied fan-out across concurrent recalls.
+        self._tokenizer_semaphore = CrossLoopSemaphore(max_concurrent)
         self._session = LoopLocalSession(
             timeout=per_phase_timeout(self.timeout),
             headers={"Authorization": f"Bearer {api_key}"},
@@ -100,10 +107,9 @@ class ServerTokenizerBudget:
             available = self.max_input_tokens - self.token_overhead - len(query_tokens)
             if available <= 0:
                 raise RerankInputBudgetError("Reranker query leaves no document budget; query was not truncated")
-            semaphore = asyncio.Semaphore(8)  # Per-call, on this loop; no process-global asyncio primitive.
 
             async def fit_document(document: str) -> str:
-                async with semaphore:
+                async with self._tokenizer_semaphore:
                     tokens = await self._tokenize(document)
                     if document and not tokens:
                         raise RerankInputBudgetError("Tokenizer returned no tokens for a nonempty document")
