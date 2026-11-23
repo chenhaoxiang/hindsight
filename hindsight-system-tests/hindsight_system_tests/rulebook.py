@@ -523,6 +523,11 @@ class RerankStub:
     #: The image formats each decision-model request carried, by placeholder (empty: no images).
     assets: list[dict[str, str]]
 
+    #: Legacy bounded-rerank story telemetry retained for the fork's input-budget regression.
+    queries: list[str]
+    max_input_characters: int | None
+    token_overhead: int
+
     #: Answer every decision-model request with this provider error instead, for the
     #: stories about a recall whose decision model fails. The /rerank endpoint ignores it.
     fail_with_status: int | None = None
@@ -538,6 +543,9 @@ class RerankStub:
         self.repeats = set()
         self.ranked = []
         self.assets = []
+        self.queries = []
+        self.max_input_characters = None
+        self.token_overhead = 0
 
     def repeat(self, memory_a: str, memory_b: str) -> float:
         return 0.9 if any(a in memory_a and b in memory_b for a, b in self.repeats) else 0.1
@@ -634,7 +642,11 @@ class Stubs:
         self.rerank.rerank_scores = {}
         self.rerank.states = []
         self.rerank.repeats = set()
+        self.rerank.ranked = []
         self.rerank.assets = []
+        self.rerank.queries = []
+        self.rerank.max_input_characters = None
+        self.rerank.token_overhead = 0
         self.rerank.fail_with_status = None
         self.rerank.rerank_fail_with_status = None
         self.triage.reset()

@@ -362,9 +362,17 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
             return _provider_error(f"stub provider error {status}", code="stub_error", status=status)
 
         query = body["query"]
+        stubs.rerank.queries.append(query)
         # An image document (knowledge search's page or photo) is scored by its text; its picture is
         # recorded like a decision model's asset, by its format.
         documents = [document if isinstance(document, str) else document["text"] for document in body["documents"]]
+        if stubs.rerank.max_input_characters is not None:
+            if any(
+                len(query) + len(document) + stubs.rerank.token_overhead > stubs.rerank.max_input_characters
+                for document in documents
+            ):
+                return JSONResponse({"error": "fixture input limit exceeded"}, status_code=500)
+        stubs.rerank.ranked.extend(documents)
         stubs.rerank.assets.append(
             {str(index): "jpg" for index, document in enumerate(body["documents"]) if not isinstance(document, str)}
         )
