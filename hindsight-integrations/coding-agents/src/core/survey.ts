@@ -44,7 +44,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { stringify as tomlStringify } from "smol-toml";
 import { describeError, log } from "./log";
-import { binOnPath } from "./util";
+import { binOnPath, nodeBinary } from "./util";
 import { resolveHostConfig } from "./host-client";
 import {
   acquireLease,
@@ -238,13 +238,20 @@ function buildSurveyPlan(
       const mcpConfig = JSON.stringify({
         mcpServers: {
           hindsight: {
-            command: "node",
+            command: nodeBinary(),
             args: [opts.mcpServerPath],
             // HINDSIGHT_MCP_HARNESS names the agent whose CLI this recipe drives — the survey's
             // ingests are its writes. mcp-server.js REQUIRES it (it used to default to
             // "claude-code", which is how the codex recipe below silently stamped its findings
             // harness:claude-code and wrote them to Claude Code's bank — #3603).
-            env: { HINDSIGHT_MCP_PROJECT_CWD: repoDir, HINDSIGHT_MCP_HARNESS: "claude-code" },
+            // HINDSIGHT_DISABLE_HOOKS is set here, not only on the CLI process: it is what keeps the
+            // write tools registered under `writeTools: false` (page-tools.ts), and a host may start
+            // MCP servers without its own environment (Codex does).
+            env: {
+              HINDSIGHT_MCP_PROJECT_CWD: repoDir,
+              HINDSIGHT_MCP_HARNESS: "claude-code",
+              HINDSIGHT_DISABLE_HOOKS: "1",
+            },
           },
         },
       });
@@ -284,13 +291,15 @@ function buildSurveyPlan(
           "--sandbox",
           "read-only",
           "-c",
-          `mcp_servers.hindsight.command="node"`,
+          `mcp_servers.hindsight.command=${tomlValue(nodeBinary())}`,
           "-c",
           `mcp_servers.hindsight.args=${tomlValue([opts.mcpServerPath])}`,
           "-c",
           `mcp_servers.hindsight.env.HINDSIGHT_MCP_PROJECT_CWD=${tomlValue(repoDir)}`,
           "-c",
           `mcp_servers.hindsight.env.HINDSIGHT_MCP_HARNESS="codex"`,
+          "-c", // see the claude recipe: keeps the write tools under `writeTools: false`
+          `mcp_servers.hindsight.env.HINDSIGHT_DISABLE_HOOKS="1"`,
           SURVEY_PROMPT,
         ],
         env,
@@ -436,7 +445,7 @@ export async function startCodebaseSurvey(
       try {
         // The agent inherits the supervisor's cwd and env. The spec rides in the environment,
         // never argv — see SURVEY_SPEC_ENV for the endpoint-security kill that argv triggers.
-        const child = spawnFn("node", [supervisorPath], {
+        const child = spawnFn(nodeBinary(), [supervisorPath], {
           cwd: repoDir,
           detached: true,
           stdio: "ignore",

@@ -21,7 +21,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, isAbsolute } from "node:path";
-import { DEFAULT_DAEMON_PORT } from "./config";
+import { CLOUD_URL, DEFAULT_DAEMON_PORT } from "./config";
 
 /** The old per-agent Claude Code plugin's name in Claude's plugin registry (`<name>@<marketplace>`). */
 const LEGACY_CLAUDE_PLUGIN = "hindsight-memory";
@@ -36,8 +36,9 @@ const LEGACY_CLAUDE_PLUGIN = "hindsight-memory";
  * so the session start is where the user finds out.
  *
  * Read from Claude's own files: `plugins/installed_plugins.json` for what is installed (user scope,
- * or a project/local scope whose `projectPath` contains `cwd`) and `settings.json` `enabledPlugins`
- * for an explicit disable. Any read failure means "not detected" — this only ever adds a warning.
+ * or a project/local scope whose `projectPath` contains `cwd`) and `enabledPlugins` in the local,
+ * project and user `settings.json` (the first that sets it wins) for an explicit disable. Any read
+ * failure means "not detected" — this only ever adds a warning.
  */
 export function detectLegacyClaudePlugin(
   cwd: string,
@@ -46,12 +47,16 @@ export function detectLegacyClaudePlugin(
   const registry = readJson(join(claudeDir, "plugins", "installed_plugins.json"));
   const plugins = registry?.plugins;
   if (!plugins || typeof plugins !== "object") return undefined;
-  const enabled = readJson(join(claudeDir, "settings.json"))?.enabledPlugins as
-    | Record<string, unknown>
-    | undefined;
+  // Claude's precedence: local project settings, then shared project settings, then user (#5729).
+  const enabledMaps = [
+    join(cwd, ".claude", "settings.local.json"),
+    join(cwd, ".claude", "settings.json"),
+    join(claudeDir, "settings.json"),
+  ].map((path) => readJson(path)?.enabledPlugins as Record<string, unknown> | undefined);
   for (const [key, raw] of Object.entries(plugins as Record<string, unknown>)) {
     if (key.split("@")[0] !== LEGACY_CLAUDE_PLUGIN) continue;
-    if (enabled && enabled[key] === false) continue;
+    const setting = enabledMaps.find((m) => m && typeof m[key] === "boolean")?.[key];
+    if (setting === false) continue;
     // v2 registry: an array of installs; v1: a single install object.
     const installs = (Array.isArray(raw) ? raw : [raw]) as Array<Record<string, unknown> | null>;
     const active = installs.some((i) => {
@@ -111,8 +116,6 @@ export interface LegacyEndpoint {
   /** The file it came from, so the installer can say where it looked. */
   source: string;
 }
-
-const CLOUD_URL = "https://api.hindsight.vectorize.io";
 
 /**
  * Read the old plugin's endpoint, or undefined when it was never configured.

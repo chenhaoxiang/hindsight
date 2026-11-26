@@ -3,7 +3,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveConfig } from "./config";
-import { daemonEnv, detectLlm, ensureDaemon, startDaemonDetached } from "./daemon";
+import {
+  DAEMON_CONFIG_ENV,
+  daemonEnv,
+  detectLlm,
+  ensureDaemon,
+  startDaemonDetached,
+} from "./daemon";
+import { nodeBinary } from "./util";
 
 // A daemon-mode ensure has to clear `preflightDaemon`, which shells out to `uvx` and `cargo`.
 // Neither is guaranteed on a test runner, so stub the subprocess layer; every
@@ -207,7 +214,9 @@ describe("every harness entrypoint reaches a daemon", () => {
   const EXEMPT: Record<string, string> = {
     "status.ts": "diagnostic — reports what is running; starting one would falsify the report",
     "deepen.ts": "spawned by the seed, which already ensured the daemon it inherits",
-    "mcp-server.ts": "child of a hook harness whose SessionStart ensured the daemon first",
+    "mcp-server.ts":
+      "child of a hook harness whose SessionStart ensured the daemon first; for Prime Agent, which " +
+      "has no SessionStart, it runs a RuntimeCore, which ensures it",
     "core/hook.ts":
       "the prompt path, deliberately: a cold start outlives the hook budget and stalls the turn",
     "core/host-client.ts":
@@ -261,9 +270,11 @@ describe("startDaemonDetached", () => {
     const [cmd, args, opts] = spawn.mock.calls[0] as unknown as [
       string,
       string[],
-      { detached: boolean; stdio: string; windowsHide: boolean },
+      { detached: boolean; stdio: string; windowsHide: boolean; env: NodeJS.ProcessEnv },
     ];
-    expect(cmd).toBe("node");
+    // The starter gets the caller's resolved config, `paths` overrides included (#6334).
+    expect(JSON.parse(opts.env[DAEMON_CONFIG_ENV]!).serverMode).toBe("daemon");
+    expect(cmd).toBe(nodeBinary());
     expect(args[0]).toMatch(/daemon-start\.js$/);
     expect(opts.detached).toBe(true);
     expect(opts.stdio).toBe("ignore");

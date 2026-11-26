@@ -26,6 +26,9 @@ explains what happens automatically, which tools you have, and how to configure 
   `current_fact_unverified` signal for explicit retrieval.
 - **Write-back**: the session transcript is retained into the bank automatically at session end
   (per-turn on opencode). The user never needs to "save" a conversation.
+- **Prime Agent 0.10+ is the exception**: it has no hooks, so nothing is injected. Call
+  `hindsight_reflect` yourself first (`await mcp.call_tool("hindsight", "hindsight_reflect", …)`);
+  that call also starts the server that saves the session.
 
 ## Storing things deliberately
 
@@ -44,6 +47,10 @@ When the user says "store this in hindsight" / "remember this":
   unrelated shared-bank observations; ordinary session write-back does not advance their scope.
   Creation can wait up to two minutes for source extraction. A pending/error result is not a page
   success, and cancellation does not roll back an already accepted source retain.
+
+If those two tools are not in your tool list, writing is turned off for this setup
+(`writeTools: false`): don't try to call them, and tell the user that only the conversation itself
+is saved.
 
 ## Retrieving
 

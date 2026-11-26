@@ -118,6 +118,97 @@ describe("readClaudeTranscript", () => {
     ]);
   });
 
+  it("keeps the user's AskUserQuestion answers, and still drops other tool results (#6421)", () => {
+    const answer =
+      'Your questions have been answered: "Open a PR?"="Full fix + PR". You can now continue.';
+    const lines = [
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_q", name: "AskUserQuestion", input: {} },
+            { type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_q",
+              content: [{ type: "text", text: answer }],
+            },
+            { type: "tool_result", tool_use_id: "toolu_b", content: "README.md" },
+          ],
+        },
+      }),
+    ];
+    writeFileSync(file, lines.join("\n"));
+
+    const result = readClaudeTranscript(file);
+
+    expect(result.filter((t) => t.role === "user")).toEqual([{ role: "user", content: answer }]);
+    expect(JSON.stringify(result)).not.toContain("README.md");
+  });
+
+  it("keeps the text of a memory note the agent wrote, and only the target of any other file write", () => {
+    const note =
+      "prc in items_g2 is cents; prc_usd is NULL for 13,654 of 20,000 rows. Use prc/100.0.";
+    const use = (name: string, input: Record<string, string>) =>
+      JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "tool_use", name, input }] },
+      });
+    writeFileSync(
+      file,
+      [
+        use("Write", { file_path: "/root/memories/prices.md", content: `${note}\n` }),
+        use("Edit", {
+          file_path: "/root/.claude/projects/p/memory/MEMORY.md",
+          old_string: "x",
+          new_string: note,
+        }),
+        use("Write", { file_path: "/repo/src/memory.ts", content: "export const x = 1;" }),
+      ].join("\n")
+    );
+
+    expect(readClaudeTranscript(file).map((t) => t.content)).toEqual([
+      `Write /root/memories/prices.md\n${note}`,
+      `Edit /root/.claude/projects/p/memory/MEMORY.md\n${note}`,
+      "Write /repo/src/memory.ts",
+    ]);
+  });
+
+  it("keeps the text of a shell command that writes a memory note, and not of one that only reads it", () => {
+    const lesson =
+      'echo "- Q5 INCORRECT: answered 20.92 (median g2 prc_usd>0); correct was 21.99. Lesson: use prc/100, not prc_usd" >> /workspace/memory/other.md';
+    const heredoc =
+      "cd /workspace/memory && cat >> other.md <<'EOF'\n- Q4: avg_rtg is stale, recompute from fdbk_g1\nEOF";
+    const use = (command: string) =>
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", name: "Bash", input: { command } }],
+        },
+      });
+    const read = "ls /workspace/memory/ 2>/dev/null && cat /workspace/memory/*.md";
+    writeFileSync(
+      file,
+      [use(lesson), use(heredoc), use(read), use("echo x > /tmp/out.txt")].join("\n")
+    );
+
+    const [first, second, third, fourth] = readClaudeTranscript(file).map((t) => t.content);
+    expect(first).toContain("Lesson: use prc/100, not prc_usd");
+    expect(second).toContain("avg_rtg is stale, recompute from fdbk_g1");
+    expect(third).toBe(`Bash ${read}`);
+    expect(fourth).toBe("Bash echo x > /tmp/out.txt");
+  });
+
   it("caps a very long action target at 100 chars, and falls back to the bare tool name when the input has no target key", () => {
     const longCmd = "echo " + "y".repeat(200);
     const lines = [
@@ -326,5 +417,125 @@ describe("readClaudeTranscript", () => {
     const result = readClaudeTranscript(file);
 
     expect(result).toEqual([{ role: "assistant", content: "First paragraph.\nSecond paragraph." }]);
+  });
+
+  it("keeps a message the human sent mid-turn (a queued_command attachment), in place; drops non-human queued commands (#6480)", () => {
+    const queued = (prompt: unknown, origin: unknown, timestamp = "2026-01-01T00:00:02Z") =>
+      JSON.stringify({
+        type: "attachment",
+        timestamp,
+        attachment: { type: "queued_command", prompt, commandMode: "prompt", origin },
+      });
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({
+          type: "user",
+          timestamp: "2026-01-01T00:00:00Z",
+          message: { role: "user", content: "run the slow migration" },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-01-01T00:00:01Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "tool_use", name: "Bash", input: { command: "sleep 60" } }],
+          },
+        }),
+        // the human typed this while the tool ran: kept as a user turn, injected memory stripped
+        queued("must be idempotent\n<hindsight_memories>old</hindsight_memories>", {
+          kind: "human",
+        }),
+        // a background task report, not the human: dropped
+        queued("<task-notification>done</task-notification>", { kind: "task-notification" }),
+        // malformed / empty / no origin: dropped
+        queued(42, { kind: "human" }),
+        queued("   ", { kind: "human" }),
+        queued("no origin", undefined),
+        // another attachment type: dropped
+        JSON.stringify({ type: "attachment", attachment: { type: "file", prompt: "x" } }),
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-01-01T00:00:03Z",
+          message: { role: "assistant", content: "Done, and the migration is idempotent." },
+        }),
+      ].join("\n")
+    );
+
+    expect(readClaudeTranscript(file)).toEqual([
+      { role: "user", content: "run the slow migration", timestamp: "2026-01-01T00:00:00Z" },
+      { role: "action", content: "Bash sleep 60", timestamp: "2026-01-01T00:00:01Z" },
+      { role: "user", content: "must be idempotent", timestamp: "2026-01-01T00:00:02Z" },
+      {
+        role: "assistant",
+        content: "Done, and the migration is idempotent.",
+        timestamp: "2026-01-01T00:00:03Z",
+      },
+    ]);
+  });
+
+  it("drops the history a forked session copied from its parent, keeping only the turns the fork added (#6642)", () => {
+    // Shape of a real `--fork-session` / `/fork` transcript: Claude Code copies the parent's lines
+    // under the fork's own sessionId and stamps each copied assistant line with the PARENT's id
+    // as `requestSessionId`. The fork's own lines carry no foreign requestSessionId.
+    const parent = "d6c488dd-parent";
+    const fork = "1491489b-fork";
+    const line = (type: string, content: string, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ type, sessionId: fork, message: { role: type, content }, ...extra });
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({
+          type: "derived-from",
+          sessionId: fork,
+          sessions: [{ id: parent, via: "fork" }],
+        }),
+        line("user", "Reply with just: one"),
+        line("assistant", "one", { requestSessionId: parent }),
+        // a message the human queued mid-turn in the PARENT is inherited too: skipped with the rest
+        JSON.stringify({
+          type: "attachment",
+          sessionId: fork,
+          attachment: {
+            type: "queued_command",
+            prompt: "keep it short",
+            origin: { kind: "human" },
+          },
+        }),
+        JSON.stringify({ type: "system", subtype: "stop_hook_summary", sessionId: fork }),
+        line("user", "Reply with just: two"),
+        line("assistant", "two", { requestSessionId: parent }),
+        JSON.stringify({ type: "system", subtype: "stop_hook_summary", sessionId: fork }),
+        // the fork's own turns
+        line("user", "Reply with just: three"),
+        line("assistant", "three"),
+      ].join("\n")
+    );
+
+    expect(readClaudeTranscript(file)).toEqual([
+      { role: "user", content: "Reply with just: three" },
+      { role: "assistant", content: "three" },
+    ]);
+  });
+
+  it("keeps every turn of a session that is not a fork, including one stamped with its own id", () => {
+    const sid = "own-session";
+    writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "user", sessionId: sid, message: { content: "hi" } }),
+        JSON.stringify({
+          type: "assistant",
+          sessionId: sid,
+          requestSessionId: sid,
+          message: { content: "hello" },
+        }),
+      ].join("\n")
+    );
+
+    expect(readClaudeTranscript(file)).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
   });
 });

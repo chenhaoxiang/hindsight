@@ -385,7 +385,9 @@ const GLOBAL_DISPATCHER_V2 = Symbol.for("undici.globalDispatcher.2");
  * UND_ERR_HEADERS_TIMEOUT before the server could answer (#5504). Composing over the CURRENT
  * global dispatcher, instead of building a new undici `Agent`, needs no `undici` dependency (the
  * bundled one is not importable) and keeps any proxy dispatcher the host installed. Hosts whose
- * fetch is not undici's (Bun, DSH's own) have no such dispatcher and ignore the option.
+ * fetch is not undici's have no such dispatcher and ignore the option — which is why this alone left
+ * Bun hosts (opencode) cut off at 300s: Bun has its own idle timeout, switched off in
+ * `fetchWithAuth` (#6431).
  */
 function signalOnlyDispatcher(): unknown {
   // Node loads undici — which installs the global dispatcher — lazily. Touching the `Headers`
@@ -487,13 +489,20 @@ export class HindsightClient {
   private async fetchWithAuth(url: string, init: RequestInit): Promise<Response> {
     // Only a request with its own deadline drops undici's timeouts; the drain poll has none.
     const dispatcher = init.signal ? signalOnlyDispatcher() : undefined;
+    // Bun has its own 300s socket-idle timeout below fetch, and ignores the undici dispatcher, so
+    // a reflect configured above 300s still died there under opencode (#6431). A request with an
+    // AbortSignal already has the caller's deadline, so disable that lower timeout just as the
+    // dispatcher does for undici; the signal still aborts on time. `timeout` is a Bun RequestInit
+    // extension; other runtimes ignore the extra field.
+    const bunTimeout = init.signal && "Bun" in globalThis ? { timeout: false as const } : {};
     const send = () => {
       init.signal?.throwIfAborted();
       return fetch(url, {
         ...init,
         headers: this.headers(),
+        ...bunTimeout,
         ...(dispatcher ? { dispatcher } : {}),
-      });
+      } as RequestInit);
     };
     const r = await send();
     init.signal?.throwIfAborted();
@@ -545,7 +554,9 @@ export class HindsightClient {
     }
     if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
       throw new Error(
-        `${method} ${url} -> ${r.status} ${await r.text()}${this.authHint(r.status)}`
+        // Query dropped: an encoded search query filled the 200-char error cap and pushed the
+        // status and the server's reason out of the tool error (#6341).
+        `${method} ${url.split("?")[0]} -> ${r.status} ${await r.text()}${this.authHint(r.status)}`
       );
     return r;
   }
@@ -754,6 +765,23 @@ export class HindsightClient {
       await this.req("DELETE", this.bankUrl());
       this.log(`[bank] reset ${this.bank}`);
     }
+    await this.configureBankSettings(opts);
+    await this.seedPages(opts.pageTrigger, opts.pages, opts.customPages);
+  }
+
+  /** The config half of `configureBank` (missions, retain strategies, entity labels), without
+   *  seeding pages. Session start calls it directly when the deepen engine — the usual caller of
+   *  `configureBank` — will not run (`autoSeed: false`, or a directory with no git history):
+   *  without it such a bank never got the `conversation` strategy, and every session write-back
+   *  was extracted with the server's generic rules instead of the plugin's mission. */
+  async configureBankSettings(
+    opts: {
+      reset?: boolean;
+      manage?: boolean;
+      extractionMode?: RetainExtractionMode;
+      defaults?: Record<string, unknown>;
+    } = {}
+  ): Promise<void> {
     if (opts.manage === false) {
       this.log(`[bank] manageBankConfig: false — leaving ${this.bank}'s configuration alone`);
     } else {
@@ -773,7 +801,6 @@ export class HindsightClient {
         this.log(`[bank] applied to ${this.bank}: ${Object.keys(manifest.bank).sort().join(", ")}`);
       }
     }
-    await this.seedPages(opts.pageTrigger, opts.pages, opts.customPages);
   }
 
   /**

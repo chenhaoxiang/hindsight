@@ -130,6 +130,14 @@ export interface RawConfig {
    *    "recall"  — the bank's memories recalled for the prompt (`recallOptions`; no LLM)
    *    "none"    — nothing; the tool guide routes new goals through pages before optional reflection */
   autoInject?: AutoInject;
+  /** Run a `"recall"` or `"pages"` auto-inject again every N user turns, with the CURRENT prompt as
+   *  the query (default 0 = first prompt only). For long sessions whose topic moves on, where the
+   *  first prompt's memory no longer fits. Ignored for `"reflect"`: an LLM call per turn (#5713). */
+  autoInjectEveryTurns?: number;
+  /** false = the agent is never told to call the two tools that write to the bank
+   *  (`hindsight_capture_initiative`, `hindsight_ingest_document`), and they are not registered —
+   *  for a host that denies them, so the guide does not contradict the host (default true; #6487). */
+  writeTools?: boolean;
   /** @deprecated Use `autoInject`. Still honoured: false = `autoInject: "none"`, true = "reflect";
    *  ignored when `autoInject` is set. Setting it logs a deprecation warning. */
   autoReflect?: boolean;
@@ -329,6 +337,8 @@ export interface Config {
   injectTimeoutMs: number;
   reflectBudget: "low" | "mid" | "high";
   autoInject: AutoInject;
+  autoInjectEveryTurns: number;
+  writeTools: boolean;
   pageSearchLimit: number;
   recallOptions: Record<string, unknown>;
   toolGuideExtra?: string;
@@ -586,6 +596,8 @@ function resolveAutoInject(raw: RawConfig): AutoInject {
   return raw.autoReflect === false ? "none" : "reflect";
 }
 
+export const CLOUD_URL = "https://api.hindsight.vectorize.io";
+
 export function resolveConfig(raw: RawConfig = {}): Config {
   const serverMode = ["cloud", "self-hosted", "daemon"].includes(raw.serverMode as string)
     ? (raw.serverMode as "cloud" | "self-hosted" | "daemon")
@@ -597,10 +609,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     // Daemon mode resolves the URL HERE rather than at each call site: every entry point already
     // builds its client from cfg.apiUrl, so collapsing the mode into that one field means the
     // daemon needs no plumbing through eight separate constructors.
-    apiUrl:
-      serverMode === "daemon"
-        ? `http://127.0.0.1:${apiPort}`
-        : (raw.apiUrl ?? "https://api.hindsight.vectorize.io"),
+    apiUrl: serverMode === "daemon" ? `http://127.0.0.1:${apiPort}` : (raw.apiUrl ?? CLOUD_URL),
     apiToken: raw.apiToken || undefined,
     apiPort,
     daemonIdleTimeout: raw.daemonIdleTimeout,
@@ -636,6 +645,8 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     injectTimeoutMs: raw.injectTimeoutMs || DEFAULT_INJECT_TIMEOUT_MS,
     reflectBudget: resolveReflectBudget(raw),
     autoInject: resolveAutoInject(raw),
+    autoInjectEveryTurns: Math.max(0, Math.floor(raw.autoInjectEveryTurns || 0)),
+    writeTools: raw.writeTools !== false,
     pageSearchLimit: raw.pageSearchLimit || DEFAULT_PAGE_SEARCH_LIMIT,
     // Same shape as retainMetadata: an object, or nothing. An array would spread into numeric
     // keys and reach the API as garbage, so it is rejected like any other non-object.
@@ -652,7 +663,8 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     // Every turn, not every tenth. The guide is what tells the agent WHEN to reach for memory, and
     // at a cadence of 10 a normal session is told once, on turn 1, and never again. Measured over
     // 40 real Claude Code turns, moving this from 10 to 1 took searches from 15% of turns to 32.5%
-    // with no wording change at all. The cost is the guide's ~2KB re-sent per turn, which caches.
+    // with no wording change at all. Only turn 1 carries the full guide; later turns get a one-line
+    // reminder (#6597), so the cadence costs almost nothing.
     pageRefreshEveryTurns: raw.pageRefreshEveryTurns || 1,
     pageTriggerType: pageTrigger.type,
     pageTriggerCron: pageTrigger.cron,
@@ -778,6 +790,8 @@ const ENV_KEYS = {
   injectTimeoutMs: "HINDSIGHT_INJECT_TIMEOUT_MS",
   reflectBudget: "HINDSIGHT_REFLECT_BUDGET",
   autoInject: "HINDSIGHT_AUTO_INJECT",
+  autoInjectEveryTurns: "HINDSIGHT_AUTO_INJECT_EVERY_TURNS",
+  writeTools: "HINDSIGHT_WRITE_TOOLS",
   pageSearchLimit: "HINDSIGHT_PAGE_SEARCH_LIMIT",
   toolGuideExtra: "HINDSIGHT_TOOL_GUIDE_EXTRA",
   autoReflect: "HINDSIGHT_AUTO_REFLECT",
@@ -815,6 +829,7 @@ const ENV_BOOLEANS = new Set<keyof RawConfig>([
   "codebaseSurvey",
   "autoUpdate",
   "manageBankConfig",
+  "writeTools",
 ]);
 const ENV_LISTS = new Set<keyof RawConfig>(["retainTags", "optInPaths"]);
 const ENV_NUMBERS = new Set<keyof RawConfig>([
@@ -826,6 +841,7 @@ const ENV_NUMBERS = new Set<keyof RawConfig>([
   "injectTimeoutMs",
   "pageSearchLimit",
   "pageRefreshEveryTurns",
+  "autoInjectEveryTurns",
   "seedLimit",
   "surveyBudgetUsd",
   "surveyRefreshCommits",
@@ -899,6 +915,26 @@ export function applyBankConfig(
   resolvedId: string,
   /** The directory the bank was resolved FROM. Supplying it enforces `optInOnly`; every entry
    *  point already has it to hand, having just passed it to bank resolution. */
+  directory?: string
+): { cfg: Config; bankId: string } {
+  const out = applyOverrides(cfg, resolvedId, directory);
+  // Cloud refuses every request without a key, so a keyless Cloud config (the default, when the
+  // plugin was added without running the installer) would ship each session only to be thrown
+  // away. Checked AFTER the overrides: a `paths`/`banks` entry may be what supplies the key.
+  if (!out.cfg.disabled && !out.cfg.apiToken && out.cfg.apiUrl.replace(/\/+$/, "") === CLOUD_URL) {
+    log.warn(
+      "config",
+      "Hindsight Cloud needs an API key and none is set — memory is off. Set apiToken in " +
+        "~/.hindsight/coding-agent.json (or HINDSIGHT_API_TOKEN), or point apiUrl at your own server."
+    );
+    return { cfg: { ...out.cfg, disabled: true }, bankId: out.bankId };
+  }
+  return out;
+}
+
+function applyOverrides(
+  cfg: Config,
+  resolvedId: string,
   directory?: string
 ): { cfg: Config; bankId: string } {
   // Rides the `disabled` gate every entry point already checks after bank resolution, rather than

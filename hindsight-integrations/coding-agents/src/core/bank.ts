@@ -196,13 +196,22 @@ function gitProjectName(directory: string, resolveWorktrees: boolean, sessionRoo
 }
 
 /** A configured directory, `~`-expanded and normalised, without a trailing separator. */
-function configuredDir(dir: string): string {
+export function configuredDir(dir: string): string {
   const expanded = dir === "~" || dir.startsWith("~/") ? join(homedir(), dir.slice(1)) : dir;
   return normalize(expanded).replace(new RegExp(`\\${sep}+$`), "");
 }
 
-/** Whether `directory` IS `configured`, or lives under it. */
-function isWithin(directory: string, configured: string): boolean {
+/** Whether `directory` IS `configured`, or lives under it. Windows paths are case-insensitive, and
+ *  a host's cwd often differs from the configured path in the drive letter alone (#6356). */
+export function isWithin(
+  directory: string,
+  configured: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (platform === "win32") {
+    directory = directory.toLowerCase();
+    configured = configured.toLowerCase();
+  }
   return directory === configured || directory.startsWith(configured + sep);
 }
 
