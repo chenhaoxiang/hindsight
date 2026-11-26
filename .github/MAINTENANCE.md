@@ -194,18 +194,19 @@ Current stable update candidate (source/PR acceptance only, not installation):
   `1.2.3+fork.1`, exact upstream `v1.2.3`
   (`bd230e8bb40e768bf69f266f1dd3c9ae03e22fe3`) plus
   [.github/patches/api-1.2.3-fork.1.patch](patches/api-1.2.3-fork.1.patch).
-- Coding Agents `0.8.7-fork.2`: npm `0.8.7` source
-  `329f8a5ac9baa5567f4516a24dc9fd0f753a75ae` plus the maintained adapter,
-  layered retrieval, source-scoped initiative, update-guard and current-state
-  retrieval-gate changes. The exact release source is the normal merge of the
-  release PR from main head `7bbd56eded8cbcb23f2d9d9b45a181e6611ba66f`.
-  The integration subtree of the pinned API release equals that published component
-  source; this was checked independently, not inferred from the API tag.
-  Package, lockfile and plugin versions agree. Native tool names remain the existing
-  ten, including the three `*_knowledge_page*` names, without renamed duplicates.
-- Control Plane uses official `1.2.3` until the paired 1.3.0 upgrade is verified; no
-  fork installation or UI runtime is changed by the API candidate alone. Do not use an
-  unpublished monorepo tip for any component.
+- Coding Agents `0.8.8-fork.1`: npm `0.8.8` source
+  `0a7ed29d7` plus the ten coding-agents fixes through upstream `main`
+  `47831d5c39010a5c30e9ac2aa16145f7048e930f`, merged onto the maintained adapter
+  (fork tool names, layered retrieval, source-scoped initiative, update-guard and
+  current-state retrieval gate). Exact release source is merge commit `0d1d4447f`
+  from PR #14; package, lockfile and plugin versions agree. Native tool names remain
+  the existing ten, including the three `*_knowledge_page*` names.
+- Control Plane uses official `1.3.0` (npm `@vectorize-io/hindsight-control-plane`),
+  installed under `runtime/control-plane-1.3.0-community`; no fork UI patch.
+- The local API/Control Plane pair was upgraded after the backup at
+  `20261126T165001Z`: API `1.3.0-fork.1` hosts `/version` and a bank list, Control
+  Plane `1.3.0` reports `status: ok` with a connected dataplane. The old `1.2.3`
+  venv, Control Plane runtime and coding-agents release remain for rollback.
 
 Upstream's Pages rename keeps the underlying `knowledge_pages` table, page IDs and
 content. Its deprecated `/knowledge-base` HTTP routes, old MCP names, config/env aliases,
