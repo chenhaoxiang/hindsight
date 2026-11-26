@@ -4,7 +4,10 @@
  * assistant narration, AND the concrete actions it took: each `tool_use` becomes a compact
  * `role:"action"` turn naming the tool and its primary target (e.g. `Edit boltons/strutils.py`) —
  * no arguments, no outputs. That keeps WHICH files/commands the session touched without burying the
- * decisions in mechanical noise; `tool_result` blocks are dropped entirely.
+ * decisions in mechanical noise; `tool_result` blocks are dropped, except AskUserQuestion's,
+ * which carries the user's answers. A message the human typed while a turn was running (stored only
+ * as a `queued_command` attachment) is kept as a user turn at its position. A forked session's copy
+ * of its parent's history is skipped: the parent's document already holds it.
  *
  * Drops non-message lines (`last-prompt`, `mode`, `summary`, …), `isMeta` lines, compaction
  * summaries (`isCompactSummary`), `isSidechain`
@@ -21,8 +24,10 @@ import { actionLine, stripInjectedMemory } from "./transcript-util";
 interface ContentBlock {
   type?: string;
   text?: string;
+  id?: string;
   name?: string;
   input?: unknown;
+  tool_use_id?: string;
   content?: string | ContentBlock[];
 }
 
@@ -32,6 +37,13 @@ interface TranscriptLine {
   isSidechain?: boolean;
   isCompactSummary?: boolean;
   timestamp?: string;
+  sessionId?: string;
+  requestSessionId?: string;
+  attachment?: {
+    type?: string;
+    prompt?: unknown;
+    origin?: { kind?: string };
+  };
   message?: {
     content?: string | ContentBlock[];
   };
@@ -45,9 +57,14 @@ interface RenderedLine {
 /**
  * Render one message's `content` into turns: text blocks join into one prose turn
  * (injected-memory stripped); each `tool_use` becomes its own compact `role:"action"` turn
- * (name + primary target, via `actionLine`); `tool_result` blocks are dropped.
+ * (name + primary target, via `actionLine`); `tool_result` blocks are dropped, except the result
+ * of an AskUserQuestion call seen earlier (`questionIds`), which is the user's answer.
  */
-function renderLine(content: string | ContentBlock[] | undefined, type: string): RenderedLine[] {
+function renderLine(
+  content: string | ContentBlock[] | undefined,
+  type: string,
+  questionIds: Set<string>
+): RenderedLine[] {
   if (typeof content === "string") {
     const text = stripInjectedMemory(content).trim();
     return text ? [{ role: type, content: text }] : [];
@@ -62,9 +79,17 @@ function renderLine(content: string | ContentBlock[] | undefined, type: string):
       const t = stripInjectedMemory(b.text).trim();
       if (t) texts.push(t);
     } else if (b.type === "tool_use" && typeof b.name === "string") {
+      if (b.name === "AskUserQuestion" && typeof b.id === "string") questionIds.add(b.id);
       actions.push({ role: "action", content: actionLine(b.name, b.input) });
+    } else if (b.type === "tool_result" && b.tool_use_id && questionIds.has(b.tool_use_id)) {
+      // The one tool result that is the USER talking: Claude Code returns the picked answers to
+      // AskUserQuestion as its result, so dropping it lost every decision made there (#6421).
+      const answer = renderLine(b.content, type, questionIds)
+        .map((r) => r.content)
+        .join("\n");
+      if (answer) texts.push(answer);
     }
-    // tool_result: dropped — outputs are mechanical noise for extraction
+    // any other tool_result: dropped — outputs are mechanical noise for extraction
   }
 
   const out: RenderedLine[] = [];
@@ -74,11 +99,14 @@ function renderLine(content: string | ContentBlock[] | undefined, type: string):
   return out;
 }
 
-/** Parse a Claude Code transcript JSONL into normalized markdown turns (text + tool calls/results).
- *  Drops thinking blocks, isMeta/isSidechain lines, injected memory, and empty turns.
+/** Parse a Claude Code transcript JSONL into normalized markdown turns (text + tool calls/results,
+ *  plus human messages queued mid-turn). Drops thinking blocks, isMeta/isSidechain lines, injected
+ *  memory, and empty turns.
  *  Never throws on bad lines. */
 export function readClaudeTranscript(path: string): TransportTurn[] {
   const turns: TransportTurn[] = [];
+  const questionIds = new Set<string>(); // AskUserQuestion calls whose result is the user's answer
+  const lines: TranscriptLine[] = [];
   for (const rawLine of readJsonl(path)) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
@@ -92,7 +120,34 @@ export function readClaudeTranscript(path: string): TransportTurn[] {
     // JSON.parse accepts non-object top-level values (`null`, numbers, booleans, arrays);
     // guard here so a corrupt/truncated line can't reach a property access below and throw.
     if (typeof parsed !== "object" || parsed === null) continue;
-    const line = parsed as TranscriptLine;
+    lines.push(parsed as TranscriptLine);
+  }
+
+  // A forked session (`/fork`, `--fork-session`) starts with a copy of its parent's history, under
+  // the fork's own sessionId. That history is already in the parent's document, so saving it again
+  // stored and extracted every inherited turn twice (#6642). Claude Code stamps each copied
+  // assistant line with the session that produced it (`requestSessionId`); the last line naming
+  // another session marks the end of the inherited part, and only what follows is the fork's own.
+  let start = 0;
+  lines.forEach((l, i) => {
+    if (l.requestSessionId && l.sessionId && l.requestSessionId !== l.sessionId) start = i + 1;
+  });
+
+  for (const line of lines.slice(start)) {
+    // A message the human typed while a turn was still running is NOT a type:"user" line: Claude
+    // Code stores it only as a `queued_command` attachment. Keep the human ones as user turns at
+    // their position; other origins (e.g. `task-notification`) are not the human speaking (#6480).
+    const queued = line.type === "attachment" ? line.attachment : undefined;
+    if (queued?.type === "queued_command" && queued.origin?.kind === "human") {
+      const text =
+        typeof queued.prompt === "string" ? stripInjectedMemory(queued.prompt).trim() : "";
+      if (text) {
+        const turn: TransportTurn = { role: "user", content: text };
+        if (typeof line.timestamp === "string") turn.timestamp = line.timestamp;
+        turns.push(turn);
+      }
+      continue;
+    }
 
     if (line.type !== "user" && line.type !== "assistant") continue;
     if (line.isMeta === true) continue;
@@ -107,7 +162,7 @@ export function readClaudeTranscript(path: string): TransportTurn[] {
 
     // `type` is validated as "user" | "assistant" above; drive role from it (not the redundant
     // `message.role`). One line can yield a prose turn plus one action turn per tool call.
-    for (const rendered of renderLine(line.message.content, line.type)) {
+    for (const rendered of renderLine(line.message.content, line.type, questionIds)) {
       const turn: TransportTurn = { role: rendered.role, content: rendered.content };
       if (typeof line.timestamp === "string") turn.timestamp = line.timestamp;
       turns.push(turn);

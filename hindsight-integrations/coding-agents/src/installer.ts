@@ -43,9 +43,10 @@ import { applyEdits, modify } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
 import { HOOK_HARNESSES, type HookHarnessName } from "./harness/hook-lifecycle";
 import { importLocalHistory } from "./core/history";
+import { PRIME_AGENT_DIR_ENV, PRIME_SESSION_ID_ENV } from "./prime-agent";
 import { detectLlm, hasRustToolchain, hasUvx, type LlmChoice } from "./core/daemon";
 import { readLegacyEndpoint } from "./core/legacy";
-import { isOurMcpEntry } from "./core/util";
+import { hookNode, hookNodeShell, isOurMcpEntry, nodeBinary } from "./core/util";
 import { SKILL_DIRS, resolveSkillDirs, traecodeDotDirName } from "./core/skill-dirs";
 import {
   enableWorkspaceMcpSetting,
@@ -225,7 +226,7 @@ function setOrDelete(obj: Record<string, any>, key: string, arr: any[]): void {
 }
 
 const cmdHook = (dist: string, file: string, timeout: number) => ({
-  hooks: [{ type: "command", command: `node "${join(dist, file)}"`, timeout }],
+  hooks: [{ type: "command", command: `${hookNodeShell()} "${join(dist, file)}"`, timeout }],
 });
 
 /** The command STRING for a host that runs `node <script>`. The path is quoted only when it needs
@@ -233,13 +234,13 @@ const cmdHook = (dist: string, file: string, timeout: number) => ({
  *  of the path, it reads `"C:\…"` as relative and fails with MODULE_NOT_FOUND (#5913). cursor-cli
  *  and copilot-cli share the flat hook branch; they run through a shell, where both forms are equal. */
 export const nodeCommand = (script: string): string =>
-  script.includes(" ") ? `node "${script}"` : `node ${script}`;
+  script.includes(" ") ? `${hookNodeShell()} "${script}"` : `${hookNodeShell()} ${script}`;
 
 /** ZCode's registration shape: the same matcher group, but an argv rather than a command STRING —
  *  it spawns hooks without a shell, so `node "…/zcode-hook.js"` would be looked up as one
  *  executable name and never run — and a `timeoutMs` budget rather than `timeout` seconds. */
 const processHook = (dist: string, file: string, timeoutMs: number) => ({
-  hooks: [{ type: "process", command: "node", args: [join(dist, file)], timeoutMs }],
+  hooks: [{ type: "process", command: hookNode(), args: [join(dist, file)], timeoutMs }],
 });
 
 /**
@@ -258,7 +259,7 @@ const mcpServerEntry = (
   harness: HookHarnessName | "cline-cli",
   extraArgs: string[] = []
 ) => ({
-  command: "node",
+  command: hookNode(),
   args: [join(dist, "mcp-server.js"), ...extraArgs],
   env: { HINDSIGHT_MCP_HARNESS: harness },
 });
@@ -423,17 +424,33 @@ function registerOpencodePlugin(c: InstallCtx, name: string): void {
   // writeJsonc, not writeJson: this config routinely carries comments, and re-serializing the
   // parsed object would strip every one of them even though the read succeeded.
   writeJsonc(path, "plugin", [...plugins.filter((p) => !String(p).includes(MARKER)), c.pkgRoot]);
+  // v2 merges `plugins` with the legacy key, so an entry of ours there would load twice (#6094).
+  dropOursFromV2Plugins(path, cfg);
   c.log?.(`${name}: plugin registered in ${path}`);
+}
+
+/** Remove our entries from v2's `plugins` key (hand-added or user-migrated), keeping the rest. */
+function dropOursFromV2Plugins(path: string, cfg: Record<string, any>): boolean {
+  if (!Array.isArray(cfg.plugins)) return false;
+  const kept = cfg.plugins.filter((p: unknown) => !String(p).includes(MARKER));
+  if (kept.length === cfg.plugins.length) return false;
+  writeJsonc(path, "plugins", kept.length ? kept : undefined);
+  return true;
 }
 
 function unregisterOpencodePlugin(c: InstallCtx, name: string): void {
   const path = opencodeConfigPath(c);
   if (!existsSync(path)) return;
   const cfg = parseJsonc(readFileSync(path, "utf8"));
-  if (!cfg || !Array.isArray(cfg.plugin)) return;
-  const kept = cfg.plugin.filter((p: unknown) => !String(p).includes(MARKER));
-  writeJsonc(path, "plugin", kept.length ? kept : undefined);
-  c.log?.(`${name}: plugin entry removed`);
+  if (!cfg) return;
+  // An entry under v2's `plugins` key keeps memory wired just the same (#6094).
+  let removed = dropOursFromV2Plugins(path, cfg);
+  if (Array.isArray(cfg.plugin)) {
+    const kept = cfg.plugin.filter((p: unknown) => !String(p).includes(MARKER));
+    writeJsonc(path, "plugin", kept.length ? kept : undefined);
+    removed = true;
+  }
+  if (removed) c.log?.(`${name}: plugin entry removed`);
 }
 
 const opencode: HarnessInstaller = {
@@ -460,7 +477,8 @@ const opencode2: HarnessInstaller = {
 };
 
 /**
- * The pi-family extension hosts: pi and its fork Prime Agent (PrimeIntellect). Both load a
+ * The pi-family extension hosts: pi and, before its 0.10 Rust rewrite, its fork Prime Agent
+ * (PrimeIntellect, now wired by `primeAgent` below). Both load a
  * persistent extension by absolute path from the `extensions` array of their own `settings.json`,
  * calling that file's default export at session start — they differ only in the config directory
  * (`~/.pi/agent` vs `~/.prime/agent`), the executable name, and which dist bundle reports which
@@ -514,7 +532,127 @@ function piFamilyInstaller(harness: string, configDir: string[]): HarnessInstall
 }
 
 const pi = piFamilyInstaller("pi", [".pi", "agent"]);
-const primeAgent = piFamilyInstaller("prime-agent", [".prime", "agent"]);
+
+const PRIME_CONTEXT_BEGIN = "<!-- hindsight-coding-agents:begin -->";
+const PRIME_CONTEXT_END = "<!-- hindsight-coding-agents:end -->";
+/** What makes the agent reach for memory at all: Prime 0.10 has no hook to inject recall with, and
+ *  our MCP server (which also writes the session back) only starts on the first call. */
+const PRIME_CONTEXT = `${PRIME_CONTEXT_BEGIN}
+## Project memory (Hindsight): required first step
+
+At the start of every task or question in a repository, before you answer or call any other
+tool, run this in Python (\`mcp\` is pre-imported):
+
+    print(await mcp.call_tool("hindsight", "hindsight_reflect", {"query": "<the user's request>"}))
+
+Do it even when the task looks simple or needs no other tools. It answers from past sessions,
+decisions and conventions the code does not show, and it is also what saves this conversation to
+memory for later sessions. Later in the task, \`hindsight_search_pages\` (\`{"query": ...}\`)
+is the fast lookup. The \`hindsight-coding-agent\` skill lists every tool.
+${PRIME_CONTEXT_END}`;
+
+/** The global context file Prime loads: the first that exists, in its own priority order (pa-core
+ *  CONTEXT_FILE_CANDIDATES), so an existing CLAUDE.md is extended rather than shadowed. */
+function primeContextFile(c: InstallCtx): string {
+  const dir = join(c.home, ".prime", "agent");
+  const found = ["AGENTS.md", "CLAUDE.md"].find((f) => existsSync(join(dir, f)));
+  return join(dir, found ?? "AGENTS.md");
+}
+
+/** The file without our block. Only the seam where the block was is re-joined: the rest of the
+ *  user's text, blank lines included, is left exactly as written. */
+function stripPrimeContext(text: string): string {
+  const start = text.indexOf(PRIME_CONTEXT_BEGIN);
+  const end = text.indexOf(PRIME_CONTEXT_END);
+  if (start < 0 || end < start) return text;
+  const before = text.slice(0, start).trimEnd();
+  const after = text.slice(end + PRIME_CONTEXT_END.length).replace(/^\s+/, "");
+  return before && after ? `${before}\n\n${after}` : before || after;
+}
+
+/**
+ * Prime Agent 0.10+ (the Rust rewrite). It dropped the JS extension host the 0.9 integration used
+ * and has no hooks, so this wires the three things it does load (see src/prime-agent.ts):
+ *
+ * - `settings.json` `mcpServers.hindsight` — our stdio MCP server, which serves the tools and writes
+ *   the session back while it runs. Prime only forwards env vars by reference, so the harness goes
+ *   in as `--harness` and the session id / agent dir as references to the kernel's own variables.
+ *   The 0.9 `extensions` entry is removed: 0.10 ignores it and 0.9 is no longer supported.
+ * - the companion skill in `~/.prime/agent/skills`.
+ * - a marked block in the global context file asking the agent to call `hindsight_reflect` first.
+ *
+ * A same-named foreign MCP server blocks install instead of being overwritten.
+ */
+const primeAgent: HarnessInstaller = {
+  name: "prime-agent",
+  detect: (c) => onPath("prime-agent") || existsSync(join(c.home, ".prime", "agent")),
+  preflight(c) {
+    const path = join(c.home, ".prime", "agent", "settings.json");
+    const existing = readJson(path).mcpServers?.hindsight;
+    if (existing && !isOurMcpEntry(existing)) {
+      return (
+        `${path} already contains a user-managed MCP server named "hindsight". ` +
+        "Rename or remove that entry, then re-run install."
+      );
+    }
+  },
+  install(c) {
+    const path = join(c.home, ".prime", "agent", "settings.json");
+    const cfg = readJson(path);
+    if (Array.isArray(cfg.extensions)) {
+      cfg.extensions = cfg.extensions.filter((p: string) => !String(p).includes(MARKER));
+      if (!cfg.extensions.length) delete cfg.extensions;
+    }
+    cfg.mcpServers = cfg.mcpServers ?? {};
+    cfg.mcpServers.hindsight = {
+      type: "stdio",
+      command: "node",
+      args: [join(c.dist, "mcp-server.js"), "--harness", "prime-agent"],
+      env: {
+        [PRIME_SESSION_ID_ENV]: { env: "RLM_SESSION_ID" },
+        [PRIME_AGENT_DIR_ENV]: { env: "PRIME_AGENT_CODING_AGENT_DIR" },
+      },
+    };
+    writeJson(path, cfg);
+    c.log?.(`prime-agent: MCP server registered in ${path}`);
+    installSkill(c, "prime-agent");
+    const ctxFile = primeContextFile(c);
+    const prior = existsSync(ctxFile)
+      ? stripPrimeContext(readFileSync(ctxFile, "utf8")).trimEnd()
+      : "";
+    writeFileSync(ctxFile, `${prior ? `${prior}\n\n` : ""}${PRIME_CONTEXT}\n`);
+    c.log?.(`prime-agent: memory instructions added to ${ctxFile}`);
+  },
+  uninstall(c) {
+    uninstallSkill(c, "prime-agent");
+    const path = join(c.home, ".prime", "agent", "settings.json");
+    if (existsSync(path)) {
+      const cfg = readJson(path);
+      if (isOurMcpEntry(cfg.mcpServers?.hindsight)) {
+        delete cfg.mcpServers.hindsight;
+        if (!Object.keys(cfg.mcpServers).length) delete cfg.mcpServers;
+      }
+      if (Array.isArray(cfg.extensions)) {
+        cfg.extensions = cfg.extensions.filter((p: string) => !String(p).includes(MARKER));
+        if (!cfg.extensions.length) delete cfg.extensions;
+      }
+      writeJson(path, cfg);
+    }
+    // Both candidates, not just the one Prime reads now: the block stays where install put it even
+    // if the user creates the other file later.
+    for (const name of ["AGENTS.md", "CLAUDE.md"]) {
+      const ctxFile = join(c.home, ".prime", "agent", name);
+      if (!existsSync(ctxFile)) continue;
+      const text = readFileSync(ctxFile, "utf8");
+      const kept = stripPrimeContext(text).trim();
+      if (kept !== text.trim()) {
+        if (kept) writeFileSync(ctxFile, `${kept}\n`);
+        else rmSync(ctxFile);
+      }
+    }
+    c.log?.("prime-agent: MCP server, memory instructions and skill removed");
+  },
+};
 
 /**
  * Kilo Code CLI — an opencode fork, so registration is opencode's: append our entry to the config's
@@ -605,7 +743,7 @@ const claudeCode: HarnessInstaller = {
         "--env",
         "HINDSIGHT_MCP_HARNESS=claude-code",
         "--",
-        "node",
+        hookNode(),
         join(c.dist, "mcp-server.js"),
       ])
     ) {
@@ -613,7 +751,7 @@ const claudeCode: HarnessInstaller = {
     } else {
       c.log?.(
         `claude-code: could not run \`claude mcp add\` — register the tools manually:\n` +
-          `  claude mcp add --scope user hindsight --env HINDSIGHT_MCP_HARNESS=claude-code -- node "${join(c.dist, "mcp-server.js")}"`
+          `  claude mcp add --scope user hindsight --env HINDSIGHT_MCP_HARNESS=claude-code -- ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
       );
     }
   },
@@ -651,7 +789,7 @@ const CODEX_MCP_BLOCK_RE = /^\[mcp_servers\.hindsight(?:\.[^\]]+)?\][^\n]*\n(?:(
 
 /** Inline `env`, so CODEX_MCP_BLOCK_RE never has to straddle a `[mcp_servers.hindsight.env]` table. */
 const codexMcpBlock = (dist: string) =>
-  `[mcp_servers.hindsight]\ncommand = "node"\nargs = [${JSON.stringify(join(dist, "mcp-server.js"))}]\n` +
+  `[mcp_servers.hindsight]\ncommand = ${JSON.stringify(hookNode())}\nargs = [${JSON.stringify(join(dist, "mcp-server.js"))}]\n` +
   `env = { HINDSIGHT_MCP_HARNESS = "codex" }`;
 
 const codex: HarnessInstaller = {
@@ -813,15 +951,15 @@ const antigravity: HarnessInstaller = {
 };
 
 /**
- * Probe the `node` on PATH — not this process — because that is the interpreter the installed hook
- * command (`node "<dist>/devin-stop-hook.js"`) will actually run under. An installer started through
+ * Probe `hookNode()` — the `node` on PATH, or this Node only when PATH has none — because that is
+ * the interpreter the installed hook command will actually run under. An installer started through
  * npx, a version manager or a wrapper script is easily a different build than the one the agent
  * later uses. `-e` runs as CommonJS regardless of the surrounding package type, so `require` here
  * is safe.
  */
 function pathNodeHasSqlite(): boolean {
   try {
-    execFileSync("node", ["-e", "require('node:sqlite')"], { stdio: "pipe", timeout: 10_000 });
+    execFileSync(hookNode(), ["-e", "require('node:sqlite')"], { stdio: "pipe", timeout: 10_000 });
     return true;
   } catch {
     return false;
@@ -830,7 +968,7 @@ function pathNodeHasSqlite(): boolean {
 
 function pathNodeVersion(): string {
   try {
-    return execFileSync("node", ["-v"], { encoding: "utf8", stdio: "pipe" }).trim();
+    return execFileSync(hookNode(), ["-v"], { encoding: "utf8", stdio: "pipe" }).trim();
   } catch {
     return "not found";
   }
@@ -1504,7 +1642,7 @@ const kimi: HarnessInstaller = {
       .map(
         (h) =>
           `[[hooks]]\nevent = ${JSON.stringify(h.event)}\n` +
-          `command = ${JSON.stringify(`node "${join(c.dist, h.entry)}"`)}\n` +
+          `command = ${JSON.stringify(`${hookNodeShell()} "${join(c.dist, h.entry)}"`)}\n` +
           `timeout = ${h.timeout}\n`
       )
       .join("\n");
@@ -1837,7 +1975,7 @@ const qwen: HarnessInstaller = {
         "-e",
         "HINDSIGHT_MCP_HARNESS=qwen-code",
         "hindsight",
-        "node",
+        hookNode(),
         join(c.dist, "mcp-server.js"),
       ])
     ) {
@@ -1845,7 +1983,7 @@ const qwen: HarnessInstaller = {
     } else {
       c.log?.(
         `qwen-code: could not run \`qwen mcp add\` — register the tools manually:\n` +
-          `  qwen mcp add -s user -e HINDSIGHT_MCP_HARNESS=qwen-code hindsight node "${join(c.dist, "mcp-server.js")}"`
+          `  qwen mcp add -s user -e HINDSIGHT_MCP_HARNESS=qwen-code hindsight ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
       );
     }
   },
@@ -2408,9 +2546,13 @@ function importConversations(harness: string, ctx: InstallCtx): void {
       `this runs extraction and may take a while`
   );
   try {
-    execFileSync("node", [join(ctx.dist, "deepen.js"), "--repo", repo, "--conversations", file], {
-      stdio: "inherit",
-    });
+    execFileSync(
+      nodeBinary(),
+      [join(ctx.dist, "deepen.js"), "--repo", repo, "--conversations", file],
+      {
+        stdio: "inherit",
+      }
+    );
   } catch {
     // The wiring is already in place; a failed backfill must not make `install` look failed.
     ctx.log?.(`${harness}: conversation import did not finish — re-run it any time with:`);

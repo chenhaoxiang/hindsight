@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { buildSessionStartContext, runSessionStartHook } from "./session-start";
+import { buildSeedBanner, buildSessionStartContext, runSessionStartHook } from "./session-start";
 import { startCodebaseSurvey, SURVEY_MAX_ATTEMPTS } from "./survey";
 import { releaseLease, SURVEY_SPEC_ENV } from "./survey-lease";
 import { resolveConfig } from "./config";
@@ -30,7 +30,9 @@ vi.mock("./config", async (importOriginal) => {
   return {
     ...actual,
     loadConfig: (...a: Parameters<typeof actual.loadConfig>) =>
-      rawConfig ? actual.resolveConfig(rawConfig) : actual.loadConfig(...a),
+      rawConfig
+        ? actual.resolveConfig({ apiToken: "test-key", ...rawConfig })
+        : actual.loadConfig(...a),
   };
 });
 
@@ -64,6 +66,79 @@ describe("buildSessionStartContext", () => {
       detectLegacyPlugin: () => undefined,
     });
     expect(out.systemMessage).not.toContain("plugin uninstall");
+  });
+
+  it("configures the bank itself only when the deepen engine is not started", async () => {
+    const configure = vi.fn(async () => {});
+    const client = {
+      listDocumentIds: async () => new Set(["git:a"]),
+      listPages: listPagesOk,
+      configureBankSettings: configure,
+    };
+    const base = {
+      cwd: "/repo/dir",
+      bankId: "bank-1",
+      client,
+      detectLegacyPlugin: () => undefined,
+    };
+    await buildSessionStartContext({ ...base, cfg: resolveConfig({ autoSeed: false }) });
+    expect(configure).toHaveBeenCalledTimes(1);
+    expect(configure).toHaveBeenCalledWith(expect.objectContaining({ extractionMode: "concise" }));
+
+    configure.mockClear();
+    await buildSessionStartContext({
+      ...base,
+      cfg: resolveConfig({ codebaseSurvey: false }),
+      hasGit: () => false,
+    });
+    expect(configure).toHaveBeenCalledTimes(1);
+
+    configure.mockClear();
+    await buildSessionStartContext({
+      ...base,
+      cfg: resolveConfig({ codebaseSurvey: false }),
+      hasGit: () => true,
+      startSeed: vi.fn(),
+      headSha: () => null,
+    });
+    expect(configure).not.toHaveBeenCalled();
+  });
+
+  it("a directory with no git history gets its pages at session start (#5982)", async () => {
+    const seedPages = vi.fn(async () => {});
+    const client = {
+      listDocumentIds: async () => new Set<string>(),
+      listPages: listPagesOk,
+      configureBankSettings: vi.fn(async () => {}),
+      seedPages,
+    };
+    const base = { cwd: "/scratch", bankId: "bank-1", client, detectLegacyPlugin: () => undefined };
+
+    await buildSessionStartContext({ ...base, cfg: resolveConfig(), hasGit: () => false });
+    expect(client.configureBankSettings).toHaveBeenCalledTimes(1);
+    expect(seedPages).toHaveBeenCalledTimes(1);
+
+    // autoSeed: false opts out of seeding, pages included.
+    seedPages.mockClear();
+    await buildSessionStartContext({ ...base, cfg: resolveConfig({ autoSeed: false }) });
+    expect(seedPages).not.toHaveBeenCalled();
+
+    // Settings that failed (slow or unreachable server) skip the pages: no second timeout.
+    seedPages.mockClear();
+    client.configureBankSettings.mockRejectedValueOnce(new Error("timeout"));
+    await buildSessionStartContext({ ...base, cfg: resolveConfig(), hasGit: () => false });
+    expect(seedPages).not.toHaveBeenCalled();
+
+    // In a git repo the deepen engine seeds them, so session start does not.
+    seedPages.mockClear();
+    await buildSessionStartContext({
+      ...base,
+      cfg: resolveConfig({ codebaseSurvey: false }),
+      hasGit: () => true,
+      startSeed: vi.fn(),
+      headSha: () => null,
+    });
+    expect(seedPages).not.toHaveBeenCalled();
   });
 
   it("cold git repo + autoSeed on -> seeds + surveys, note in systemMessage (user-visible) + roster in additionalContext (model)", async () => {
@@ -700,7 +775,7 @@ describe("buildSessionStartContext — crashed-survey retry (baseline without fi
     const out = await buildSessionStartContext({
       cwd: "/tmp/x",
       bankId: "bank-1",
-      cfg: resolveConfig({ surveyRefreshCommits: 50 }),
+      cfg: resolveConfig({ surveyRefreshCommits: 50, apiToken: "test-key" }),
       client,
       hasGit: () => true,
       startSeed: vi.fn(),
@@ -718,6 +793,7 @@ describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
   // this hook makes — so the count must hold with every retain failing.
   it("stops surveying a commit after SURVEY_MAX_ATTEMPTS launches, with every retain failing", async () => {
     const leaseDir = mkdtempSync(join(tmpdir(), "hindsight-attempts-"));
+    rawConfig = {}; // the survey re-resolves config; keep it off this machine's real file
     try {
       const spawn = vi.fn().mockImplementation(() => {
         const child = Object.assign(new EventEmitter(), { unref: vi.fn() });
@@ -740,7 +816,7 @@ describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
         buildSessionStartContext({
           cwd: "/tmp/x",
           bankId: "bank-1",
-          cfg: resolveConfig({ surveyRefreshCommits: 50 }),
+          cfg: resolveConfig({ surveyRefreshCommits: 50, apiToken: "test-key" }),
           client: {
             listDocumentIds: async (tag: string) =>
               tag === "source:survey-baseline"
@@ -760,6 +836,7 @@ describe("buildSessionStartContext — survey attempt limit (#5623)", () => {
       for (let i = 0; i < SURVEY_MAX_ATTEMPTS + 2; i++) await session();
       expect(spawn).toHaveBeenCalledTimes(SURVEY_MAX_ATTEMPTS);
     } finally {
+      rawConfig = undefined;
       rmSync(leaseDir, { recursive: true, force: true });
     }
   });
@@ -793,4 +870,11 @@ describe("survey launch admission", () => {
       expect(retain).not.toHaveBeenCalled();
     }
   );
+});
+
+describe("buildSeedBanner color (#6502)", () => {
+  it("is plain text unless the host paints color", () => {
+    expect(buildSeedBanner("b", false)).toMatch(/^Hindsight is tracking/);
+    expect(buildSeedBanner("b", false, undefined, true)).toContain("\x1b[38;2;");
+  });
 });

@@ -78,7 +78,8 @@ const CREDIT_REMINDER =
   "Crediting is mandatory, not a judgement call: if anything these results contribute reaches your " +
   "reply — quoted, paraphrased, or merely confirming what you were going to say — open that part " +
   'with "> 🧠 **From Hindsight memory (<page>)** — <the specific facts you drew on>". Rewriting a ' +
-  "snippet in your own words does not make it yours. If none of them bear on the turn, ignore them " +
+  "snippet in your own words does not make it yours. The one exception: a page whose snippet is " +
+  '"No content yet." has nothing in it to credit. If none of them bear on the turn, ignore them ' +
   "silently — an unhelpful search needs no mention. These are past records: check a claim that " +
   "something was fixed or works against the code before relying on it.";
 
@@ -121,6 +122,8 @@ function currentStateUnknownGate(
           : "No safe page was available; the current state is unknown until raw/recent facts are checked.",
   };
 }
+
+const WRITE_TOOL_NAMES = new Set(["hindsight_capture_initiative", "hindsight_ingest_document"]);
 
 export interface ToolSpec {
   name: string;
@@ -188,8 +191,10 @@ export function buildPageTools(
     reflectTimeoutMs?: number;
     /** Reflect budget for `hindsight_reflect` (cfg.reflectBudget, default "high"). */
     reflectBudget?: "low" | "mid" | "high";
-    /** cfg.toolGuideExtra, added after the crediting note so it lands with the results too. */
+    /** cfg.toolGuideExtra, added after the crediting note in the search tool's description. */
     toolGuideExtra?: string;
+    /** cfg.writeTools: false leaves out the two tools that write to the bank (#6487). */
+    writeTools?: boolean;
   } = {}
 ): ToolSpec[] {
   const extra = opts.toolGuideExtra?.trim();
@@ -203,7 +208,8 @@ export function buildPageTools(
     offset: z.number().int().min(0).max(1_000_000).default(0),
     max_chars: z.number().int().min(1000).max(48_000).default(24_000),
   };
-  return [
+  const tools: ToolSpec[] = [
+
     {
       name: "hindsight_sync_status",
       description:
@@ -294,12 +300,14 @@ export function buildPageTools(
         "Search this repository's Hindsight pages for content relevant to a query — " +
         "hybrid full-text + semantic search, server-side. Call this when the user's question may " +
         "be answered by the project's accumulated knowledge (architecture, conventions, decisions, " +
-        "initiatives) rather than by reading code. Returns ranked pages with a relevance snippet. " +
+        "initiatives) rather than by reading code. Returns ranked pages, each with its opening " +
+        "text (not the passage that matched, and not filtered by relevance). " +
         "For current-state questions (current/latest/now/still/as-of), page snippets and bodies are " +
         "never returned: the result is a metadata-only raw-facts-required signal with safe/filtered " +
         "page counts. Only pages with explicit no-scoped-writes-reported freshness plus a source " +
         "watermark count as safe; when none remain the result is explicitly unknown. Stable background " +
         "questions keep normal page search behavior. " +
+
         // Same sentence the payload carries, from the same constant: two copies of a rule this
         // fiddly drift apart, and the description is what a host shows when the tool is listed.
         "read a full page with hindsight_read_knowledge_page. " +
@@ -343,7 +351,9 @@ export function buildPageTools(
             ...(isCurrentStateQuery(query)
               ? { pages: [], truncated: false }
               : boundedPageSearch(gated.hits)),
-            crediting,
+            // The reminder only: toolGuideExtra already rides the tool description, and repeating
+            // it in every result was most of the result's size (#6597).
+            crediting: CREDIT_REMINDER,
             freshness_note:
               "Freshness is scoped-write metadata, not a current-truth guarantee; deletions are " +
               "not observed. Missing metadata is unknown.",
@@ -534,4 +544,8 @@ export function buildPageTools(
       }),
     },
   ];
+  // The codebase survey (HINDSIGHT_DISABLE_HOOKS) is the plugin's own run, and saving what it
+  // learned with hindsight_ingest_document is its whole job, so it keeps the write tools.
+  if (opts.writeTools !== false || process.env.HINDSIGHT_DISABLE_HOOKS) return tools;
+  return tools.filter((t) => !WRITE_TOOL_NAMES.has(t.name));
 }

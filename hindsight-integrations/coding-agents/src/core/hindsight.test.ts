@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent, fetch as undiciFetch, getGlobalDispatcher, setGlobalDispatcher } from "undici";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { describeError } from "./log";
 import {
   DEFAULT_MAX_PARALLEL_RETAINS,
   DEFAULT_OBSERVATION_SCOPES,
@@ -455,6 +456,21 @@ describe("HindsightClient credential refresh", () => {
     return { calls, fetchMock };
   }
 
+  it("keeps the status and server detail in a capped error despite a long query (#6341)", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(400, { detail: "invalid byte sequence for encoding UTF8" }))
+    );
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    const url = `http://x/v1/default/banks/b/search?q=${encodeURIComponent("知识页面".repeat(20))}`;
+    const shown = await client.req("GET", url).then(
+      () => "",
+      (e) => describeError(e)
+    );
+    expect(shown).toContain("400");
+    expect(shown).toContain("invalid byte sequence");
+  });
+
   it("identifies itself with the integration's User-Agent", async () => {
     const { fetchMock } = server(() => undefined);
     await new HindsightClient({ apiUrl: "http://x", bank: "b" }).req("GET", "http://x/thing");
@@ -627,6 +643,32 @@ describe("every client-building entrypoint forwards observationScopes", () => {
 });
 
 describe("HindsightClient.reflect failures", () => {
+  it("disables Bun's socket idle timeout when the request has its own deadline (#6431)", async () => {
+    vi.stubGlobal("Bun", {});
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse(200, { text: "answer" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+
+    await expect(client.reflect("why?", { timeoutMs: 900_000 })).resolves.toBe("answer");
+
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ timeout: false });
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("leaves fetch's own timeout alone outside Bun (#6431)", async () => {
+    const fetchMock = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
+      jsonResponse(200, { text: "answer" })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+
+    await expect(client.reflect("why?", { timeoutMs: 900_000 })).resolves.toBe("answer");
+
+    expect(fetchMock.mock.calls[0][1]).not.toHaveProperty("timeout");
+  });
+
   it("keeps the server's error body, not just the status", async () => {
     vi.stubGlobal(
       "fetch",

@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { resolveHostConfig } from "./host-client";
 import { resolveConfig } from "./config";
+import { nodeBinary } from "./util";
 
 vi.mock("./host-client", () => ({ resolveHostConfig: vi.fn() }));
 let lockDir: string;
@@ -86,7 +87,7 @@ describe("startCodebaseSurvey", () => {
    *  from the supervisor's spec; the options are the real spawn's (the agent inherits them). */
   function launched(spawn: ReturnType<typeof fakeSpawn>, i = 0) {
     const [node, argv, options] = spawn.mock.calls[i];
-    expect(node).toBe("node");
+    expect(node).toBe(nodeBinary());
     // Only the script path on the command line: the payload rides in the environment (#4255).
     expect(argv).toEqual(["/x/survey-supervisor.js"]);
     const spec = JSON.parse(options.env[SURVEY_SPEC_ENV]) as SurveySupervisorSpec;
@@ -151,6 +152,8 @@ describe("startCodebaseSurvey", () => {
     const argv = launched(spawn)[1];
     expect(argv[argv.indexOf("--model") + 1]).toBe("haiku");
     expect(argv[argv.indexOf("--max-budget-usd") + 1]).toBe("2");
+    const mcp = JSON.parse(argv[argv.indexOf("--mcp-config") + 1]);
+    expect(mcp.mcpServers.hindsight.env.HINDSIGHT_DISABLE_HOOKS).toBe("1"); // keeps write tools
   });
 
   // ── codex recipe (read-only sandbox + inline -c MCP) ───────────────────────────────────────────
@@ -166,12 +169,14 @@ describe("startCodebaseSurvey", () => {
     expect(bin).toBe("codex");
     expect(argv.slice(0, 3)).toEqual(["exec", "--sandbox", "read-only"]);
     expect(argv).toContain(SURVEY_PROMPT);
-    expect(argv).toContain(`mcp_servers.hindsight.command="node"`);
+    expect(argv).toContain(`mcp_servers.hindsight.command=${JSON.stringify(nodeBinary())}`);
     expect(argv).toContain(`mcp_servers.hindsight.args=[ "/x/mcp-server.js" ]`);
     // Without this the survey's findings were stamped harness:claude-code and landed in Claude
     // Code's bank even though Codex ran the survey (#3603).
     expect(argv).toContain(`mcp_servers.hindsight.env.HINDSIGHT_MCP_HARNESS="codex"`);
     expect(argv).toContain(`mcp_servers.hindsight.env.HINDSIGHT_MCP_PROJECT_CWD="/repo"`);
+    // Codex starts MCP servers without its own environment; this keeps the write tools (#6487).
+    expect(argv).toContain(`mcp_servers.hindsight.env.HINDSIGHT_DISABLE_HOOKS="1"`);
     // No Claude-only flags leak into the codex recipe.
     expect(argv).not.toContain("--model");
     expect(argv).not.toContain("--disallowedTools");
