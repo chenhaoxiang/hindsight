@@ -168,7 +168,7 @@ describe("writeTools: false (#6487)", () => {
 describe("no pages yet", () => {
   it("leaves out the page tools, which would point at nothing", () => {
     const out = buildPagesPreamble([], { reflectOnNewGoals: true });
-    expect(out).not.toContain("hindsight_search_pages(query) — FIRST STOP");
+    expect(out).not.toContain("hindsight_search_knowledge_pages(query) — FIRST STOP");
     expect(out).not.toContain("NEW task or goal");
     expect(out).toContain("hindsight_reflect");
     expect(out).toContain("hindsight_capture_initiative");
@@ -176,15 +176,21 @@ describe("no pages yet", () => {
 });
 
 describe("short refresh (#6597)", () => {
-  it("is one line naming the search tool, not the guide", () => {
+  it("is one line naming page and direct raw/recent search tools, not the full guide", () => {
     const extra = "Team rule.";
     const out = buildRosterRefresh([{ id: "p1", title: "Component map" }], { extra, short: true });
     expect(out).toMatch(/^<hindsight_page_refresh>\n.*\n<\/hindsight_page_refresh>$/);
     expect(out).toContain("1 Hindsight page covers this repo");
-    expect(out).toContain("hindsight_search_pages");
+    expect(out).toContain("hindsight_search_knowledge_pages");
+    expect(out).toContain("hindsight_recall");
+    expect(out).toContain("hindsight_recent_memories");
+    expect(out).not.toContain("hindsight_search_pages");
     expect(out).not.toContain(extra);
     expect(out.length).toBeLessThan(300);
-    expect(buildRosterRefresh([], { short: true })).toContain("No Hindsight pages yet");
+    const empty = buildRosterRefresh([], { short: true });
+    expect(empty).toContain("No Hindsight pages yet");
+    expect(empty).toContain("hindsight_recall");
+    expect(empty).toContain("hindsight_recent_memories");
   });
 });
 
