@@ -178,9 +178,22 @@ are separately identifiable. A rejected or interrupted validation is retained as
 
 Current stable update candidate (source/PR acceptance only, not installation):
 
-- API `1.2.3-fork.1` / Python `1.2.3+fork.1`: exact upstream `v1.2.3`,
-  `bd230e8bb40e768bf69f266f1dd3c9ae03e22fe3`, plus
-  [.github/patches/api-1.2.3-fork.1.patch](patches/api-1.2.3-fork.1.patch). The overlay preserves the fork.2 TypeSafe decision budget alignment, fork.3 process-wide tokenizer semaphore and reranker input budget, fork.4 low-budget TypeSafe retry floor/tokenizer cap, and the later refresh-decision budget fixes. The maintenance API production tree equals this export plus overlay. The full official wrapper keeps its `==1.2.3` dependency, satisfied by the local `1.2.3+fork.1` version.
+- API `1.3.0-fork.1` / Python `1.3.0+fork.1`: exact upstream `v1.3.0`,
+  `937886199e0e3443f41f4d8180a16b12cc95c547`, plus
+  [.github/patches/api-1.3.0-fork.1.patch](patches/api-1.3.0-fork.1.patch).
+  Upstream v1.3.0 replaced the deprecated `TypeSafeCrossEncoder` with the shared
+  `DecisionModel` and absorbed the delta stage deadline, transient retry verdict and
+  invalid-request classification. The overlay therefore drops those now-redundant
+  implementations, keeps the fork's retry floor at the `decision_engine` wiring,
+  Cohere tokenizer input budgeting and the stable-chunk retain path, and retains the
+  fork's immediate abort in the reflect loop when the provider transport budget is
+  already exhausted. The maintenance API production tree equals this export plus
+  overlay. The full official wrapper is `1.3.0` with a `==1.3.0` dependency, satisfied
+  by the local `1.3.0+fork.1` version.
+- Previous API candidate, preserved for reproduction: `1.2.3-fork.1` / Python
+  `1.2.3+fork.1`, exact upstream `v1.2.3`
+  (`bd230e8bb40e768bf69f266f1dd3c9ae03e22fe3`) plus
+  [.github/patches/api-1.2.3-fork.1.patch](patches/api-1.2.3-fork.1.patch).
 - Coding Agents `0.8.7-fork.2`: npm `0.8.7` source
   `329f8a5ac9baa5567f4516a24dc9fd0f753a75ae` plus the maintained adapter,
   layered retrieval, source-scoped initiative, update-guard and current-state
@@ -190,8 +203,9 @@ Current stable update candidate (source/PR acceptance only, not installation):
   source; this was checked independently, not inferred from the API tag.
   Package, lockfile and plugin versions agree. Native tool names remain the existing
   ten, including the three `*_knowledge_page*` names, without renamed duplicates.
-- Control Plane uses official `1.2.3`; no fork installation or UI runtime is changed
-  by this API candidate. Do not use an unpublished monorepo tip for any component.
+- Control Plane uses official `1.2.3` until the paired 1.3.0 upgrade is verified; no
+  fork installation or UI runtime is changed by the API candidate alone. Do not use an
+  unpublished monorepo tip for any component.
 
 Upstream's Pages rename keeps the underlying `knowledge_pages` table, page IDs and
 content. Its deprecated `/knowledge-base` HTTP routes, old MCP names, config/env aliases,
@@ -222,7 +236,9 @@ adds these PostgreSQL knowledge-bank revisions in order:
    and drops the now-unused document language column.
 3. `kbtok1a2b3c4`: adds `kb_documents.content_tokens` for knowledge-bank metering.
 
-The fork overlay adds no schema revision. API startup normally applies upstream migrations:
+Upstream `v1.3.0` adds no Alembic revision compared with `v1.2.3` (both trees carry the
+same 122 revision files); the fork overlay adds no schema revision either. API startup
+normally applies upstream migrations:
 installation therefore requires the normal backup/migration/rollback planning rather than
 calling this source change schema-free. The 1.2.3-fork.1 installation was performed only
 against the already backed-up local store; deterministic tests migrate disposable stores.
@@ -231,6 +247,8 @@ executable. A runtime/data rollback is a separate verified operation.
 
 Preserve all previous overlays and Releases byte-for-byte:
 
+- API `1.2.3-fork.1` overlay and its Release remain the previous pinned component;
+  do not rewrite them during the 1.3.0 synchronization.
 - Historical API: upstream `v1.2.0` commit `34a138684a899b6ec34175f7a2b633860466d289`,
   plus [.github/patches/api-1.2.0-fork.3.patch](patches/api-1.2.0-fork.3.patch)
   for the incremental-retain candidate. Preserve the previously released

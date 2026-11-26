@@ -7,18 +7,19 @@ from typing import Any
 
 import pytest
 
+from hindsight_api.engine.llm_interface import OutputTooLongError
 from hindsight_api.engine.reflect.delta_ops import (
     AddSectionOp,
     AppendBlockOp,
-    DeltaOperationsInvalidError,
     DeltaOperationList,
+    DeltaOperationsInvalidError,
     ReplaceSectionBlocksOp,
     apply_operations,
     parse_delta_operation_list,
     request_delta_operations,
 )
-from hindsight_api.engine.response_models import LLMCallResult
 from hindsight_api.engine.reflect.structured_doc import Block, Section, StructuredDocument
+from hindsight_api.engine.response_models import LLMCallResult
 
 
 def test_parse_delta_operation_list_trailing_brackets():
@@ -254,18 +255,23 @@ class _ScriptedLLM:
     ``replies`` is typed ``Any`` because a provider does not always hand back
     text: when the call set a ``response_format`` the OpenAI-compatible providers
     parse the body and return the object — a dict under ``skip_validation``, the
-    validated model otherwise. The delta call site passes ``skip_validation=True``
-    (see ``memory_engine``), so a dict is what a real reply looks like here, and
+    validated model otherwise. ``request_delta_operations`` sets ``skip_validation=True``
+    on every call, so a dict is what a real reply looks like here, and
     every double in this file that returned text is what hid #4965.
     """
 
     def __init__(self, *replies: Any) -> None:
         self._replies = list(replies)
         self.calls: list[list[dict]] = []
+        self.kwargs: list[dict] = []
 
     async def call(self, *, messages, scope, **kwargs):
         self.calls.append(messages)
-        return LLMCallResult(content=self._replies[len(self.calls) - 1])
+        self.kwargs.append(kwargs)
+        reply = self._replies[len(self.calls) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return LLMCallResult(content=reply)
 
 
 class _RequestBodyRefused(Exception):
@@ -299,6 +305,21 @@ async def test_request_delta_operations_returns_a_clean_reply_in_one_call():
     op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
     assert len(op_list.operations) == 1
     assert len(llm.calls) == 1
+
+
+async def test_request_delta_operations_sends_the_schema_on_every_ask():
+    """A caller that names no schema still gets one — the retraction pass did not (#6569).
+
+    Without it a provider with native grammar decoding (Ollama) runs unconstrained and
+    returns off-schema ops; the retry must carry it too.
+    """
+    llm = _ScriptedLLM(_STRAY, _GOOD)
+    await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+    assert len(llm.kwargs) == 2
+    for kwargs in llm.kwargs:
+        assert kwargs["response_format"] is DeltaOperationList
+        assert kwargs["skip_validation"] is True
+        assert "strict_schema" in kwargs
 
 
 async def test_request_delta_operations_asks_again_with_the_errors():
@@ -563,3 +584,30 @@ async def test_request_delta_operations_tells_a_guessed_new_section_id_to_use_th
     outcome = apply_operations(_DOC, op_list.operations)
     assert not outcome.skipped
     assert [s.heading for s in outcome.document.sections] == ["Preferences", "Who's On Call", "Rollback"]
+
+
+_RUNAWAY = OutputTooLongError("reply hit the output cap")
+
+
+async def test_request_delta_operations_samples_once_more_when_a_reply_runs_to_the_cap():
+    """A repetition loop to the cap is a sampling accident (#6265): the same request, once more, comes back whole."""
+    llm = _ScriptedLLM(_RUNAWAY, _GOOD)
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+    assert len(op_list.operations) == 1
+    assert llm.calls[0] == llm.calls[1]
+
+
+async def test_request_delta_operations_resamples_the_correction_turn_too():
+    llm = _ScriptedLLM(_STRAY, _RUNAWAY, _GOOD)
+    op_list = await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+    assert len(op_list.operations) == 1
+    assert len(llm.calls) == 3
+    # The resample re-sends the correction turn as it was, not a third, different ask.
+    assert llm.calls[1] == llm.calls[2]
+
+
+async def test_request_delta_operations_raises_when_the_resample_runs_away_too():
+    llm = _ScriptedLLM(_RUNAWAY, _RUNAWAY)
+    with pytest.raises(OutputTooLongError):
+        await request_delta_operations(llm, system_prompt="sys", user_prompt="usr", scope="test")
+    assert len(llm.calls) == 2

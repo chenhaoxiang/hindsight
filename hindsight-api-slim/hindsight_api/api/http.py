@@ -21,14 +21,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import StrEnum
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
 from urllib.parse import quote, unquote
 
 import orjson
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from hindsight_api.api.admission import AdmissionAbandoned, AdmissionRejected, build_controller_from_config
+from hindsight_api.api.admission import admit_for, build_controller_from_config
 from hindsight_api.api.content_disposition import content_disposition
 from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
 from hindsight_api.api.gzip_offload import OffloadingGZipMiddleware
@@ -48,6 +48,7 @@ from hindsight_api.engine.document_history import DocumentHistoryResponse
 from hindsight_api.engine.llm_trace import LLMCallType, LLMRequestListResponse, LLMRequestStatsResponse, LLMStatsSplit
 from hindsight_api.engine.observation_tree import TreeFolder
 from hindsight_api.extensions import AuthenticationError, PrecheckContext, PrecheckOperation
+from hindsight_api.pagination import TRIM_TO_GRAPH, TRIM_TO_PAGE, trim_to
 
 
 def _parse_metadata(metadata: Any) -> dict[str, Any]:
@@ -4892,49 +4893,18 @@ def _register_routes(app: FastAPI):
 
     app.state.resolve_bank_alias = _resolve_bank_alias
 
+    async def _refuse_knowledge_bank(request: Request, bank_id: str) -> None:
+        """The route class's knowledge-bank refusal for memory-bank routes (see ``unknown_params``)."""
+        await app.state.memory.refuse_knowledge_bank(
+            bank_id,
+            request_context=get_request_context(request, request.headers.get("authorization")),
+        )
+
+    app.state.refuse_knowledge_bank = _refuse_knowledge_bank
+
     from hindsight_api.knowledge.routes import build_router as _build_knowledge_router
 
     app.include_router(_build_knowledge_router(get_request_context))
-
-    def admit_for(operation: PrecheckOperation):
-        """Build a FastAPI dependency that holds an admission permit for the request.
-
-        Yield-style so the permit is held for the whole request and released once the
-        response has been produced. Declared alongside ``precheck_for`` on the heavy
-        routes: FastAPI resolves dependencies before deserialising the body, so an
-        overloaded server refuses without ever reading the payload.
-
-        Returns 503 with ``Retry-After`` rather than queueing indefinitely — see
-        :mod:`hindsight_api.api.admission` for why the wait, not the concurrency, is
-        the thing worth bounding.
-        """
-
-        async def _admit_dep(request: Request):
-            controller = getattr(app.state, "admission", None)
-            if controller is None:
-                yield
-                return
-            # Recall, reflect and the retain POST carry a disconnect token (see
-            # api/disconnect.py). A queued request whose client has gone gives up its
-            # place immediately, which is what makes a patient deadline affordable.
-            # Retain joined them in #4526: before that its lane kept the place of a
-            # caller that had already hung up, because this returned None for it.
-            abandoned = get_scope_cancellation_token(request.scope)
-            try:
-                async with controller.admit(str(operation), abandoned=abandoned):
-                    yield
-            except AdmissionAbandoned:
-                # Nobody left to answer. Close the request without spending a slot
-                # or building a response.
-                raise HTTPException(status_code=499, detail="client disconnected while queued") from None
-            except AdmissionRejected as e:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(f"Server is at capacity for '{e.lane}' ({e.limit} concurrent); try again shortly."),
-                    headers={"Retry-After": str(e.retry_after_seconds)},
-                ) from None
-
-        return _admit_dep
 
     def precheck_for(operation: PrecheckOperation):
         """
@@ -5166,7 +5136,11 @@ def _register_routes(app: FastAPI):
         http_request: Request,
         bank_id: str,
         type: str | None = None,
-        limit: int = Query(default=1000, ge=0),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of memories to return. Values above 5000 are trimmed to 5000."),
+            TRIM_TO_GRAPH,
+        ] = 1000,
         q: str | None = Query(None, description=_MEMORY_Q_DESCRIPTION),
         tags: list[str] | None = Query(None),
         tags_match: TagsMatch = "all_strict",
@@ -5243,7 +5217,11 @@ def _register_routes(app: FastAPI):
         ),
         start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
         end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
-        limit: int = Query(default=100, ge=0),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of memories to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -6013,7 +5991,11 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_banks(
         q: str | None = Query(None, description="Case-insensitive substring filter on bank ID or name (e.g. 'alice')"),
-        limit: int = Query(default=100, ge=0, description="Maximum number of banks to return"),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of banks to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -6169,7 +6151,11 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_entities(
         bank_id: str,
-        limit: int = Query(default=100, ge=0, description="Maximum number of entities to return"),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of entities to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         tags: list[str] | None = Query(
             default=None,
@@ -6265,7 +6251,14 @@ def _register_routes(app: FastAPI):
     )
     async def api_entity_graph(
         bank_id: str,
-        limit: int = Query(default=1000, ge=0, description="Maximum number of co-occurrence edges to return"),
+        limit: Annotated[
+            int,
+            Query(
+                ge=0,
+                description="Maximum number of co-occurrence edges to return. Values above 5000 are trimmed to 5000.",
+            ),
+            TRIM_TO_GRAPH,
+        ] = 1000,
         min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
         tags: list[str] | None = Query(
             default=None,
@@ -6399,7 +6392,13 @@ def _register_routes(app: FastAPI):
                 "Content is opt-in: it is returned only when explicitly requested."
             ),
         ),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Annotated[
+            int,
+            Query(
+                ge=1, description="Maximum number of mental models to return. Values above 1000 are trimmed to 1000."
+            ),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(0, ge=0),
         exclude_pages: bool = Query(
             False,
@@ -7022,7 +7021,9 @@ def _register_routes(app: FastAPI):
     async def api_search_pages(
         bank_id: str,
         q: str = Query(..., description="Search query", min_length=1),
-        limit: int = Query(10, ge=1, le=50, description="Maximum results to return"),
+        limit: Annotated[
+            int, Query(ge=1, description="Maximum results to return. Values above 50 are trimmed to 50."), trim_to(50)
+        ] = 10,
         tag_filter: PageTagFilter = Depends(_page_tag_filter),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7221,7 +7222,11 @@ def _register_routes(app: FastAPI):
             description="How tagged directives match the requested scope. Untagged/global directives are included.",
         ),
         active_only: bool = Query(True, description="Only return active directives"),
-        limit: int = Query(100, ge=1, le=1000),
+        limit: Annotated[
+            int,
+            Query(ge=1, description="Maximum number of directives to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7425,7 +7430,11 @@ def _register_routes(app: FastAPI):
         ),
         start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
         end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
-        limit: int = Query(default=100, ge=0),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of documents to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7477,7 +7486,11 @@ def _register_routes(app: FastAPI):
     async def api_list_document_chunks(
         bank_id: str,
         document_id: str,
-        limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of chunks to return"),
+        limit: Annotated[
+            int,
+            Query(ge=1, description="Maximum number of chunks to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7545,7 +7558,11 @@ def _register_routes(app: FastAPI):
     async def api_get_document_history(
         bank_id: str,
         document_id: str,
-        limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of operations to read"),
+        limit: Annotated[
+            int,
+            Query(ge=1, description="Maximum number of operations to read. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination, in operations"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7665,7 +7682,11 @@ def _register_routes(app: FastAPI):
             default="memories",
             description="Where to read tags from: 'memories' (memory_units, default) or 'mental_models'.",
         ),
-        limit: int = Query(default=100, ge=0, description="Maximum number of tags to return"),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of tags to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -7875,7 +7896,11 @@ def _register_routes(app: FastAPI):
             default=None,
             description="Filter by operation type: retain, consolidation, refresh_mental_model, file_convert_retain, webhook_delivery",
         ),
-        limit: int = Query(default=20, ge=1, le=100, description="Maximum number of operations to return"),
+        limit: Annotated[
+            int,
+            Query(ge=1, description="Maximum number of operations to return. Values above 100 are trimmed to 100."),
+            trim_to(100),
+        ] = 20,
         offset: int = Query(default=0, ge=0, description="Number of operations to skip"),
         exclude_parents: bool = Query(default=False, description="Exclude parent batch operations from results"),
         request_context: RequestContext = Depends(get_request_context),
@@ -9161,7 +9186,11 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_observation_scopes(
         bank_id: str,
-        limit: int = Query(default=100, ge=0, le=1000, description="Maximum number of scopes to return"),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of scopes to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -9499,7 +9528,11 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_webhooks(
         bank_id: str,
-        limit: int = Query(default=100, ge=0, le=1000, description="Maximum number of webhooks to return"),
+        limit: Annotated[
+            int,
+            Query(ge=0, description="Maximum number of webhooks to return. Values above 1000 are trimmed to 1000."),
+            TRIM_TO_PAGE,
+        ] = 100,
         offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -9675,7 +9708,11 @@ def _register_routes(app: FastAPI):
     async def api_list_webhook_deliveries(
         bank_id: str,
         webhook_id: str,
-        limit: int = Query(default=50, le=200, description="Maximum number of deliveries to return"),
+        limit: Annotated[
+            int,
+            Query(ge=1, description="Maximum number of deliveries to return. Values above 200 are trimmed to 200."),
+            trim_to(200),
+        ] = 50,
         cursor: str | None = Query(default=None, description="Pagination cursor (created_at of last item)"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -10247,7 +10284,9 @@ def _register_routes(app: FastAPI):
         transport: str | None = Query(None, description="Filter by transport (http, mcp, system)"),
         start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
         end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
-        limit: int = Query(50, ge=1, le=500, description="Max items to return"),
+        limit: Annotated[
+            int, Query(ge=1, description="Max items to return. Values above 500 are trimmed to 500."), trim_to(500)
+        ] = 50,
         offset: int = Query(0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -10366,7 +10405,9 @@ def _register_routes(app: FastAPI):
         ),
         start_date: str | None = Query(None, description="Filter from this ISO datetime (inclusive)"),
         end_date: str | None = Query(None, description="Filter until this ISO datetime (exclusive)"),
-        limit: int = Query(50, ge=1, le=500, description="Max items to return"),
+        limit: Annotated[
+            int, Query(ge=1, description="Max items to return. Values above 500 are trimmed to 500."), trim_to(500)
+        ] = 50,
         offset: int = Query(0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
