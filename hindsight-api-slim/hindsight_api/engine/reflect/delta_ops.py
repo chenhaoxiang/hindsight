@@ -50,9 +50,11 @@ from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
+from hindsight_api.config import get_config
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
-from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, parse_llm_json, reask_messages
+from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, OutputTooLongError, parse_llm_json, reask_messages
+from hindsight_api.engine.response_models import LLMCallResult
 
 from .structured_doc import (
     Block,
@@ -173,7 +175,7 @@ class RemoveBlockOp(_OpBase):
 
 
 class AddSectionOp(_OpBase):
-    """Add a new section with its blocks, after after_section_id (an existing section's id) or at the end when omitted."""
+    """Add a new section with its blocks, after after_section_id (an existing section's id) or at the end when null."""
 
     # ``new_id``, when omitted, is the heading slugified and disambiguated
     # against the ids already in use.
@@ -499,6 +501,23 @@ def _unreachable_correction_prompt(
     return "\n".join(lines)
 
 
+async def _call_resampling_a_runaway(
+    llm: ConfiguredLLMProvider, messages: list[dict[str, Any]], scope: str, **call_kwargs: Any
+) -> LLMCallResult:
+    """``llm.call``, sampled once more when the reply runs to the output cap.
+
+    An operation list is short; a reply that reaches the cap is the model stuck
+    repeating one bullet, not a long answer (#6265). That loop is a sampling
+    accident — about 1 in 120 identical requests — so the same request, once more,
+    comes back whole. A second runaway raises, so the refresh fails as before.
+    """
+    try:
+        return await llm.call(messages=messages, scope=scope, **call_kwargs)
+    except OutputTooLongError:
+        logger.warning("[STRUCTURED_DELTA] %s reply hit the token cap; sampling once more", scope)
+        return await llm.call(messages=messages, scope=scope, **call_kwargs)
+
+
 async def request_delta_operations(
     llm: ConfiguredLLMProvider,
     *,
@@ -583,6 +602,13 @@ async def _request_delta_operations(
     preserved and the task retries with a fresh reflect behind it, a better use
     of the next attempt.
 
+    A reply that runs to the output cap is a different failure and is answered
+    differently: the same request, sampled once more (``_call_resampling_a_runaway``),
+    on either ask. That is not the #3421 case — a loop to the cap is not decided by
+    the input, about 1 identical request in 120 hits it (#6265) — and with no reply
+    there is nothing to correct. Before this, the cap error raised straight out and
+    the model stayed stale, since a failover chain does not move on for it either.
+
     The retry APPENDS to the first request and never rewrites it, so the system
     prompt and the whole document stay a byte-identical prefix and the provider's
     prompt cache still covers them on the second call. The one appended turn the
@@ -597,9 +623,19 @@ async def _request_delta_operations(
     block ids. Only the refresh's edit pass passes it — for the retraction pass,
     touching nothing is a legitimate answer.
     """
+    # The schema travels on every delta-shaped call, set here rather than by each
+    # caller: the retraction pass once omitted it and ran unconstrained, so a model
+    # with native grammar decoding (Ollama) produced off-schema ops there (#6569).
+    # ``skip_validation`` keeps the raw JSON for the op-by-op parser below.
+    call_kwargs = {
+        "response_format": DeltaOperationList,
+        "strict_schema": get_config().llm_strict_schema_reflect,
+        "skip_validation": True,
+        **call_kwargs,
+    }
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
     _check_edit_deadline(deadline)
-    first = await llm.call(messages=messages, scope=scope, **call_kwargs)
+    first = await _call_resampling_a_runaway(llm, messages, scope, **call_kwargs)
     _check_edit_deadline(deadline)
     try:
         op_list = parse_delta_operation_list(first.content)
@@ -625,9 +661,12 @@ async def _request_delta_operations(
             len(op_list.operations),
         )
         correction = _unreachable_correction_prompt(unreachable, document, any_applied=bool(outcome.applied))
+    # An expired phase cannot start a structural correction: the provider round trip
+    # would only spend the caller's budget on an answer that cannot land.
     _check_edit_deadline(deadline)
-    second = await llm.call(messages=reask_messages(messages, first.content, correction), scope=scope, **call_kwargs)
-    _check_edit_deadline(deadline)
+    second = await _call_resampling_a_runaway(
+        llm, reask_messages(messages, first.content, correction), scope, **call_kwargs
+    )
     return parse_delta_operation_list(second.content)
 
 

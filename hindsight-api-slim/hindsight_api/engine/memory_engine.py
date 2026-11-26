@@ -76,6 +76,8 @@ from ..extensions.operation_validator import (
     FileConvertResult,
     ImportArchiveDocument,
     ImportContext,
+    KnowledgeBankReadContext,
+    KnowledgeBankReadOperation,
     MemoryCurationAction,
     MemoryUpdateContext,
     MemoryUpdateResult,
@@ -687,7 +689,8 @@ from .bank_life import (
     job_bank_bound,
 )
 from .bank_templates import apply_default_bank_template_resources, load_default_bank_template_manifest
-from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, TypeSafeCrossEncoder, recall_log_id
+from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, recall_log_id
+from .decision_model import DecisionEngineFor, DecisionModel, decision_engine
 from .embeddings import (
     EMBEDDING_MODEL_SETTING,
     Embeddings,
@@ -763,6 +766,7 @@ from .reflect.models import StructuredOutputResult
 from .reflect.retractions import (
     RetractedGrounding,
     based_on_fact_ids,
+    drop_inline_citations,
     partition_retracted,
     prune_based_on,
 )
@@ -777,7 +781,7 @@ from .reflect.tools import (
     tool_search_mental_models,
     tool_search_observations,
 )
-from .remote_retry import RetryPolicy, is_invalid_remote_request, is_transient_remote_error, status_code_of
+from .remote_retry import is_transient_remote_error, status_code_of
 from .response_models import (
     DIRECTIVE_PRIORITY_MAX,
     DIRECTIVE_PRIORITY_MIN,
@@ -833,7 +837,7 @@ from .search.tags import (
 from .search.types import ScoredResult
 from .source_facts import select_source_facts_within_budget
 from .source_scope import visible_document_ids
-from .stored_dates import is_placeholder_date
+from .stored_dates import bank_timezone, is_placeholder_date
 from .task_backend import TaskBackend
 from .time_filter import DOCUMENT_TIME_FIELDS, validate_time_window
 
@@ -2488,8 +2492,8 @@ def _delta_failure_reason(fallback: ModeFallbackReason | None) -> RefreshFailure
     """Narrow a delta run's fallback reason to the failure vocabulary.
 
     Only the three reasons a delta can hit *after* it has been chosen are
-    reachable here — ``no_baseline_content`` and ``source_query_changed`` turn
-    delta off before it runs, so a refresh carrying them is a legitimate full
+    reachable here — ``no_baseline_content``, ``source_query_changed`` and
+    ``grounding_gone`` turn delta off before it runs, so a refresh carrying them is a legitimate full
     regeneration, not a failure. Anything else degrades to the generic value
     rather than widening the failure enum with values it can never mean.
     """
@@ -3011,6 +3015,7 @@ class MemoryEngine(MemoryEngineInterface):
         consolidation_llm_base_url: str | None = None,
         embeddings: Embeddings | None = None,
         cross_encoder: CrossEncoderModel | None = None,
+        decision_engine_for: DecisionEngineFor | None = None,
         query_analyzer: QueryAnalyzer | None = None,
         pool_min_size: int | None = None,
         pool_max_size: int | None = None,
@@ -3049,6 +3054,10 @@ class MemoryEngine(MemoryEngineInterface):
             consolidation_llm_base_url: Base URL for consolidation LLM. Falls back to memory_llm_base_url.
             embeddings: Embeddings implementation. If not provided, created from env vars.
             cross_encoder: Cross-encoder model. If not provided, created from env vars.
+            decision_engine_for: The decision model each operation asks, by operation (None for none).
+                                Defaults to decision_model.decision_engine, the shared engine built
+                                from HINDSIGHT_API_DECISION_MODEL_*. Recall's reranker and consolidation
+                                triage are handed this same callable.
             query_analyzer: Query analyzer implementation. If not provided, uses DateparserQueryAnalyzer.
             pool_min_size: Minimum number of connections in the pool. Defaults to HINDSIGHT_API_DB_POOL_MIN_SIZE.
             pool_max_size: Maximum number of connections in the pool. Defaults to HINDSIGHT_API_DB_POOL_MAX_SIZE.
@@ -3518,9 +3527,12 @@ class MemoryEngine(MemoryEngineInterface):
             _consolidation_base_llm, config, "consolidation_", consolidation_call_defaults
         )
 
-        # Initialize cross-encoder reranker (cached for performance)
-        self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
-        self._reflect_decision_model_client: TypeSafeCrossEncoder | None = None
+        # The engine each operation asks. Set before the reranker so recall is handed this
+        # same callable; with nothing injected it is decision_engine, as before.
+        self._decision_engine_for = decision_engine_for or decision_engine
+        self._cross_encoder_reranker = CrossEncoderReranker(
+            cross_encoder=cross_encoder, decision_engine_for=self._decision_engine_for
+        )
         self._reflect_decision_model_unsupported_logged = False
 
         # Page-index writes a create hands off instead of waiting on; held so the loop does not
@@ -3690,6 +3702,15 @@ class MemoryEngine(MemoryEngineInterface):
     def audit_logger(self) -> AuditLogger:
         """The audit logger for feature usage tracking."""
         return self._audit_logger
+
+    @property
+    def decision_engine_for(self) -> DecisionEngineFor:
+        """The decision engine each operation was given.
+
+        Read-only. This is the callable passed to MemoryEngine, or the module
+        decision_engine when nothing was injected.
+        """
+        return self._decision_engine_for
 
     async def _resolve_bank_audit_enabled(self, bank_id: str, context: "RequestContext | None" = None) -> bool:
         """Resolve ``audit_log_enabled`` for one bank (env -> tenant -> bank).
@@ -4579,6 +4600,23 @@ class MemoryEngine(MemoryEngineInterface):
             retry_count=task_dict.get("_retry_count", 0),
             operation_id=task_dict.get("_operation_id"),
         )
+        if operation_id and not any(item.get("update_mode") == "append" for item in contents):
+            newer = await self._supersede_by_newer_retain_of_same_document(operation_id)
+            if newer:
+                # A replace carries the whole document, so one SENT later and already finished holds
+                # a newer version. This one can only reach here after it by being retried: the claim
+                # predicate runs a document's retains in submission order, but a peer waiting out
+                # its retry delay does not hold the line. Running it would roll the document back
+                # and re-extract the older body (#6763). The orchestrator's own stale check cannot
+                # see this: it compares against when this run STARTED, which is after the newer
+                # version committed. Checked before `retain_batch_async` on purpose: nothing runs,
+                # so the retain's validator hooks and its retain.completed event (written only with
+                # stored memories, like the orchestrator's stale skip) have nothing to report.
+                logger.info(
+                    f"[BATCH_RETAIN_TASK] Skipping retain {operation_id} for bank_id={bank_id}: "
+                    f"retain {newer}, sent after it, already replaced the document"
+                )
+                return
         await self.retain_batch_async(
             bank_id=bank_id,
             contents=contents,
@@ -10462,6 +10500,7 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_function=get_config().recency_decay_function,
                     recency_decay_linear_window_days=get_config().recency_decay_linear_window_days,
                     recency_decay_halflife_days=get_config().recency_decay_halflife_days,
+                    recency_alpha=get_config().recency_alpha,
                     # Resolved here, not in the store: `question_date` overrides "now", and two
                     # clocks would make an identical request score differently on the two paths.
                     now=_recall_scoring_now(request.question_date),
@@ -11059,6 +11098,7 @@ class MemoryEngine(MemoryEngineInterface):
                     recency_decay_function=scoring_config.recency_decay_function,
                     recency_decay_linear_window_days=scoring_config.recency_decay_linear_window_days,
                     recency_decay_halflife_days=scoring_config.recency_decay_halflife_days,
+                    recency_alpha=scoring_config.recency_alpha,
                 )
                 # Per-strategy bump after combined scoring. Passthrough recalls
                 # (explicit rrf, an rrf provider, or a chain that failed over to
@@ -11071,7 +11111,9 @@ class MemoryEngine(MemoryEngineInterface):
 
                     stage2 = apply_post_rerank_boost(scored_results, strategy_boosts, passthrough=is_passthrough)
                 scored_results.sort(key=lambda x: x.weight, reverse=True)
-                log_buffer.append("  [4.6] Combined scoring: ce * recency_boost(0.2) * temporal_boost(0.2)")
+                log_buffer.append(
+                    f"  [4.6] Combined scoring: ce * recency_boost({scoring_config.recency_alpha}) * temporal_boost(0.2)"
+                )
                 if strategy_boosts:
                     log_buffer.append(f"  [4.7] Strategy boosts applied: {strategy_boosts} {stage2}")
 
@@ -16270,74 +16312,41 @@ class MemoryEngine(MemoryEngineInterface):
             return self._reflect_llm_config
         return override
 
-    def _reflect_decision_model(self) -> TypeSafeCrossEncoder | None:
-        """The decision model reflect asks "is this enough?", or None when none is set up.
+    def _reflect_decision_model(self) -> DecisionModel | None:
+        """The decision model reflect and page refresh ask, or None when none is set up.
 
-        Built from the reflect decision-model setup (HINDSIGHT_API_DECISION_MODEL_*, with
-        HINDSIGHT_API_REFLECT_DECISION_MODEL_* overrides), once per engine so its connection
-        pool is shared across reflects. It is a TypeSafeCrossEncoder because pruning needs
-        that class's rank-and-cut; the sufficiency question is one more call on it.
+        The shared engine for reflect (HINDSIGHT_API_DECISION_MODEL_*, with
+        HINDSIGHT_API_REFLECT_DECISION_MODEL_* overrides), injected through the constructor. It
+        prunes the evidence, judges "is this enough?" and gates delta page refreshes; its
+        requests are retried (DecisionModel.ask), so a single 429 does not drop a round's cut or
+        verdict. Its questions are sized to the configured window, counted in the setup's
+        tokenizer (#6659); with no window (Hindsight Inference) at the Jev-sized default.
 
-        That client speaks only the System One endpoint (typesafe, hindsight), so another provider
-        (cloudflare, openai) leaves reflect on agent turns instead of failing every reflect's first round.
+        Reflect runs on the System One providers (typesafe, hindsight) only, as measured; another
+        provider (cloudflare, openai) leaves reflect on agent turns.
         """
-        if self._reflect_decision_model_client is None:
-            setup = get_config().decision_model_config("reflect")
-            if setup is None:
-                return None
-            if setup.provider not in SYSTEM_ONE_DECISION_MODEL_PROVIDERS:
-                if not self._reflect_decision_model_unsupported_logged:
-                    self._reflect_decision_model_unsupported_logged = True
-                    logger.warning(
-                        "Reflect's decision model supports only the typesafe and hindsight providers, not %r: "
-                        "reflect keeps agent turns.",
-                        setup.provider,
-                    )
-                return None
-            max_question_tokens = setup.max_request_tokens
-            if max_question_tokens is not None and max_question_tokens < TypeSafeCrossEncoder.MIN_QUESTION_TOKENS:
-                # The shared DecisionModel floor is lower than TypeSafe's retry floor.
-                # Do not turn a valid shared-model setting into a page/reflect startup
-                # failure; leave the TypeSafe client on its historical safe default.
+        model = self._decision_engine_for("reflect")
+        if model is None:
+            return None
+        if model.provider not in SYSTEM_ONE_DECISION_MODEL_PROVIDERS:
+            if not self._reflect_decision_model_unsupported_logged:
+                self._reflect_decision_model_unsupported_logged = True
                 logger.warning(
-                    "Decision model max_request_tokens=%s is below TypeSafe's retry floor %s; "
-                    "using the TypeSafe default question budget",
-                    max_question_tokens,
-                    TypeSafeCrossEncoder.MIN_QUESTION_TOKENS,
+                    "Reflect's decision model supports only the typesafe and hindsight providers, not %r: "
+                    "reflect keeps agent turns.",
+                    model.provider,
                 )
-                max_question_tokens = None
-            self._reflect_decision_model_client = TypeSafeCrossEncoder(
-                api_key=setup.api_key,
-                model=setup.model,
-                base_url=setup.base_url,
-                timeout=setup.timeout,
-                max_concurrent=setup.max_concurrent,
-                prune_candidates=True,
-                # The recall cut keeps at most 12; a reflect answer can need more (a count
-                # over seven customers can be seven facts plus the observations about them).
-                # The floor guards the cut's coarse levels: on that count it kept five.
-                shortlist=25,
-                min_keep=15,
-                vision=setup.vision,
-                # The shared decision-model request ceiling is also the endpoint's
-                # context budget. Keep reflect/page decisions from probing the
-                # historical 26k default against a smaller self-hosted endpoint.
-                # None (Hindsight Inference, which fits requests itself): the class default, sized for Jev.
-                max_question_tokens=max_question_tokens,
-                tokenizer=setup.tokenizer,
-            )
-            # Retried like the shared decision model (DecisionModel.ask): without it a single 429
-            # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)
-            # for that round. On a shared endpoint under load it was 30% of reflects in a LoComo
-            # run, which then quietly answered like agent mode.
-            self._reflect_decision_model_client.retry_policy = RetryPolicy()
-        return self._reflect_decision_model_client
+            return None
+        return model
 
     async def _prune_reflect_evidence(self, query: str, texts: list[str]) -> list[bool]:
         """Keep flags for the first retrieval of a decision-orchestrated reflect."""
         model = self._reflect_decision_model()
         assert model is not None  # only wired when a decision model is configured
-        scores = await model.predict([(query, text) for text in texts])
+        # The recall cut keeps at most 12; a reflect answer can need more (a count over seven
+        # customers is seven facts plus the observations about them). The floor guards the
+        # cut's coarse levels: on that count it kept five.
+        scores = await model.rank(query, texts, prune=True, shortlist=25, min_keep=15)
         return [score > 0.0 for score in scores]
 
     def _llm_for_reflect_operation(self, operation_label: str) -> "LLMConfig | MultiLLMProvider":
@@ -16814,6 +16823,7 @@ class MemoryEngine(MemoryEngineInterface):
                             evidence_is_sufficient_fn=decision_model.evidence_is_sufficient if decision_model else None,
                             prune_evidence_fn=self._prune_reflect_evidence if decision_model else None,
                             reflect_id=reflect_id,
+                            tz=bank_timezone(resolved_reflect_config),
                         )
             except (asyncio.CancelledError, OperationCancelledError):
                 # Logged here, under this reflect's id, because the HTTP layer's
@@ -17192,7 +17202,8 @@ class MemoryEngine(MemoryEngineInterface):
             for u in units
         ]
         # CPU-bound (~0.1s per few thousand observations): off the event loop, like the entity graph.
-        return await asyncio.to_thread(build_observation_tree, observations, bank_id)
+        tz = bank_timezone(await self._config_resolver.resolve_full_config(bank_id, request_context))
+        return await asyncio.to_thread(build_observation_tree, observations, bank_id, tz)
 
     async def get_entity_graph(
         self,
@@ -18930,6 +18941,75 @@ class MemoryEngine(MemoryEngineInterface):
                 else:
                     stored_structured_content = raw_struct
 
+        # Retracted grounding: facts the stored document still cites that no longer
+        # exist. Derived here rather than passed in by whatever removed them, because
+        # ``submit_async_refresh_mental_model`` guarantees that refreshes carry no
+        # per-request options — that is what makes its pending-dedupe safe (#3487), and
+        # a payload of ids would break it by making one queued refresh no longer cover
+        # the next caller's intent. Deriving also makes the pass idempotent (a failed
+        # run recomputes the same set) and covers invalidation, every delete path, and
+        # the observation sweep without instrumenting any of them.
+        #
+        # Only delta needs this. A full refresh regenerates the document from live
+        # facts and rebuilds ``based_on`` wholesale, so a retracted fact cannot survive
+        # either surface. It is read before reflect runs because it can turn delta off.
+        retracted = RetractedGrounding()
+        retraction_deferred_reason: str | None = None
+        # Set once the unsay pass has run to completion, which is what licenses
+        # pruning the retracted ids out of based_on below.
+        retraction_handled = False
+        retraction_operations: MentalModelDeltaOperations | None = None
+        if use_delta:
+            stored_based_on = (mental_model.get("reflect_response") or {}).get("based_on")
+            cited_ids = based_on_fact_ids(stored_based_on)
+            if cited_ids:
+                from .memories import get_memories
+
+                store = get_memories()
+                # Resolved before taking the read connection: the resolver can need a
+                # connection of its own, and holding one while it waits for another can
+                # exhaust a small pool.
+                bank_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+                async with self._store_read_conn(bank_id) as conn:
+                    live_ids = await store.live_memory_ids(
+                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
+                    )
+                    retracted = partition_retracted(stored_based_on, live_ids)
+                    if retracted:
+                        # Re-ingesting a document deletes its facts and re-extracts them
+                        # under fresh ids, so the old ones read exactly like a retraction.
+                        # The replacements are not observations yet — those are minted by a
+                        # consolidation run that happens *after* retain commits — so waiting
+                        # for the commit is not enough. Unsaying in that gap deletes prose
+                        # whose replacement does not exist, and because the ids leave
+                        # ``based_on`` with it, nothing would ever notice again. Wait for the
+                        # bank to be caught up instead; staleness re-offers this every round.
+                        #
+                        # Only a bank that makes observations has anything to wait for. With
+                        # observations off nothing is ever consolidated, so ``pending`` never
+                        # drains and the wait deferred the pass forever: a deleted memory's
+                        # claims stayed on the page for good (#6855). There, the replacement
+                        # facts exist as soon as their retain commits.
+                        freshness = await store.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+                        if bank_config.enable_observations and freshness.get("pending"):
+                            retraction_deferred_reason = (
+                                f"{freshness['pending']} fact(s) are still pending consolidation"
+                            )
+
+        # Nothing the page cites exists any more: its whole source was deleted, or
+        # re-ingested under new ids. Unsaying every claim at once is not an edit, so
+        # rebuild the page from what the bank holds now instead. A deleted source then
+        # leaves nothing to say, a re-ingested one writes the page again under its new
+        # ids, and no stale citation survives in either the text or ``based_on``.
+        # Still deferred while consolidation is pending: right after a re-ingest the
+        # replacements are not there yet, and a rebuild then would empty the page.
+        gone_citations = 0
+        if retracted.unresolvable and retraction_deferred_reason is None:
+            use_delta = False
+            mode_fallback_reason = "grounding_gone"
+            gone_citations = retracted.cited_count
+            retracted = RetractedGrounding()
+
         tag_filtering = _resolve_refresh_tag_filtering(model_tags, trigger_data)
         exclude_ids = sorted({*stored_exclude_ids, mental_model_id})
         scope = MentalModelRefreshScope(
@@ -19132,51 +19212,6 @@ class MemoryEngine(MemoryEngineInterface):
         for _facts in based_on_serialized_payload.values():
             delta_supporting_facts.extend(_facts)
 
-        # Retracted grounding: facts the stored document still cites that no longer
-        # exist. Derived here rather than passed in by whatever removed them, because
-        # ``submit_async_refresh_mental_model`` guarantees that refreshes carry no
-        # per-request options — that is what makes its pending-dedupe safe (#3487), and
-        # a payload of ids would break it by making one queued refresh no longer cover
-        # the next caller's intent. Deriving also makes the pass idempotent (a failed
-        # run recomputes the same set) and covers invalidation, every delete path, and
-        # the observation sweep without instrumenting any of them.
-        #
-        # Only delta needs this. A full refresh regenerates the document from live
-        # facts and rebuilds ``based_on`` wholesale, so a retracted fact cannot survive
-        # either surface.
-        retracted = RetractedGrounding()
-        retraction_deferred_reason: str | None = None
-        # Set once the unsay pass has run to completion, which is what licenses
-        # pruning the retracted ids out of based_on below.
-        retraction_handled = False
-        retraction_operations: MentalModelDeltaOperations | None = None
-        if use_delta:
-            stored_based_on = (mental_model.get("reflect_response") or {}).get("based_on")
-            cited_ids = based_on_fact_ids(stored_based_on)
-            if cited_ids:
-                from .memories import get_memories
-
-                store = get_memories()
-                async with self._store_read_conn(bank_id) as conn:
-                    live_ids = await store.live_memory_ids(
-                        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
-                    )
-                    retracted = partition_retracted(stored_based_on, live_ids)
-                    if retracted:
-                        # Re-ingesting a document deletes its facts and re-extracts them
-                        # under fresh ids, so the old ones read exactly like a retraction.
-                        # The replacements are not observations yet — those are minted by a
-                        # consolidation run that happens *after* retain commits — so waiting
-                        # for the commit is not enough. Unsaying in that gap deletes prose
-                        # whose replacement does not exist, and because the ids leave
-                        # ``based_on`` with it, nothing would ever notice again. Wait for the
-                        # bank to be caught up instead; staleness re-offers this every round.
-                        freshness = await store.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
-                        if freshness.get("pending"):
-                            retraction_deferred_reason = (
-                                f"{freshness['pending']} fact(s) are still pending consolidation"
-                            )
-
         # In delta mode, based_on must accumulate: the mental model is
         # grounded on ALL facts ever used, not just the latest delta's new
         # ones. Merge previous based_on with current, deduplicating by id.
@@ -19210,13 +19245,21 @@ class MemoryEngine(MemoryEngineInterface):
         warnings: list[str] = []
         retrieved_total = sum(facts.retrieved.values())
         used_total = sum(facts.used.values())
-        if not has_sources:
+        if gone_citations:
             warnings.append(
-                "Nothing in this document's scope was readable, so the reflect loop was skipped and the "
-                "document left as it is. Check the resolved scope — tags, tag_groups and fact_types all "
-                "narrow it — and, in delta mode, the time window: only memories changed after the last "
-                "refresh are in range."
+                f"None of the {gone_citations} fact(s) this document cited exist any more, so it is rebuilt "
+                "from what the bank holds now"
+                + (", which is nothing in its scope: the document is emptied." if not has_sources else ".")
             )
+        if not has_sources:
+            # A rebuild with nothing to read already said so above, and empties the page.
+            if not gone_citations:
+                warnings.append(
+                    "Nothing in this document's scope was readable, so the reflect loop was skipped and the "
+                    "document left as it is. Check the resolved scope — tags, tag_groups and fact_types all "
+                    "narrow it — and, in delta mode, the time window: only memories changed after the last "
+                    "refresh are in range."
+                )
         elif retrieved_total == 0:
             warnings.append(
                 "Retrieval returned no facts at all. Check the resolved scope and the time window — "
@@ -19281,7 +19324,6 @@ class MemoryEngine(MemoryEngineInterface):
         # drift is structurally impossible. Falls back to the full candidate
         # markdown if either the structuring or the LLM op call fails.
         from .reflect.delta_ops import (
-            DeltaOperationList,
             apply_operations,
             request_delta_operations,
         )
@@ -19300,6 +19342,11 @@ class MemoryEngine(MemoryEngineInterface):
         final_content = reflect_result.text
         final_structured: StructuredDocument | None = None
         delta_applied = False
+        # The unsay pass has its own flag, apart from ``delta_applied``: when new facts
+        # follow, the unsay edits only stand if the new-facts delta lands too. Sharing
+        # one flag let a failed new-facts delta write the unsay-only document and move
+        # the watermark past the facts it never added (#6447).
+        unsay_applied = False
         delta_operations: MentalModelDeltaOperations | None = None
         # Both op calls share one LLM handle, built on first use so a refresh that
         # neither retracts nor has new facts still pays no config resolution.
@@ -19353,20 +19400,7 @@ class MemoryEngine(MemoryEngineInterface):
                 # because a retraction is a reason to edit the document all by itself —
                 # gating it on new facts arriving is exactly the coupling that let a
                 # retired claim survive indefinitely on a quiet bank.
-                if retracted.unresolvable:
-                    # None of the grounding resolves, so this is a broken provenance
-                    # link rather than a retraction — see RetractedGrounding.unresolvable.
-                    # Drop the dangling citations (nothing should report a fact that is
-                    # not there) but leave the prose exactly as it is.
-                    retraction_handled = True
-                    warnings.append(
-                        f"None of the {retracted.cited_count} fact(s) this document cites could be "
-                        "resolved in this bank, which is a broken provenance link rather than a "
-                        "retraction — a restored or copied bank carries its documents but re-creates "
-                        "its memories under new ids. The citations were dropped; the content was left "
-                        "untouched and will be re-grounded by future refreshes."
-                    )
-                elif retracted and retraction_deferred_reason is None:
+                if retracted and retraction_deferred_reason is None:
                     try:
                         doc_max_tokens = stored_max_tokens or 2048
                         unsay_prompt = build_structured_retraction_prompt(
@@ -19395,11 +19429,13 @@ class MemoryEngine(MemoryEngineInterface):
                         # facts — and still counts as handled, so the citations are pruned
                         # and the same call is not repaid on every future refresh.
                         retraction_handled = True
-                        if unsay_outcome.applied:
-                            current_doc = unsay_outcome.document
-                            final_structured = unsay_outcome.document
-                            final_content = render_document(unsay_outcome.document)
-                            delta_applied = True
+                        # The model is shown the retracted facts without their ids, so a
+                        # sentence it keeps still carries the old ``[id]`` — and once the
+                        # id leaves ``based_on`` below, nothing would ever notice it again.
+                        cleaned_doc = drop_inline_citations(unsay_outcome.document, retracted.ids)
+                        if unsay_outcome.applied or cleaned_doc != unsay_outcome.document:
+                            current_doc = cleaned_doc
+                            unsay_applied = True
                         logger.info(
                             f"[MENTAL_MODELS] Retraction pass for {mental_model_id}: "
                             f"{len(retracted.facts)} retracted fact(s), applied "
@@ -19437,11 +19473,11 @@ class MemoryEngine(MemoryEngineInterface):
                 # already removed still stands: the document changed, so this is a
                 # write, not a preserved no-op.
                 if not supporting_facts:
-                    reflect_response_payload["delta_applied"] = delta_applied
+                    reflect_response_payload["delta_applied"] = unsay_applied
                     if retraction_operations is not None:
                         reflect_response_payload["delta_operations_applied"] = retraction_operations.applied
                         reflect_response_payload["delta_operations_skipped"] = retraction_operations.skipped
-                    if not delta_applied:
+                    if not unsay_applied:
                         reflect_response_payload["delta_skipped_reason"] = "no_new_facts"
                     if retraction_handled:
                         reflect_response_payload["based_on"] = prune_based_on(
@@ -19450,10 +19486,10 @@ class MemoryEngine(MemoryEngineInterface):
                     return _finish(
                         effective_mode="delta",
                         mode_fallback_reason=None,
-                        final_content=final_content if delta_applied else current_content,
-                        final_structured=final_structured,
+                        final_content=render_document(current_doc) if unsay_applied else current_content,
+                        final_structured=current_doc if unsay_applied else None,
                         delta_operations=retraction_operations,
-                        outcome="content_written" if delta_applied else "content_preserved_no_new_facts",
+                        outcome="content_written" if unsay_applied else "content_preserved_no_new_facts",
                     )
 
                 # Op JSON is denser than the rendered markdown — each op
@@ -19491,12 +19527,16 @@ class MemoryEngine(MemoryEngineInterface):
                 delta_llm = await _op_llm()
                 try:
                     # Structured-output call, following the retain extraction path:
-                    # the schema is sent, ``strict_schema`` is resolved from reflect's
-                    # own flag, and ``skip_validation`` keeps the raw JSON so the
-                    # op-by-op parser sees it. A reply that misses the schema is
+                    # ``request_delta_operations`` sends the schema, resolves
+                    # ``strict_schema`` from reflect's own flag, and sets
+                    # ``skip_validation`` so the op-by-op parser sees the raw JSON —
+                    # for this call and the retraction pass alike (the retraction pass
+                    # once ran without a schema, #6569). A reply that misses the schema is
                     # refused whole and asked for again with the errors attached —
                     # ``request_delta_operations`` owns that, for this call and the
-                    # retraction pass alike.
+                    # retraction pass alike. It also samples once more a reply that
+                    # runs to the output cap, a repetition loop rather than a long
+                    # answer (#6265).
                     #
                     # This was a text-mode call until #3901: pydantic renders the
                     # eight-op discriminated union as ``oneOf`` + ``discriminator``,
@@ -19523,9 +19563,6 @@ class MemoryEngine(MemoryEngineInterface):
                         scope="mental_model_delta_ops",
                         deadline=edit_deadline,
                         document=current_doc,
-                        response_format=DeltaOperationList,
-                        strict_schema=get_config().llm_strict_schema_reflect,
-                        skip_validation=True,  # Get raw JSON; the parser validates op-by-op
                         max_completion_tokens=get_config().reflect_max_completion_tokens,
                         temperature=get_config().llm_temperature_mental_model_refresh,
                     )
@@ -19573,12 +19610,15 @@ class MemoryEngine(MemoryEngineInterface):
                                 "operations for the reason each was dropped."
                             )
                 except Exception as exc:
-                    # Do not turn a temporary provider failure into delta_ops_failed: that
-                    # refusal pauses automatic refresh and hides the original retryability.
-                    # Structural/schema failures still follow the data-preserving refusal.
-                    if isinstance(
-                        exc, (OperationCancelledError, ProviderRateLimitResetError)
-                    ) or is_transient_remote_error(exc):
+                    # A provider that is rate-limited or down answers later: let it escape
+                    # as itself, so the refresh fails as temporary and does not pause
+                    # automatic refresh — the same verdict the reflect loop gets (#6674).
+                    # Turned into ``delta_ops_failed`` it lost its type and paused the model.
+                    if (
+                        isinstance(exc, OperationCancelledError)
+                        or is_transient_remote_error(exc)
+                        or isinstance(exc, ProviderRateLimitResetError)
+                    ):
                         raise
                     logger.warning(
                         f"[MENTAL_MODELS] Structured delta failed for {mental_model_id} "
@@ -19597,8 +19637,10 @@ class MemoryEngine(MemoryEngineInterface):
             # citing a memory that no longer exists. Only for a pass that actually ran:
             # a deferred or failed one must keep its ids, because they are the sole
             # remaining evidence that the prose is unsupported — pruning them would
-            # leave the stale claim in place with nothing left to notice it.
-            if retraction_handled:
+            # leave the stale claim in place with nothing left to notice it. The same
+            # holds when the new-facts delta failed: the refresh is refused, the unsay
+            # edits are not written, so the next refresh must see the retraction again.
+            if retraction_handled and delta_applied:
                 reflect_response_payload["based_on"] = prune_based_on(
                     reflect_response_payload["based_on"], retracted.ids
                 )
@@ -19634,7 +19676,14 @@ class MemoryEngine(MemoryEngineInterface):
         #
         # Reached by a full refresh, and by a delta refresh whose baseline could not be
         # read (a delta with a baseline has already returned via the no-new-facts leg).
-        if not has_sources and not delta_applied:
+        #
+        # Not for a page whose whole grounding is gone and that has nothing left to read:
+        # there, empty is the answer — its source was deleted — and keeping the document
+        # would keep stating it. Both guards let that one page be written empty. With
+        # sources in scope an empty candidate still means the reflect failed, so the
+        # empty-candidate guard below keeps refusing it.
+        write_empty = gone_citations > 0 and not has_sources
+        if not has_sources and not delta_applied and not write_empty:
             return _finish(
                 effective_mode=effective_mode,
                 mode_fallback_reason=mode_fallback_reason,
@@ -19654,7 +19703,7 @@ class MemoryEngine(MemoryEngineInterface):
         # existing content and raises, rather than persisting the empty render.
         # A gated delta has no reflect candidate at all, so its empty text says nothing
         # about the LLM: a failed edit there is reported by the delta guard below.
-        if not final_content.strip() and gate is None:
+        if not final_content.strip() and gate is None and not write_empty:
             warnings.append(
                 "The refresh produced empty content, which usually means an upstream LLM failure. "
                 "A real refresh would preserve the existing content and fail."
@@ -19888,6 +19937,7 @@ class MemoryEngine(MemoryEngineInterface):
             # of the extra call and the fail-loud behaviour.
             response_schema = (mental_model.get("trigger") or {}).get("response_schema")
             prev_structured_output = (mental_model.get("reflect_response") or {}).get("structured_output")
+            prev_based_on = (mental_model.get("reflect_response") or {}).get("based_on")
 
             async def _structured_output_for(content_text: str) -> StructuredOutputResult:
                 if not response_schema or not content_text.strip():
@@ -19943,6 +19993,15 @@ class MemoryEngine(MemoryEngineInterface):
                 logger.warning(f"[MENTAL_MODELS] Refresh for {mental_model_id} failed ({reason}); {detail}")
                 reflect_response_payload["refresh_skipped"] = reason
                 reflect_response_payload["outcome"] = outcome
+                # The content stays, so its structured view must stay too (#6499).
+                if prev_structured_output is not None:
+                    reflect_response_payload["structured_output"] = prev_structured_output
+                # ...and so must the facts it cites. A rebuild's based_on is only what
+                # its own (failed) reflect read; storing that would drop the dead ids
+                # that made this a rebuild, and no later refresh would notice the
+                # page's source is gone (#6764).
+                # A page that never stored one cites nothing yet, not what this run read.
+                reflect_response_payload["based_on"] = prev_based_on if prev_based_on is not None else {}
                 await self.update_mental_model(
                     bank_id,
                     mental_model_id,
@@ -20557,8 +20616,24 @@ class MemoryEngine(MemoryEngineInterface):
                 if is_failure
                 else f"(content->>'kind' IS NULL OR content->>'kind' <> '{_MM_HISTORY_KIND_FAILURE}')"
             )
-            await conn.execute(
-                f"""
+            if getattr(conn, "backend_type", None) == "oracle":
+                # Oracle: number the rows once and delete past the cap, instead of
+                # checking every row against a NOT IN subquery that re-reads the
+                # CLOB predicate (#6771). Same order as idx_mm_history_model.
+                trim_sql = f"""
+                DELETE FROM {fq_table("mental_model_history")}
+                WHERE id IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (ORDER BY changed_at DESC, id DESC) AS rn
+                        FROM {fq_table("mental_model_history")}
+                        WHERE mental_model_id = $1 AND bank_id = $2
+                          AND {kind_predicate}
+                    )
+                    WHERE rn > $3
+                )
+                """
+            else:
+                trim_sql = f"""
                 DELETE FROM {fq_table("mental_model_history")}
                 WHERE mental_model_id = $1 AND bank_id = $2
                   AND {kind_predicate}
@@ -20569,11 +20644,8 @@ class MemoryEngine(MemoryEngineInterface):
                       ORDER BY changed_at DESC, id DESC
                       LIMIT $3
                   )
-                """,
-                mental_model_id,
-                bank_id,
-                max_entries,
-            )
+                """
+            await conn.execute(trim_sql, mental_model_id, bank_id, max_entries)
 
     async def _record_mental_model_refresh_failure(
         self,
@@ -22049,6 +22121,7 @@ class MemoryEngine(MemoryEngineInterface):
         if self._llm_config.provider == "none":
             return 0
         try:
+            bank_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
                 # Someone else is already going to notice. Consolidation is pending, and
@@ -22058,7 +22131,11 @@ class MemoryEngine(MemoryEngineInterface):
                 # (A bank with auto-consolidation off never reaches that hook; its
                 # cron-refreshed pages are still covered by the scheduled loop, and its
                 # manually refreshed ones were never this function's business.)
-                if await get_memories().has_pending_consolidation(conn=conn, fq_table=fq_table, bank_id=bank_id):
+                # A bank without observations never consolidates, so its facts read as
+                # pending forever and nothing would ever schedule this refresh (#6855).
+                if bank_config.enable_observations and await get_memories().has_pending_consolidation(
+                    conn=conn, fq_table=fq_table, bank_id=bank_id
+                ):
                     return 0
                 rows = await conn.fetch(
                     f"""
@@ -22258,6 +22335,35 @@ class MemoryEngine(MemoryEngineInterface):
         from . import bank_aliases
 
         return await bank_aliases.resolve(await self._get_backend(), bank_id)
+
+    async def refuse_knowledge_bank(self, bank_id: str, *, request_context: "RequestContext") -> None:
+        """400 when ``bank_id`` names a knowledge bank.
+
+        Knowledge banks share the memory banks' id space but have their own API
+        (``/v1/default/knowledge-banks``) and their own validator hooks. The HTTP route class runs
+        this for every ``/v1/default/banks/{bank_id}`` route and the MCP tools for every bank they
+        are handed, so no memory-bank endpoint ever serves a knowledge bank -- or runs the memory
+        hooks in place of the knowledge-bank ones.
+
+        The knowledge bank's own read hook runs first: a caller it rejects gets its verdict, not a 400
+        that would tell them the bank exists and is a knowledge bank.
+        """
+        await self._authenticate_tenant(request_context)
+        if await bank_utils.bank_kind_cached(await self._get_backend(), bank_id) != "knowledge":
+            return
+        if self._operation_validator is not None:
+            await self._validate_operation(
+                self._operation_validator.validate_knowledge_bank_read(
+                    KnowledgeBankReadContext(
+                        bank_id=bank_id,
+                        operation=KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK,
+                        request_context=request_context,
+                    )
+                )
+            )
+        raise OperationValidationError(
+            f"'{bank_id}' is a knowledge bank; use /v1/default/knowledge-banks/{bank_id}", status_code=400
+        )
 
     async def list_bank_aliases(
         self,
@@ -22610,21 +22716,33 @@ class MemoryEngine(MemoryEngineInterface):
         self._refuse_unwritable(tags, await self._write_tag_scope(bank_id, request_context), "a directive")
         backend = await self._get_backend()
 
-        async with acquire_with_retry(backend) as conn:
-            row = await conn.fetchrow(
-                f"""
-                INSERT INTO {fq_table("directives")}
-                (bank_id, name, content, priority, is_active, tags)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, bank_id, name, content, priority, is_active, tags, created_at, updated_at
-                """,
-                bank_id,
-                name,
-                content,
-                priority,
-                is_active,
-                tags or [],
-            )
+        # A first write to a new bank creates it, like retain and pinned mental models do (#6853).
+        # Same transaction as the insert, retried whole: see create_mental_model for why (#5830).
+        created = False
+
+        async def _write() -> Any:
+            nonlocal created
+            async with acquire_with_retry(backend) as conn:
+                async with conn.transaction():
+                    created = await self._ensure_bank_exists(bank_id, request_context, conn=conn)
+                    return await conn.fetchrow(
+                        f"""
+                        INSERT INTO {fq_table("directives")}
+                        (bank_id, name, content, priority, is_active, tags)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        RETURNING id, bank_id, name, content, priority, is_active, tags, created_at, updated_at
+                        """,
+                        bank_id,
+                        name,
+                        content,
+                        priority,
+                        is_active,
+                        tags or [],
+                    )
+
+        row = await retry_with_backoff(_write)
+        if created:
+            await self._apply_default_bank_template(bank_id, request_context)
 
         logger.info(f"[DIRECTIVES] Created directive '{name}' for bank {bank_id}")
         return self._row_to_directive(row)
@@ -22789,6 +22907,7 @@ class MemoryEngine(MemoryEngineInterface):
         offset: int = 0,
         exclude_parents: bool = False,
         request_context: "RequestContext",
+        _knowledge_bank: bool = False,
     ) -> dict[str, Any]:
         """List async operations for a bank with optional filtering and pagination.
 
@@ -22805,13 +22924,16 @@ class MemoryEngine(MemoryEngineInterface):
             Dict with total count and list of operations, sorted by most recent first
         """
         await self._authenticate_tenant(request_context)
-        if self._operation_validator:
+        # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
+        # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
+        if self._operation_validator and not _knowledge_bank:
             ctx = BankReadContext(
                 bank_id=bank_id, operation=BankReadOperation.LIST_OPERATIONS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
         # Answered for the whole bank, not narrowed to a tag scope: refuse scoped callers.
-        await self._refuse_bank_wide_if_scoped(bank_id, request_context, "list the bank's operations")
+        if not _knowledge_bank:
+            await self._refuse_bank_wide_if_scoped(bank_id, request_context, "list the bank's operations")
         await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
 
@@ -22841,11 +22963,18 @@ class MemoryEngine(MemoryEngineInterface):
             total = total_row["total"] if total_row else 0
 
             # Get operations with pagination (include result_metadata to check for parent operations)
+            # Oracle: with only the bank filter, pin the (bank_id, created_at DESC) index so a
+            # peeked bind cannot settle on a full scan plus sort (#6771).
+            op_hint, op_alias = (
+                ("/*+ INDEX(ao idx_async_operations_bank_created_desc) */ ", " ao")
+                if getattr(conn, "backend_type", None) == "oracle" and len(where_conditions) == 1
+                else ("", "")
+            )
             operations = await conn.fetch(
                 f"""
-                SELECT operation_id, operation_type, created_at, updated_at, status, error_message,
+                SELECT {op_hint}operation_id, operation_type, created_at, updated_at, status, error_message,
                        result_metadata, retry_count, next_retry_at
-                FROM {fq_table("async_operations")}
+                FROM {fq_table("async_operations")}{op_alias}
                 WHERE {where_clause}
                 ORDER BY created_at DESC
                 LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
@@ -22902,6 +23031,7 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         request_context: "RequestContext",
         include_payload: bool = False,
+        _knowledge_bank: bool = False,
     ) -> dict[str, Any]:
         """Get the status of a specific async operation.
 
@@ -22915,7 +23045,13 @@ class MemoryEngine(MemoryEngineInterface):
         """
         await self._authenticate_tenant(request_context)
 
-        tag_scope = await self._authorize_bank_read(bank_id, BankReadOperation.GET_OPERATION_STATUS, request_context)
+        # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
+        # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
+        tag_scope = (
+            None
+            if _knowledge_bank
+            else await self._authorize_bank_read(bank_id, BankReadOperation.GET_OPERATION_STATUS, request_context)
+        )
         # An operation row is not tagged, but its payload is the raw request — a retain's
         # payload is the text someone else stored. A scoped caller never gets payloads.
         if tag_scope:
@@ -23064,6 +23200,7 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id: str,
         *,
         request_context: "RequestContext",
+        _knowledge_bank: bool = False,
     ) -> dict[str, Any]:
         """Cancel a pending or in-flight async operation.
 
@@ -23079,13 +23216,16 @@ class MemoryEngine(MemoryEngineInterface):
         flip, or fails, cannot resurrect the row.
         """
         await self._authenticate_tenant(request_context)
-        if self._operation_validator:
+        # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
+        # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
+        if self._operation_validator and not _knowledge_bank:
             ctx = BankWriteContext(
                 bank_id=bank_id, operation=BankWriteOperation.CANCEL_OPERATION, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         # Acts on the whole bank, not narrowed to a tag scope: refuse scoped callers.
-        await self._refuse_bank_wide_if_scoped(bank_id, request_context, "cancel the bank's operations")
+        if not _knowledge_bank:
+            await self._refuse_bank_wide_if_scoped(bank_id, request_context, "cancel the bank's operations")
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
@@ -23145,17 +23285,21 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id: str,
         *,
         request_context: "RequestContext",
+        _knowledge_bank: bool = False,
     ) -> dict[str, Any]:
         """Re-queue a failed or cancelled async operation, or run a deferred one now."""
         await self._authenticate_tenant(request_context)
 
-        if self._operation_validator:
+        # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
+        # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
+        if self._operation_validator and not _knowledge_bank:
             ctx = BankWriteContext(
                 bank_id=bank_id, operation=BankWriteOperation.RETRY_OPERATION, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         # Acts on the whole bank, not narrowed to a tag scope: refuse scoped callers.
-        await self._refuse_bank_wide_if_scoped(bank_id, request_context, "retry the bank's operations")
+        if not _knowledge_bank:
+            await self._refuse_bank_wide_if_scoped(bank_id, request_context, "retry the bank's operations")
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
@@ -23299,17 +23443,21 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id: str,
         *,
         request_context: "RequestContext",
+        _knowledge_bank: bool = False,
     ) -> dict[str, Any]:
         """Delete a terminal (failed/cancelled/completed) async operation row."""
         await self._authenticate_tenant(request_context)
 
-        if self._operation_validator:
+        # ``_knowledge_bank``: called by the knowledge-bank service, which has already run the
+        # knowledge-bank hook; the memory hooks and tag scopes never apply to a knowledge bank.
+        if self._operation_validator and not _knowledge_bank:
             ctx = BankWriteContext(
                 bank_id=bank_id, operation=BankWriteOperation.DELETE_OPERATION, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         # Acts on the whole bank, not narrowed to a tag scope: refuse scoped callers.
-        await self._refuse_bank_wide_if_scoped(bank_id, request_context, "delete the bank's operations")
+        if not _knowledge_bank:
+            await self._refuse_bank_wide_if_scoped(bank_id, request_context, "delete the bank's operations")
         backend = await self._get_backend()
 
         op_uuid = uuid.UUID(operation_id)
@@ -23743,6 +23891,40 @@ class MemoryEngine(MemoryEngineInterface):
         except Exception as e:
             logger.warning(f"Failed to check for other pending consolidation ops for bank {bank_id}: {e}")
             return None
+
+    async def _supersede_by_newer_retain_of_same_document(self, operation_id: str) -> str | None:
+        """The completed retain of the same document submitted after ``operation_id``, if any.
+
+        When there is one, records it as ``result_metadata.superseded_by`` on ``operation_id``,
+        which then completes normally: nothing is left for it to do, so it is neither a failure
+        nor a cancellation (a cancelled child would also turn its whole batch 'cancelled').
+
+        Keyed on ``serialization_key``, which a retain carries exactly when it targets one
+        document; a multi-document retain has none and never matches.
+        """
+        table = fq_table("async_operations")
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            newer = await conn.fetchval(
+                f"SELECT newer.operation_id FROM {table} me "
+                f"JOIN {table} newer "
+                f"ON newer.bank_id = me.bank_id AND newer.serialization_key = me.serialization_key "
+                f"AND newer.operation_type = me.operation_type "
+                f"WHERE me.operation_id = $1 AND newer.status = 'completed' "
+                f"AND (newer.created_at > me.created_at "
+                f"OR (newer.created_at = me.created_at AND newer.operation_id > me.operation_id)) "
+                f"LIMIT 1",
+                uuid.UUID(operation_id),
+            )
+            if newer is None:
+                return None
+            await conn.execute(
+                f"UPDATE {table} SET result_metadata = COALESCE(result_metadata, '{{}}'::jsonb) || $2::jsonb "
+                f"WHERE operation_id = $1",
+                uuid.UUID(operation_id),
+                json.dumps({"superseded_by": str(newer)}),
+            )
+        return str(newer)
 
     async def _mark_operation_superseded(self, operation_id: str, superseded_by: str, error_message: str) -> None:
         """Close an op whose work another pending op will do, without calling it a failure.

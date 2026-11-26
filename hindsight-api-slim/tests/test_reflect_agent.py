@@ -9,6 +9,7 @@ These tests verify:
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.config import HindsightConfig
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_REQUIRED, LLMToolChoice
 from hindsight_api.engine.reflect.agent import (
     ReflectNoAnswerError,
@@ -31,11 +33,12 @@ from hindsight_api.engine.reflect.agent import (
     _process_done_tool,
     run_reflect_agent,
 )
+from hindsight_api.engine.reflect import prompts as reflect_prompts
 from hindsight_api.engine.reflect.models import TokenUsageSummary
 from hindsight_api.engine.reflect.presentation import ToolResultPresenter
 from hindsight_api.engine.reflect.structured_doc import DocumentSectionsInvalidError
 from hindsight_api.engine.response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
-from tests.llm_judge import assert_meets_criteria
+from tests.llm_judge import assert_meets_criteria, evaluate
 from tests.reflect_script import closing_echo
 
 
@@ -986,6 +989,41 @@ class TestReflectAgentMocked:
         assert mock_llm.call_with_tools.await_count == 3  # recall, the free turn's done, the closing done
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("strict", [True, False])
+    async def test_every_tool_turn_follows_the_reflect_strict_schema_flag(
+        self, mock_llm, mock_functions, monkeypatch, strict
+    ):
+        """HINDSIGHT_API_LLM_STRICT_SCHEMA_REFLECT reaches the loop turns and the closing done (#6673)."""
+        config = dataclasses.replace(HindsightConfig.from_env(), llm_strict_schema_reflect_tool_turns=strict)
+        monkeypatch.setattr("hindsight_api.engine.reflect.agent.get_config", lambda: config)
+        mock_llm.call_with_tools.side_effect = closing_echo(
+            [
+                LLMToolCallResult(
+                    tool_calls=[LLMToolCall(id="1", name="recall", arguments={"reason": "facts", "query": "ABC-123"})],
+                    finish_reason="tool_calls",
+                ),
+                LLMToolCallResult(
+                    tool_calls=[LLMToolCall(id="2", name="done", arguments={"answer": "Open.", "memory_ids": []})],
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="where are we on ABC-123",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+        calls = mock_llm.call_with_tools.await_args_list
+        assert [c.kwargs["scope"] for c in calls] == ["reflect_tool_call", "reflect_tool_call", "reflect"]
+        assert [c.kwargs["strict_schema"] for c in calls] == [strict, strict, strict]
+
+    @pytest.mark.asyncio
     async def test_stale_mental_model_keeps_forced_retrieval(self, mock_llm, mock_functions):
         """A stale mental model must not short-circuit; the full forced path continues."""
         mock_functions["search_mental_models_fn"].return_value = {
@@ -1464,6 +1502,28 @@ class TestReflectAgentMocked:
         # The retry asks for the step that failed, not the next one (#4564).
         choices = [c.kwargs["tool_choice"] for c in mock_llm.call_with_tools.call_args_list]
         assert choices[0] == choices[1] == LLMToolChoice.named("search_observations")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_turn_does_not_use_up_an_iteration(self, mock_llm, mock_functions):
+        """#6674: a turn that failed and was retried counted as one of the run's
+        iterations, so a rate-limited run ended one search short with nothing to say so."""
+        search = LLMToolCallResult(
+            tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+            finish_reason="tool_calls",
+        )
+        mock_llm.call_with_tools.side_effect = closing_echo([RuntimeError("429"), search, search])
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            max_iterations=3,
+            **mock_functions,
+        )
+
+        # Two searches, then the closing step: the failed call took no iteration.
+        assert mock_functions["recall_fn"].await_count == 2
 
     @pytest.mark.asyncio
     async def test_cancellation_from_a_tool_is_not_wrapped(self, mock_llm, mock_functions):
@@ -2790,7 +2850,9 @@ class TestMentalModelShortCircuitRealLLM:
         )
 
     @pytest.mark.asyncio
-    async def test_real_fresh_but_uncovering_mental_model_digs_instead_of_denying(self, llm_config, mock_functions):
+    async def test_real_fresh_but_uncovering_mental_model_digs_instead_of_denying(
+        self, llm_config, mock_functions, monkeypatch
+    ):
         """Fresh pages that do not COVER the question must not become a negative answer.
 
         The regression from #4567: the short-circuit releases the forced lower
@@ -2841,38 +2903,54 @@ class TestMentalModelShortCircuitRealLLM:
             ],
         )
 
-        result = await run_reflect_agent(
-            llm_config=llm_config,
-            bank_id="test-bank",
-            query="Where do we stand on AURORA-412?",
-            bank_profile={"name": "Test", "mission": "Answer from what the bank holds"},
-            has_mental_models=True,
-            include_observations=True,
-            include_recall=True,
-            budget="low",
-            max_iterations=6,
-            **functions,
-        )
+        # Pinned clock, three fixed times, pass if any digs (#6833). The prompt carries
+        # the time to the minute, and that string alone decided this model choice: on
+        # gemini-2.5-flash-lite 09:33 and 09:47 failed every time and other minutes
+        # passed every time, whatever the question's wording. So a live clock made the
+        # result depend on when CI ran, and reruns 2s apart replayed the same minute.
+        # Fixed times make a run repeatable; three of them are three real draws.
+        # ponytail: catches "never digs", not "digs less often"; measure a real rate
+        # on the reporter's banks (#4567) for that.
+        async def one_run(now: str) -> str:
+            monkeypatch.setattr(reflect_prompts, "_current_datetime", lambda tz=None: now)
+            result = await run_reflect_agent(
+                llm_config=llm_config,
+                bank_id="test-bank",
+                query="Where do we stand on AURORA-412?",
+                bank_profile={"name": "Test", "mission": "Answer from what the bank holds"},
+                has_mental_models=True,
+                include_observations=True,
+                include_recall=True,
+                budget="low",
+                max_iterations=6,
+                **functions,
+            )
+            assert result.text, "agent must return a non-empty answer"
+            return result.text
 
-        assert result.text, "agent must return a non-empty answer"
         # No hard assert on recall being called (#6619): which tools a free turn picks
         # is the model's choice. The close date and the flag removal live only in the
         # recall layer, so the judge requires one of them: that is the evidence the agent
         # dug deeper rather than guessed.
-        await assert_meets_criteria(
-            response=result.text,
-            criteria=(
-                "The answer reports that AURORA-412 was closed on 12 March, or that its feature flag was removed "
-                "(a bare 'it was closed' without either detail does not count). It does NOT claim the bank holds nothing, no record, no status or no history for "
-                "AURORA-412. Saying that the release-process page itself records no status is fine, as long as "
-                "the answer goes on to report the closed/fixed status."
-            ),
-            context=(
-                "The first search returned only a fresh page about the AURORA release process, which records no "
-                "status for any individual issue. The raw-fact layer holds that AURORA-412 was closed as fixed "
-                "on 12 March."
-            ),
+        criteria = (
+            "The answer reports that AURORA-412 was closed on 12 March, or that its feature flag was removed "
+            "(a bare 'it was closed' without either detail does not count). It does NOT claim the bank holds "
+            "nothing, no record, no status or no history for AURORA-412. Saying that the release-process page itself records no status is fine, as long as "
+            "the answer goes on to report the closed/fixed status."
         )
+        context = (
+            "The first search returned only a fresh page about the AURORA release process, which records no "
+            "status for any individual issue. The raw-fact layer holds that AURORA-412 was closed as fixed "
+            "on 12 March."
+        )
+        misses = []
+        for now in ("2026-03-20 09:40 UTC", "2026-03-20 10:00 UTC", "2026-03-20 13:13 UTC"):
+            answer = await one_run(now)
+            verdict = await evaluate(response=answer, criteria=criteria, context=context)
+            if verdict.meets_criteria:
+                return
+            misses.append(f"- {now}: {answer[:200]!r} -> {verdict.reasoning[:200]}")
+        raise AssertionError("no run of three dug past the page:\n" + "\n".join(misses))
 
     @pytest.mark.asyncio
     async def test_real_agent_recovers_from_an_early_negative(self, llm_config, mock_functions, monkeypatch):
