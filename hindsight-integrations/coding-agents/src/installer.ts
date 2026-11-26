@@ -547,7 +547,7 @@ tool, run this in Python (\`mcp\` is pre-imported):
 
 Do it even when the task looks simple or needs no other tools. It answers from past sessions,
 decisions and conventions the code does not show, and it is also what saves this conversation to
-memory for later sessions. Later in the task, \`hindsight_search_pages\` (\`{"query": ...}\`)
+memory for later sessions. Later in the task, \`hindsight_search_knowledge_pages\` (\`{"query": ...}\`)
 is the fast lookup. The \`hindsight-coding-agent\` skill lists every tool.
 ${PRIME_CONTEXT_END}`;
 

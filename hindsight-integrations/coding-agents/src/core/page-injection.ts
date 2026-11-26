@@ -71,7 +71,7 @@ const PAGE_TOOLS_GUIDE =
   "    • the user asks why something is the way it is, or what is left to do;\n" +
   "    • you are about to commit, and need to know what the change was supposed to honour.\n" +
   "  It ranks the pages by relevance and shows the opening of each; every page can come back, so " +
-  "the ranking, not the list, is the signal. Read the top page with hindsight_read_page before you " +
+  "the ranking, not the list, is the signal. Read the top page with hindsight_read_knowledge_page before you " +
   "rely on it — the opening is not the passage that matched. What it returns is a past record, " +
   "not a live reading: a claim that something was fixed, " +
   "passes, or works is what someone said then — check it against the code before you rely on it, " +
@@ -191,9 +191,10 @@ export function buildRosterRefresh(
   if (opts?.short) {
     const line = pages.length
       ? `${pages.length === 1 ? "1 Hindsight page covers" : `${pages.length} Hindsight pages cover`} ` +
-        "this repo: search them (hindsight_search_pages) before bugs, tests, new work and commits, " +
-        "and credit any hit you use."
-      : "No Hindsight pages yet; hindsight_reflect answers from this repo's raw memory.";
+        "this repo: search hindsight_search_knowledge_pages or raw/recent memory directly " +
+        "(hindsight_recall / hindsight_recent_memories, fresher when pages lag) before bugs, tests, " +
+        "new work and commits; credit hits."
+      : "No Hindsight pages yet; search raw/recent memory directly (hindsight_recall / hindsight_recent_memories) or use hindsight_reflect.";
     return `<hindsight_page_refresh>\n${line}\n</hindsight_page_refresh>`;
   }
   const rosterBlock = pages.length ? `${indexLine(pages)}\n` : "";

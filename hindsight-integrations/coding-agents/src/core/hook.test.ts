@@ -1375,7 +1375,10 @@ describe("buildHookOutput", () => {
     await turn();
     const t4 = await turn();
     expect(t4.context).toContain("<hindsight_page_refresh>");
-    expect(t4.context).toContain("search them (hindsight_search_pages)");
+    expect(t4.context).toContain(
+      "search hindsight_search_knowledge_pages or raw/recent memory directly"
+    );
+    expect(t4.context).toContain("hindsight_recall / hindsight_recent_memories");
     expect(t4.context).not.toContain("CREDITING IS NOT OPTIONAL");
   });
 
