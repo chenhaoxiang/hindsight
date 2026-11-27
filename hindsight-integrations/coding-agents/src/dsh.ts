@@ -30,6 +30,7 @@ import { diag } from "./core/diag";
 import type { ToolSpec } from "./core/page-tools";
 import { log } from "./core/log";
 import { RuntimeCore } from "./core/runtime";
+import type { TransportTurn } from "./core/chat";
 import { HINDSIGHT_PLUGIN, readDshEvents, type DshSessionEvent } from "./core/transcript-dsh";
 
 const HARNESS = "dsh";
@@ -99,7 +100,50 @@ interface DshContext {
     event: "agent/disposed",
     listener: (payload: { agent: DshAgent }) => void
   ): (() => void) | void;
-  inject(names: string[], callback: (ctx: DshToolContext) => void): void;
+  inject(names: ["tools"], callback: (ctx: DshToolContext) => void): void;
+  inject(
+    names: ["sessionPersistence"],
+    callback: (ctx: {
+      sessionPersistence: DshSessionPersistence;
+      on?(event: "dispose", listener: () => void): void;
+    }) => void
+  ): void;
+}
+
+/** dsh's durable session store (docs/subsystems/persistence.md in deepseek-harness): a `read`
+ *  handle works on a session no agent holds, which is what a replay after a restart needs. */
+export interface DshSessionPersistence {
+  open(
+    id: string,
+    access: "read"
+  ): Promise<{
+    readonly inheritedEventCount?: number;
+    read(): Promise<{ readonly events: readonly DshSessionEvent[] }>;
+    close(): Promise<void>;
+  }>;
+}
+
+/** Held while the host provides it (see `apply`); without it a past session reads back as empty,
+ *  so it is not replayed. */
+let sessionStore: DshSessionPersistence | undefined;
+
+/** Every workspace core's past-session source: whatever store the host provides right now. */
+export async function readStoredSession(sessionId: string): Promise<TransportTurn[]> {
+  return sessionStore ? readPastSession(sessionStore, sessionId) : [];
+}
+
+/** A stored session's own turns, read through the host's store — the same slice `ownEvents` takes. */
+export async function readPastSession(
+  store: DshSessionPersistence,
+  sessionId: string
+): Promise<TransportTurn[]> {
+  const handle = await store.open(sessionId, "read");
+  try {
+    const { events } = await handle.read();
+    return readDshEvents(events.slice(handle.inheritedEventCount ?? 0));
+  } finally {
+    await handle.close();
+  }
 }
 
 interface DshToolContext {
@@ -193,6 +237,9 @@ function workspaceFor(root: string): Workspace | undefined {
     const agent = liveAgents.get(sessionId);
     return agent ? readDshEvents(ownEvents(agent.session)) : [];
   });
+  // A session whose write-back failed before the app quit has no live agent any more: it is read
+  // back from the host's store, so a later process can replay it (#6559).
+  core.setPastSessionSource(readStoredSession);
   const workspace: Workspace = { core, root };
   workspaces.set(root, workspace);
   return workspace;
@@ -363,7 +410,13 @@ export function toDshParameters(spec: ToolSpec): Record<string, unknown> {
     // `.optional()` wraps the real type, so unwrap before checking it — otherwise every optional
     // parameter would pass the guard below whatever it actually holds.
     const inner = zod.def?.type === "optional" ? zod.def.innerType?.def?.type : zod.def?.type;
+    const optional = typeof zod.isOptional === "function" && zod.isOptional();
     if (inner !== undefined && inner !== "string") {
+      // dsh compiles this shape itself, and a mis-typed property would register a tool that
+      // cannot be called: an OPTIONAL flag the projection cannot express (a boolean such as
+      // `verify_connection`) is left out instead, so the tool's own default applies. A required
+      // one still fails loudly — there is no way to carry the call without it.
+      if (optional) continue;
       throw new Error(
         `hindsight tool ${spec.name}: dsh projection supports string parameters only`
       );
@@ -477,6 +530,15 @@ export function apply(ctx: DshContext): void {
   // recall, injection and write-back.
   ctx.inject(["tools"], (toolCtx) => {
     registerTools(toolCtx, process.cwd());
+  });
+  // Optional too: without it, a session that failed to save before a restart is not retried.
+  ctx.inject(["sessionPersistence"], (scoped) => {
+    const store = scoped.sessionPersistence;
+    sessionStore = store;
+    // Cordis disposes this scope when the service goes away; a re-inject sets the new one.
+    scoped.on?.("dispose", () => {
+      if (sessionStore === store) sessionStore = undefined;
+    });
   });
 }
 

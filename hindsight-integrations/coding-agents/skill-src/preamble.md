@@ -1,13 +1,14 @@
 ---
 name: hindsight-coding-agent
-description: How this machine's Hindsight coding-agent memory works — the plugin behind the 🧠 banner. Use when the user says "store/remember this in hindsight", asks what the memory/pages are, wants to configure per-repo memory (disable, rename banks, git depth), or something memory-related looks broken.
+description: Everyday use of this machine's Hindsight coding-agent memory — the plugin behind the 🧠 banner. Use when the user says "store/remember this in hindsight", asks what the memory or its pages are, or a memory needs correcting. For installing, configuring or debugging the plugin, use hindsight-coding-agent-setup instead.
 ---
 
 # Hindsight Coding-Agent Memory
 
 This machine runs the `hindsight-coding-agents` plugin: long-term project memory for coding
 sessions, backed by a Hindsight server. You (the agent) are already wired into it — this skill
-explains what happens automatically, which tools you have, and how to configure or debug it.
+explains what happens automatically and which tools you have. Installing, updating, configuration and
+diagnosing problems live in the `hindsight-coding-agent-setup` skill.
 
 ## What happens automatically (no action needed)
 
@@ -27,7 +28,8 @@ explains what happens automatically, which tools you have, and how to configure 
 - **Write-back**: the session transcript is retained into the bank automatically at session end
   (per-turn on opencode). The user never needs to "save" a conversation.
 - **Prime Agent 0.10+ is the exception**: it has no hooks, so nothing is injected. Call
-  `hindsight_reflect` yourself first (`await mcp.call_tool("hindsight", "hindsight_reflect", …)`);
+  `hindsight_reflect` yourself first (`await mcp.call_tool("hindsight", "hindsight_reflect", …)`, with the server name your
+  install chose if it is not `hindsight`);
   that call also starts the server that saves the session.
 
 ## Storing things deliberately
@@ -39,7 +41,7 @@ When the user says "store this in hindsight" / "remember this":
 - A **new feature/initiative being started** → `hindsight_capture_initiative(title, summary)`,
   right after the plan is agreed and before code is written.
 - A **plan that materially changed** (goal, scope, or rationale — including mid-implementation) →
-  call `hindsight_capture_initiative` again with `relates_to_page_id` set to that initiative's page
+  call `hindsight_capture_initiative` again with `page_id` set to that initiative's page
   id, summarising the _current_ intent. Same page, updated plan — never a second page. Trivial
   course-corrections don't count.
 - **Verified milestones or completion** of an already tracked initiative → update that same page
@@ -47,6 +49,10 @@ When the user says "store this in hindsight" / "remember this":
   unrelated shared-bank observations; ordinary session write-back does not advance their scope.
   Creation can wait up to two minutes for source extraction. A pending/error result is not a page
   success, and cancellation does not roll back an already accepted source retain.
+
+If those two tools are not in your tool list, writing is turned off for this setup
+(`writeTools: false`): don't try to call them, and tell the user that only the conversation itself
+is saved.
 
 If those two tools are not in your tool list, writing is turned off for this setup
 (`writeTools: false`): don't try to call them, and tell the user that only the conversation itself
