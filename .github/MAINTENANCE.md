@@ -201,6 +201,22 @@ Current stable update candidate (source/PR acceptance only, not installation):
   current-state retrieval gate). Exact release source is merge commit `0d1d4447f`
   from PR #14; package, lockfile and plugin versions agree. Native tool names remain
   the existing ten, including the three `*_knowledge_page*` names.
+- Coding Agents `0.9.0-fork.1`: upstream tag `integrations/coding-agents/v0.9.0`
+  (`bd3ecdde4`), merged path-limited onto `hindsight-integrations/coding-agents` only;
+  no other component (API, clients, Control Plane, docs) is upgraded by this sync.
+  Taken from upstream: `pageScope`, `toolGuideMoments`, `sessionContext`,
+  `recallTags`, `apiHeaders`, `injectQueryMaxChars`, `skipOriginators`,
+  `keepToolInputs` with Channel turns, observation `proof_count`, `--mcp-name`
+  server isolation, the continued-session transcript dedupe, on-disk orphan replay,
+  the connect-wait cap and the unreachable-server banner. Retained from the fork:
+  the ten public tool names (the three `*_knowledge_page*` names included), the
+  current-state retrieval gate, bounded page results, source-scoped initiative pages
+  with their retained source anchor, the 7s automatic-injection budget (upstream 5s,
+  raised for the freshness batch this fork also fetches), the native v2 dispatcher
+  preference and the dsh projection. An initiative question is now built from
+  `initiativeQuery` + the fork's source anchor + the scope clause, so the re-sync
+  keeps the anchor when `pageScope` changes. `toDshParameters` omits an optional
+  parameter it cannot type instead of registering a mis-typed tool.
 - Control Plane uses official `1.3.0` (npm `@vectorize-io/hindsight-control-plane`),
   installed under `runtime/control-plane-1.3.0-community`; no fork UI patch.
 - The local API/Control Plane pair was upgraded after the backup at

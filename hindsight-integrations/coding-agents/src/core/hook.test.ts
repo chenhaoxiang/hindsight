@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveConfig } from "./config";
+import { DEFAULT_INJECT_TIMEOUT_MS, resolveConfig } from "./config";
 import { buildHookOutput, runHook } from "./hook";
 import { diagFilePath, readHookEvent } from "./diag";
 import { journalPath, readJournalTranscript } from "./turn-journal";
@@ -66,7 +66,7 @@ const UNRELATED_PROMPT = "completely unrelated banana smoothie question";
 function makeClient(
   overrides: Partial<{
     reflect: (query: string, opts: { budget?: string; timeoutMs: number }) => Promise<string>;
-    listPages: () => Promise<unknown>;
+    listPages: (opts?: { timeoutMs?: number }) => Promise<unknown>;
     getPage: (pageId: string) => Promise<unknown>;
     searchPages: (
       query: string,
@@ -327,7 +327,7 @@ describe("buildHookOutput", () => {
       .map((line) => JSON.parse(line))
       .find((entry) => entry.event === "reflect_failed");
     expect(failed.bank).toBe("coding-agent::demo");
-    expect(failed.timeoutMs).toBe(20_000);
+    expect(failed.timeoutMs).toBe(15_000);
     // Past describeError's default 200-char cut, where the root cause usually sits.
     expect(failed.error).toContain("upstream LLM rejected the turn");
   });
@@ -362,7 +362,47 @@ describe("buildHookOutput", () => {
     expect(result.context).not.toContain("<hindsight_memory>");
   });
 
-  it("uses a bounded low-budget reflect with the 20000ms default timeout", async () => {
+  // #6167: run after reflect with no limit, the page list pushed the hook past the host's 30s.
+  it("fetches the page list alongside reflect, bounded by injectTimeoutMs", async () => {
+    const cfg = resolveConfig({ injectTimeoutMs: 1234 });
+    let finishReflect: (answer: string) => void = () => {};
+    const client = makeClient({
+      reflect: vi.fn(() => new Promise<string>((resolve) => (finishReflect = resolve))),
+    });
+    const pending = buildHookOutput({
+      harness: "claude-code",
+      prompt: "p",
+      cfg,
+      client,
+      cacheFile,
+    });
+    await vi.waitFor(() => expect(client.reflect).toHaveBeenCalled());
+    // Reflect has not answered, yet the page list already went out with its own limit.
+    expect(client.listPages).toHaveBeenCalledWith({ timeoutMs: 1234 });
+    finishReflect("REFLECT_ANSWER");
+    const out = await pending;
+    expect(out.pages.map((p) => p.title)).toEqual(["Uploader guide"]);
+  });
+
+  it("a page list that fails keeps the reflect answer", async () => {
+    const cfg = resolveConfig({});
+    const client = makeClient({
+      listPages: async () => {
+        throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      },
+    });
+    const out = await buildHookOutput({
+      harness: "claude-code",
+      prompt: "p",
+      cfg,
+      client,
+      cacheFile,
+    });
+    expect(out.context).toContain("REFLECT_ANSWER");
+    expect(out.pages).toEqual([]);
+  });
+
+  it("uses a bounded low-budget reflect with the 15000ms default timeout", async () => {
     const cfg = resolveConfig({});
     const client = makeClient();
     await buildHookOutput({
@@ -374,7 +414,7 @@ describe("buildHookOutput", () => {
     });
     expect(client.reflect).toHaveBeenCalledWith(buildReflectQuery("the prompt"), {
       budget: "low",
-      timeoutMs: 20000,
+      timeoutMs: 15000,
     });
   });
 
@@ -396,7 +436,7 @@ describe("buildHookOutput", () => {
   });
 
   describe("reflect fallback (timeout / 5xx)", () => {
-    const timedOut = () => new ReflectError("reflect timed out after 20000ms", undefined, true);
+    const timedOut = () => new ReflectError("reflect timed out after 15000ms", undefined, true);
     const serverError = () => new ReflectError("reflect 502 bad gateway", 502, false);
     const HIT = { id: "kp-1", name: "Upload retries", snippet: "200ms  jitter\nwindow" };
 
@@ -424,7 +464,7 @@ describe("buildHookOutput", () => {
             client,
             cacheFile,
           });
-          const budget = injectTimeoutMs ?? 7000;
+          const budget = injectTimeoutMs ?? DEFAULT_INJECT_TIMEOUT_MS;
           expect(client.searchPages).toHaveBeenCalledWith(MATCHING_PROMPT, {
             timeoutMs: budget,
           });
@@ -606,7 +646,7 @@ describe("buildHookOutput", () => {
         });
         const retrieve = autoInject === "pages" ? client.searchPages : client.recallObservations;
         expect(retrieve).toHaveBeenCalledWith(MATCHING_PROMPT, {
-          timeoutMs: injectTimeoutMs ?? 7000,
+          timeoutMs: injectTimeoutMs ?? DEFAULT_INJECT_TIMEOUT_MS,
         });
         expect(client.reflect).not.toHaveBeenCalled();
       }
@@ -1185,6 +1225,50 @@ describe("buildHookOutput", () => {
     }
     // ASCII keeps a useful query length rather than collapsing to the byte bound.
     expect((recallObservations.mock.calls.at(-1)![0] as string).length).toBe(1000);
+  });
+
+  it("injectQueryMaxChars caps what pages and recall search with, never the reflect goal (#5089)", async () => {
+    const recallObservations = vi.fn(
+      async (_q: string, _o: { timeoutMs: number }) => [] as string[]
+    );
+    const searchPages = vi.fn(
+      async (_q: string, _o?: { timeoutMs?: number }) =>
+        [] as { id: string; name: string; snippet: string }[]
+    );
+    const client = makeClient({ recallObservations, searchPages });
+    const prompt = "🧠".repeat(10) + "word ".repeat(400);
+    const run = async (raw: Parameters<typeof resolveConfig>[0]) => {
+      rmSync(cacheFile, { force: true });
+      await buildHookOutput({
+        harness: "claude-code",
+        prompt,
+        cfg: resolveConfig(raw),
+        client,
+        cacheFile,
+      });
+    };
+    await run({ autoInject: "recall", injectQueryMaxChars: 5 });
+    // Code points, so the emoji pair is never split.
+    expect(recallObservations.mock.calls.at(-1)![0]).toBe("🧠".repeat(5));
+    await run({ autoInject: "pages", injectQueryMaxChars: 30 });
+    expect(searchPages.mock.calls.at(-1)![0]).toBe(Array.from(prompt).slice(0, 30).join(""));
+    // A cap above the built-in bounds changes nothing.
+    await run({ autoInject: "pages", injectQueryMaxChars: 100_000 });
+    expect(searchPages.mock.calls.at(-1)![0]).toBe(prompt.slice(0, 500));
+    // Unset = today's query.
+    await run({ autoInject: "pages" });
+    expect(searchPages.mock.calls.at(-1)![0]).toBe(prompt.slice(0, 500));
+    // Reflect's goal is the whole prompt either way.
+    const reflect = makeClient();
+    rmSync(cacheFile, { force: true });
+    await buildHookOutput({
+      harness: "claude-code",
+      prompt,
+      cfg: resolveConfig({ autoInject: "reflect", injectQueryMaxChars: 5 }),
+      client: reflect,
+      cacheFile,
+    });
+    expect(String(vi.mocked(reflect.reflect).mock.calls[0]![0])).toContain("word word");
   });
 
   it("autoInject recall: injects recalled observations, never reflects or searches pages", async () => {

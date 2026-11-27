@@ -93,7 +93,7 @@ const capture = (
 describe("initiative source readiness", () => {
   it("commits and verifies the identifying source before creating an auto-synthesizing page", async () => {
     const calls = server();
-    await expect(capture()).resolves.toEqual({ page_id: "kp-real" });
+    await expect(capture()).resolves.toEqual({ page_id: "kp-real", action: "created" });
     const page = calls.findIndex((c) => c.path.endsWith("/pages"));
     const source = calls.findIndex((c) => c.path.endsWith("/memories"));
     const visible = calls.findIndex((c) => c.path.endsWith("/memories/list"));
@@ -101,9 +101,13 @@ describe("initiative source readiness", () => {
     expect(visible).toBeLessThan(page);
     const query = calls[page].body?.source_query ?? "";
     expect(query).toContain("Atlas cache repair");
-    expect(query).toContain("Repair Atlas's cache");
-    expect(query).toContain(calls[source].body?.items?.[0].document_id);
-    expect(query).not.toContain("group by project where that helps");
+    // The summary itself rides on the retained source document, and the question anchors on its id.
+    const sourceItem = calls[source].body?.items?.[0] as unknown as {
+      content?: string;
+      document_id?: string;
+    };
+    expect(sourceItem.content).toContain("Repair Atlas's cache");
+    expect(query).toContain(sourceItem.document_id);
     expect(calls[page].body?.tags).toEqual([
       "knowledge:feature-work",
       expect.stringMatching(/^initiative:/),
@@ -116,7 +120,7 @@ describe("initiative source readiness", () => {
 
   it("recovers the real same-source page after a duplicate create acknowledgement", async () => {
     const calls = server("completed", true, true);
-    await expect(capture()).resolves.toEqual({ page_id: "kp-existing" });
+    await expect(capture()).resolves.toEqual({ page_id: "kp-existing", action: "created" });
     expect(calls.filter((c) => c.path.endsWith("/pages"))).toHaveLength(1);
   });
 
@@ -177,7 +181,7 @@ describe("initiative source readiness", () => {
     await client.captureInitiative({
       title: "Reworded title",
       summary: "Verified completion",
-      relatesToPageId: "kp-existing",
+      pageId: "kp-existing",
     });
     expect(requests.at(-1)?.body?.items?.[0].tags).toContain(sourceTag);
     expect(requests.some((r) => r.path.endsWith("/pages"))).toBe(false);
@@ -280,7 +284,7 @@ describe("initiative source readiness", () => {
     vi.stubGlobal("fetch", fetch);
     const client = new HindsightClient({ apiUrl: "http://fixture.invalid", bank: "shared" });
     await expect(
-      client.captureInitiative({ title: "Atlas", summary: "Done", relatesToPageId: "kp-ambiguous" })
+      client.captureInitiative({ title: "Atlas", summary: "Done", pageId: "kp-ambiguous" })
     ).rejects.toThrow("ambiguous source scope");
     expect(fetch).toHaveBeenCalledTimes(1);
   });

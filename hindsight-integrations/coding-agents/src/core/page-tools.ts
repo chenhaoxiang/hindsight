@@ -209,7 +209,6 @@ export function buildPageTools(
     max_chars: z.number().int().min(1000).max(48_000).default(24_000),
   };
   const tools: ToolSpec[] = [
-
     {
       name: "hindsight_sync_status",
       description:
@@ -297,7 +296,7 @@ export function buildPageTools(
     {
       name: "hindsight_search_knowledge_pages",
       description:
-        "Search this repository's Hindsight pages for content relevant to a query — " +
+        "Search this project's Hindsight pages for content relevant to a query — " +
         "hybrid full-text + semantic search, server-side. Call this when the user's question may " +
         "be answered by the project's accumulated knowledge (architecture, conventions, decisions, " +
         "initiatives) rather than by reading code. Returns ranked pages, each with its opening " +
@@ -369,7 +368,7 @@ export function buildPageTools(
     {
       name: "hindsight_list_knowledge_pages",
       description:
-        "List this repository's Hindsight pages — curated, continuously-updated " +
+        "List this project's Hindsight pages — curated, continuously-updated " +
         "summaries of the project's durable knowledge (architecture, components, conventions, key " +
         "decisions, and in-flight initiatives). Returns each page's id, title, and a one-line " +
         "description of what it covers, plus reported freshness. Results are bounded/paged; use " +
@@ -439,7 +438,7 @@ export function buildPageTools(
     {
       name: "hindsight_reflect",
       description:
-        "Deep memory reasoning: an agentic synthesis over this repository's FULL memory (git " +
+        "Deep memory reasoning: an agentic synthesis over this project's FULL memory (git " +
         "decisions, past sessions, ingested knowledge) that answers WHY questions — the past " +
         "decision and exact rule/values that explain a behavior, bug, or convention. Slower than " +
         "hindsight_search_knowledge_pages (several seconds): reach for it when pages are too " +
@@ -462,36 +461,42 @@ export function buildPageTools(
         "WHEN TO CALL:\n" +
         "- Starting one: right after the user approves a plan or finishes brainstorming a new feature/" +
         "capability and you are about to start implementing — BEFORE you write any code. Leave " +
-        "relates_to_page_id empty.\n" +
+        "page_id empty.\n" +
         "- Plan changed: call it AGAIN — mid-implementation is fine and expected — whenever the goal, " +
         "scope, or rationale of an initiative you already captured materially changes (an approach is " +
-        "dropped, scope grows or shrinks, the why is rewritten). Pass relates_to_page_id = that " +
-        "initiative's page id so the change lands on the existing page. Never mint a second page for the " +
-        "same initiative.\n" +
+        "dropped, scope grows or shrinks, the why is rewritten). Pass page_id = that initiative's " +
+        "page id so the change lands on the existing page. Never mint a second page for the same " +
+        "initiative. A capture without a page id updates an existing Initiative page of the same " +
+        "title instead of minting another one.\n" +
         "- Verified milestone or completion: update the same page with evidence. New scoped pages read " +
         "explicit captures, not unrelated shared-bank observations or ordinary session ingestion.\n\n" +
         "WHEN TO SKIP: bug fixes, small tweaks, refactors, chores, and trivial course-corrections that " +
         "leave the goal intact are not initiatives — skip them.\n\n" +
         "- title: short, specific name (e.g. 'Newsletter refinement chat'). On a recapture, reuse the " +
-        "initiative's existing title.\n" +
+        "initiative's existing title: a capture without page_id whose title matches an existing " +
+        "initiative page is recorded as an update to that page.\n" +
         "- summary: 2-3 sentences on what you're building and why — the CURRENT intent, not the " +
         "originally approved plan (on a recapture, say what changed and why).\n" +
-        "- relates_to_page_id: leave empty for a new initiative. Set it to an existing initiative's page " +
-        "id — from hindsight_list_knowledge_pages, or the id this tool returned earlier — to record a " +
+        "- page_id: leave empty for a new initiative. Set it to an existing initiative's page id — " +
+        "from hindsight_list_knowledge_pages, or the id this tool returned earlier — to record a " +
         "plan change or an enhancement to it.\n\n" +
+        'Returns the page id and action: "created" (a new page) or "updated" (an existing one). ' +
         "Creation waits up to two minutes for the source facts. Pending/errors are not success; cancellation " +
-        "does not roll back an accepted retain. Returns the real page id, not a fabricated fallback.",
+        "does not roll back an accepted retain. The page is generated for you — you never format one " +
+        "yourself, and the real page id is returned, not a fabricated fallback.",
       inputSchema: {
         title: z.string(),
         summary: z.string(),
-        relates_to_page_id: z.string().optional(),
+        page_id: z.string().optional(),
+        // The old name, still sent by agents that learned it. Remove in 2.x.
+        relates_to_page_id: z.string().optional().describe("Deprecated: use page_id."),
       },
       annotations: NON_DESTRUCTIVE_WRITE_ANNOTATIONS,
-      handler: guarded(async ({ title, summary, relates_to_page_id }) =>
+      handler: guarded(async ({ title, summary, page_id, relates_to_page_id }) =>
         client.captureInitiative({
           title,
           summary,
-          relatesToPageId: relates_to_page_id,
+          pageId: page_id ?? relates_to_page_id,
           ...(opts.stampFor ? { stamp: opts.stampFor() } : {}),
           ...(opts.pageTrigger ? { pageTrigger: opts.pageTrigger } : {}),
         })
@@ -500,7 +505,7 @@ export function buildPageTools(
     {
       name: "hindsight_ingest_document",
       description:
-        "Save an external document or a block of durable notes/findings into this repository's " +
+        "Save an external document or a block of durable notes/findings into this project's " +
         "memory so it informs future recall and pages. Use for design notes, research, or " +
         "reference material you want remembered — not for the conversation you're already in " +
         "(that's captured automatically at session end). This is ALSO the correction mechanism: " +
