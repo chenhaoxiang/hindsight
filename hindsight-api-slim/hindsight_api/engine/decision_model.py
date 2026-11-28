@@ -909,7 +909,11 @@ def decision_engine(operation: DecisionModelOperation) -> DecisionModel | None:
     stays the same.
     """
     setup = hindsight_config.get_config().decision_model_config(operation)
-    if setup is not None and setup.max_request_tokens is not None and setup.max_request_tokens < DecisionModel.MIN_QUESTION_TOKENS:
+    if (
+        setup is not None
+        and setup.max_request_tokens is not None
+        and setup.max_request_tokens < DecisionModel.MIN_QUESTION_TOKENS
+    ):
         # The fork keeps the TypeSafe retry floor: a shared budget this small cannot fit a
         # single question after the first refusal, so ask at the default instead of failing
         # every reflect/page setup at startup.

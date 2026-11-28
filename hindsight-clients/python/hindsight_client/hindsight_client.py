@@ -3100,6 +3100,8 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Text an MCP client receives in the initialize response (None = none)
+        mcp_server_instructions: str | None = None,
         # Knowledge banks linked to this memory bank (recall/reflect return their passages)
         knowledge_banks: list[str] | None = None,
         # How reflect searches those knowledge banks
@@ -3178,6 +3180,7 @@ class Hindsight:
                 disposition_literalism=disposition_literalism,
                 disposition_empathy=disposition_empathy,
                 mcp_enabled_tools=mcp_enabled_tools,
+                mcp_server_instructions=mcp_server_instructions,
                 knowledge_banks=knowledge_banks,
                 reflect_kb_search_media_types=reflect_kb_search_media_types,
                 reflect_kb_search_apply_tags=reflect_kb_search_apply_tags,
@@ -3258,6 +3261,8 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Text an MCP client receives in the initialize response (None = none)
+        mcp_server_instructions: str | None = None,
         # Knowledge banks linked to this memory bank (recall/reflect return their passages)
         knowledge_banks: list[str] | None = None,
         # How reflect searches those knowledge banks
@@ -3359,6 +3364,8 @@ class Hindsight:
             disposition_literalism: How literally to interpret information (1=flexible, 5=literal).
             disposition_empathy: How much to consider emotional context (1=detached, 5=empathetic).
             mcp_enabled_tools: List of MCP tool names to enable for this bank.
+            mcp_server_instructions: Text an MCP client receives in the initialize response
+                for this bank (None = none).
             knowledge_banks: Knowledge banks linked to this bank: reflect also searches them and treats
                 their passages as authoritative. Recall is unchanged.
             reflect_kb_search_media_types: Media types reflect's knowledge-bank search may return
@@ -3439,6 +3446,7 @@ class Hindsight:
                 "disposition_literalism": disposition_literalism,
                 "disposition_empathy": disposition_empathy,
                 "mcp_enabled_tools": mcp_enabled_tools,
+                "mcp_server_instructions": mcp_server_instructions,
                 "knowledge_banks": knowledge_banks,
                 "reflect_kb_search_media_types": reflect_kb_search_media_types,
                 "reflect_kb_search_apply_tags": reflect_kb_search_apply_tags,

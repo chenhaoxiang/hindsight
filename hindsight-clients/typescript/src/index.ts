@@ -1045,6 +1045,8 @@ export class HindsightClient {
       recallBudgetMax?: number;
       /** MCP tool names enabled for this bank. */
       mcpEnabledTools?: string[];
+      /** Text an MCP client receives in the initialize response (omit = none). */
+      mcpServerInstructions?: string;
       /** Knowledge banks linked to this bank: reflect also searches them and treats their
        *  passages as authoritative. Recall is unchanged. */
       knowledgeBanks?: string[];
@@ -1170,6 +1172,8 @@ export class HindsightClient {
     if (options.recallBudgetMin !== undefined) updates.recall_budget_min = options.recallBudgetMin;
     if (options.recallBudgetMax !== undefined) updates.recall_budget_max = options.recallBudgetMax;
     if (options.mcpEnabledTools !== undefined) updates.mcp_enabled_tools = options.mcpEnabledTools;
+    if (options.mcpServerInstructions !== undefined)
+      updates.mcp_server_instructions = options.mcpServerInstructions;
     if (options.knowledgeBanks !== undefined) updates.knowledge_banks = options.knowledgeBanks;
     if (options.reflectKbSearchMediaTypes !== undefined)
       updates.reflect_kb_search_media_types = options.reflectKbSearchMediaTypes;
