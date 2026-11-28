@@ -781,7 +781,7 @@ from .reflect.tools import (
     tool_search_mental_models,
     tool_search_observations,
 )
-from .remote_retry import is_transient_remote_error, status_code_of
+from .remote_retry import is_invalid_remote_request, is_transient_remote_error, status_code_of
 from .response_models import (
     DIRECTIVE_PRIORITY_MAX,
     DIRECTIVE_PRIORITY_MIN,
