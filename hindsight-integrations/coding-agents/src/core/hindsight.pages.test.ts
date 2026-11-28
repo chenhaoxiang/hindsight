@@ -1403,7 +1403,10 @@ describe("HindsightClient.captureInitiative", () => {
   it("names the repository, not the bank, when the client knows one", async () => {
     const calls: any[] = [];
     stubInitiativeFetch(calls, [
-      { match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"), json: { roots: [] } },
+      {
+        match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"),
+        json: { roots: [] },
+      },
       {
         match: (m, u) => m === "POST" && u.endsWith("/pages/folders"),
         json: { id: "folder-abc" },
@@ -1428,7 +1431,10 @@ describe("HindsightClient.captureInitiative", () => {
   it("new initiative: POSTs a per-initiative page + a marker retain naming the same page id", async () => {
     const calls: any[] = [];
     stubInitiativeFetch(calls, [
-      { match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"), json: { roots: [] } },
+      {
+        match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"),
+        json: { roots: [] },
+      },
       {
         match: (m, u) => m === "POST" && u.endsWith("/pages/folders"),
         json: { id: "folder-abc" },
@@ -1468,9 +1474,7 @@ describe("HindsightClient.captureInitiative", () => {
       'Summarize the "Retry backoff for the uploader" initiative as it stands now'
     );
     // The summary itself is the retained source document, which the question anchors the page on.
-    expect(pagePost.body.source_query).toMatch(
-      /initiative-source-[0-9a-f-]{36}/
-    );
+    expect(pagePost.body.source_query).toMatch(/initiative-source-[0-9a-f-]{36}/);
     expect(pagePost.body.max_tokens).toBe(PAGE_MAX_TOKENS);
 
     // The backlink marker uses the same source tag; the overview can still follow its page link.
@@ -1505,7 +1509,10 @@ describe("HindsightClient.captureInitiative", () => {
     const capture = async (title: string) => {
       const calls: any[] = [];
       stubInitiativeFetch(calls, [
-        { match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"), json: { roots: [] } },
+        {
+          match: (m, u) => m === "GET" && u.endsWith("/pages/tree?detail=basic"),
+          json: { roots: [] },
+        },
         {
           match: (m, u) => m === "POST" && u.endsWith("/pages/folders"),
           json: { id: "folder-abc" },

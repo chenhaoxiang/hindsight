@@ -642,12 +642,7 @@ export async function buildHookOutput(args: {
           query: prompt.slice(0, 80),
         });
         if (e instanceof ReflectError && e.fallbackEligible) {
-          const fallbackResult = await reflectFallback(
-            harness,
-            query,
-            client,
-            cfg.injectTimeoutMs
-          );
+          const fallbackResult = await reflectFallback(harness, query, client, cfg.injectTimeoutMs);
           fallback = fallbackResult?.body;
           if (fallbackResult?.currentState) currentStateGate = fallbackResult.currentState;
           // The fallback body is cached exactly like a reflect answer: injected once, not retried.

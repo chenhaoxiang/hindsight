@@ -302,7 +302,6 @@ export function orphanedCursors(
   return out.sort((a, b) => b.mtime - a.mtime).map((o) => o.found);
 }
 
-
 const cursorStores = new Map<string, RetainCursorStore>();
 
 /**

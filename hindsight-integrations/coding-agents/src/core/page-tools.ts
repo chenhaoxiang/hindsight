@@ -306,7 +306,6 @@ export function buildPageTools(
         "page counts. Only pages with explicit no-scoped-writes-reported freshness plus a source " +
         "watermark count as safe; when none remain the result is explicitly unknown. Stable background " +
         "questions keep normal page search behavior. " +
-
         // Same sentence the payload carries, from the same constant: two copies of a rule this
         // fiddly drift apart, and the description is what a host shows when the tool is listed.
         "read a full page with hindsight_read_knowledge_page. " +
