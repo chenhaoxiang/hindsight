@@ -50,8 +50,8 @@ from typing import Annotated, Any, Literal, Union, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
-from hindsight_api.config import get_config
 from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.config import get_config
 from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
 from hindsight_api.engine.llm_wrapper import ConfiguredLLMProvider, OutputTooLongError, parse_llm_json, reask_messages
 from hindsight_api.engine.response_models import LLMCallResult

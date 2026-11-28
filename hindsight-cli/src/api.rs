@@ -1548,9 +1548,12 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::WebhookDeliveryListResponse> {
         self.runtime.block_on(async {
+            // The API takes a non-zero page size; a CLI-supplied 0 or negative value means
+            // "no explicit limit", not an invalid request.
+            let limit_nz = limit.and_then(|value| std::num::NonZeroU64::new(value.max(1) as u64));
             let response = self
                 .client
-                .list_webhook_deliveries(bank_id, webhook_id, cursor, limit, None)
+                .list_webhook_deliveries(bank_id, webhook_id, cursor, limit_nz, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())

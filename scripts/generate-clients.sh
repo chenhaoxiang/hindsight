@@ -636,12 +636,18 @@ else
         fi
     done
 
-    # Fix known generator issue: api_files.go uses os.File but generator omits "os" import
-    if [ -f "api_files.go" ] && grep -q 'os\.File' api_files.go && ! grep -q '"os"' api_files.go; then
-        echo "Patching api_files.go: adding missing 'os' import..."
-        sed -i.bak 's|"net/url"|"net/url"\n\t"os"|' api_files.go
-        rm -f api_files.go.bak
-    fi
+    # Fix known generator issue: a file that names os.X (os.File for multipart uploads,
+    # os.Getenv in a client) does not always get the "os" import. Patch every generated
+    # file that needs it, not one known name: the generator decides per file which
+    # operations land there (api_files.go, api_knowledge_banks.go, api_pages.go, ...).
+    for f in *.go; do
+        [ -e "$f" ] || continue
+        if grep -qE '\bos\.' "$f" && ! grep -qE '^[[:space:]]*"os"$' "$f"; then
+            echo "Patching $f: adding missing 'os' import..."
+            sed -i.bak 's|"net/url"|"net/url"\n\t"os"|' "$f"
+            rm -f "$f.bak"
+        fi
+    done
 
     # Initialize module and build
     echo "Building Go client..."

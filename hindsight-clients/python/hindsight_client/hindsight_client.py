@@ -1450,12 +1450,13 @@ class Hindsight:
         if tag_groups is not None:
             # The generator emits one union model for every tag_groups field and names it after
             # the first schema that used it; there is no RecallRequest-specific class. Importing
-            # the non-existent name raised ModuleNotFoundError for every caller passing tag_groups.
-            from hindsight_client_api.models.mental_model_trigger_input_tag_groups_inner import (
-                MentalModelTriggerInputTagGroupsInner,
+            # a name the current spec does not emit raised ModuleNotFoundError for every caller
+            # passing tag_groups, so the import lives with the spec's own union name.
+            from hindsight_client_api.models.knowledge_search_request_tag_groups_inner import (
+                KnowledgeSearchRequestTagGroupsInner,
             )
 
-            tag_groups_objs = [MentalModelTriggerInputTagGroupsInner.from_dict(tg) for tg in tag_groups]
+            tag_groups_objs = [KnowledgeSearchRequestTagGroupsInner.from_dict(tg) for tg in tag_groups]
 
         min_scores_obj = None
         if min_scores is not None:
@@ -1589,12 +1590,13 @@ class Hindsight:
         if tag_groups is not None:
             # The generator emits one union model for every tag_groups field and names it after
             # the first schema that used it; there is no RecallRequest-specific class. Importing
-            # the non-existent name raised ModuleNotFoundError for every caller passing tag_groups.
-            from hindsight_client_api.models.mental_model_trigger_input_tag_groups_inner import (
-                MentalModelTriggerInputTagGroupsInner,
+            # a name the current spec does not emit raised ModuleNotFoundError for every caller
+            # passing tag_groups, so the import lives with the spec's own union name.
+            from hindsight_client_api.models.knowledge_search_request_tag_groups_inner import (
+                KnowledgeSearchRequestTagGroupsInner,
             )
 
-            tag_groups_objs = [MentalModelTriggerInputTagGroupsInner.from_dict(tg) for tg in tag_groups]
+            tag_groups_objs = [KnowledgeSearchRequestTagGroupsInner.from_dict(tg) for tg in tag_groups]
 
         request_obj = reflect_request.ReflectRequest(
             query=query,
@@ -3100,6 +3102,8 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Text an MCP client receives in the initialize response (None = none)
+        mcp_server_instructions: str | None = None,
         # Knowledge banks linked to this memory bank (recall/reflect return their passages)
         knowledge_banks: list[str] | None = None,
         # How reflect searches those knowledge banks
@@ -3178,6 +3182,7 @@ class Hindsight:
                 disposition_literalism=disposition_literalism,
                 disposition_empathy=disposition_empathy,
                 mcp_enabled_tools=mcp_enabled_tools,
+                mcp_server_instructions=mcp_server_instructions,
                 knowledge_banks=knowledge_banks,
                 reflect_kb_search_media_types=reflect_kb_search_media_types,
                 reflect_kb_search_apply_tags=reflect_kb_search_apply_tags,
@@ -3258,6 +3263,8 @@ class Hindsight:
         disposition_empathy: int | None = None,
         # MCP settings
         mcp_enabled_tools: list[str] | None = None,
+        # Text an MCP client receives in the initialize response (None = none)
+        mcp_server_instructions: str | None = None,
         # Knowledge banks linked to this memory bank (recall/reflect return their passages)
         knowledge_banks: list[str] | None = None,
         # How reflect searches those knowledge banks
@@ -3359,6 +3366,8 @@ class Hindsight:
             disposition_literalism: How literally to interpret information (1=flexible, 5=literal).
             disposition_empathy: How much to consider emotional context (1=detached, 5=empathetic).
             mcp_enabled_tools: List of MCP tool names to enable for this bank.
+            mcp_server_instructions: Text an MCP client receives in the initialize response
+                for this bank (None = none).
             knowledge_banks: Knowledge banks linked to this bank: reflect also searches them and treats
                 their passages as authoritative. Recall is unchanged.
             reflect_kb_search_media_types: Media types reflect's knowledge-bank search may return
@@ -3439,6 +3448,7 @@ class Hindsight:
                 "disposition_literalism": disposition_literalism,
                 "disposition_empathy": disposition_empathy,
                 "mcp_enabled_tools": mcp_enabled_tools,
+                "mcp_server_instructions": mcp_server_instructions,
                 "knowledge_banks": knowledge_banks,
                 "reflect_kb_search_media_types": reflect_kb_search_media_types,
                 "reflect_kb_search_apply_tags": reflect_kb_search_apply_tags,

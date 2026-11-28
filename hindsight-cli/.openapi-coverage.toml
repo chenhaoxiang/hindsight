@@ -111,6 +111,37 @@ get_knowledge_page = "Deprecated alias of get_page; `pages get-page` calls the n
 update_knowledge_node = "Deprecated alias of update_page_node; `pages update` calls the new route"
 delete_knowledge_node = "Deprecated alias of delete_page_node; `pages delete` calls the new route"
 
+# Knowledge Banks — the document/retrieval corpus, not a memory bank.
+#
+# `pages` (alias `knowledge-base`) in this CLI is the Pages product of a memory
+# bank, covered by the /pages operations above. Creating a Knowledge Bank,
+# ingesting files or texts, reading documents and passages, media search and its
+# operation history are a separate API/control-plane surface with no CLI
+# commands. Listed explicitly so a new endpoint in that product is a decision
+# rather than a silent gap.
+cancel_knowledge_bank_operation = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+create_knowledge_bank = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+delete_knowledge_bank = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+delete_knowledge_bank_operation = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+delete_knowledge_document = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_bank = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_bank_config = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_bank_operation = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_bank_timeseries = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_document = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_document_file = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+get_knowledge_passage_media = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+ingest_knowledge_files = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+ingest_knowledge_texts = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+list_knowledge_bank_operations = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+list_knowledge_bank_tags = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+list_knowledge_banks = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+list_knowledge_documents = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+reset_knowledge_bank_config = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+retry_knowledge_bank_operation = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+search_knowledge_bank = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+update_knowledge_bank_config = "Knowledge Banks (RAG document corpus) is a separate product surface; this CLI manages memory banks and their pages"
+
 # ---------------------------------------------------------------------------
 # Per-operation parameter skips
 # ---------------------------------------------------------------------------
